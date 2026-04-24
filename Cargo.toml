@@ -1,0 +1,43 @@
+[package]
+name = "win-theme-switcher"
+version = "0.1.0"
+edition = "2021"
+description = "Lightweight Windows tray app that auto-switches theme at sunrise and sunset"
+license = "MIT"
+
+[[bin]]
+name = "win-theme-switcher"
+path = "src/main.rs"
+
+[dependencies]
+chrono = "0.4"
+sun-times = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tray-icon = "0.19"
+winit = "0.30"
+
+[dependencies.windows-sys]
+version = "0.59"
+features = [
+    "Win32_Foundation",
+    "Win32_System_Registry",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Shell",
+    "Win32_Graphics_Dwm",
+]
+
+[dependencies.windows]
+version = "0.59"
+features = [
+    "Devices_Geolocation",
+    "Foundation",
+    "Win32_System_Com",
+]
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

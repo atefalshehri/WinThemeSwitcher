@@ -1,0 +1,21 @@
+# Rust build artifacts
+/target
+
+# Legacy pre-Cargo binary at the repo root (from the original Manus prototype).
+# Delete it if still present; this line keeps it out of commits either way.
+/win-theme-switcher.exe
+
+# User-local configs that sometimes appear next to the dev exe
+/config.json
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS metadata
+Thumbs.db
+desktop.ini
+.DS_Store
