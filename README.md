@@ -119,7 +119,7 @@ Requirements: Rust `stable-x86_64-pc-windows-msvc` + Visual Studio Build Tools w
 ```powershell
 winget install Rustlang.Rustup
 winget install Microsoft.VisualStudio.2022.BuildTools --override "--add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"
-git clone https://github.com/<your-username>/WinThemeSwitcher.git
+git clone https://github.com/atefalshehri/WinThemeSwitcher.git
 cd WinThemeSwitcher
 cargo build --release
 # Output: target\release\win-theme-switcher.exe

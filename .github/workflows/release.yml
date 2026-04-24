@@ -55,7 +55,7 @@ jobs:
           body: |
             ## WinThemeSwitcher ${{ github.ref_name }}
 
-            See [README.md](../blob/${{ github.ref_name }}/README.md) for install and configuration.
+            See the [README](https://github.com/${{ github.repository }}/blob/${{ github.ref_name }}/README.md) for install and configuration.
 
             > ⚠ **Your antivirus will likely flag the binary as a false positive** (`VHO:Trojan.Win32.Agent.gen` on Kaspersky, similar generic detections on others). This is an unsigned Rust app that does registry writes + system broadcasts + shell pokes — every heuristic signal fires. Source is fully open in this repo. See the README's "Antivirus false positives" section for allowlist instructions.
 
