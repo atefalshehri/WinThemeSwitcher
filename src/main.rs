@@ -4,6 +4,7 @@ use std::error::Error;
 use std::fs;
 use std::path::PathBuf;
 use std::ptr;
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Local, NaiveDate, TimeZone};
@@ -15,19 +16,31 @@ use tray_icon::{
 };
 use windows::Devices::Geolocation::{GeolocationAccessStatus, Geolocator};
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
+use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows_sys::Win32::Graphics::Dwm::DwmFlush;
+use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows_sys::Win32::System::Power::PowerRegisterSuspendResumeNotification;
+use windows_sys::Win32::System::RemoteDesktop::{
+    WTSRegisterSessionNotification, NOTIFY_FOR_THIS_SESSION,
+};
 use windows_sys::Win32::System::Registry::{
     RegCloseKey, RegDeleteValueW, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW, HKEY,
     HKEY_CURRENT_USER, KEY_QUERY_VALUE, KEY_SET_VALUE, REG_DWORD, REG_SZ,
 };
 use windows_sys::Win32::UI::Shell::ShellExecuteW;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    FindWindowW, MessageBoxW, PostMessageW, SendMessageTimeoutW, HWND_BROADCAST, IDYES,
-    MB_ICONINFORMATION, MB_ICONQUESTION, MB_OK, MB_YESNO, SMTO_ABORTIFHUNG, SW_HIDE, SW_SHOWNORMAL,
-    WM_CLOSE, WM_SETTINGCHANGE, WM_THEMECHANGED,
+    CreateWindowExW, DefWindowProcW, DispatchMessageW, FindWindowW, GetMessageW, MessageBoxW,
+    PostMessageW, RegisterClassW, SendMessageTimeoutW, TranslateMessage, HWND_BROADCAST,
+    HWND_MESSAGE, IDYES, MB_ICONINFORMATION, MB_ICONQUESTION, MB_OK, MB_YESNO, MSG,
+    SMTO_ABORTIFHUNG, SW_HIDE, SW_SHOWNORMAL, WM_CLOSE, WM_POWERBROADCAST, WM_SETTINGCHANGE,
+    WM_THEMECHANGED, WM_WTSSESSION_CHANGE, WNDCLASSW,
 };
 use winit::event::{Event, StartCause};
-use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
+
+const PBT_APMRESUMEAUTOMATIC: WPARAM = 0x12;
+const WTS_SESSION_UNLOCK: WPARAM = 0x8;
+const DEVICE_NOTIFY_WINDOW_HANDLE: u32 = 0x0;
 
 const THEME_KEY: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize";
 const RUN_KEY: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Run";
@@ -70,7 +83,10 @@ enum Theme {
 #[derive(Debug, Clone)]
 enum AppEvent {
     Menu(MenuId),
+    Wake,
 }
+
+static EVENT_PROXY: OnceLock<EventLoopProxy<AppEvent>> = OnceLock::new();
 
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
@@ -513,6 +529,70 @@ fn tick(cfg: &Config, elwt: &ActiveEventLoop) {
     elwt.set_control_flow(ControlFlow::WaitUntil(deadline_instant(next)));
 }
 
+unsafe extern "system" fn wake_window_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    let trigger = match msg {
+        WM_WTSSESSION_CHANGE => wparam == WTS_SESSION_UNLOCK,
+        WM_POWERBROADCAST => wparam == PBT_APMRESUMEAUTOMATIC,
+        _ => false,
+    };
+    if trigger {
+        if let Some(proxy) = EVENT_PROXY.get() {
+            let _ = proxy.send_event(AppEvent::Wake);
+        }
+    }
+    DefWindowProcW(hwnd, msg, wparam, lparam)
+}
+
+fn start_wake_listener() {
+    std::thread::spawn(|| {
+        let class_name = wide("WinThemeSwitcherWakeListener");
+        unsafe {
+            let hinstance = GetModuleHandleW(ptr::null());
+            let mut wc: WNDCLASSW = std::mem::zeroed();
+            wc.lpfnWndProc = Some(wake_window_proc);
+            wc.hInstance = hinstance;
+            wc.lpszClassName = class_name.as_ptr();
+            RegisterClassW(&wc);
+
+            let hwnd = CreateWindowExW(
+                0,
+                class_name.as_ptr(),
+                ptr::null(),
+                0,
+                0,
+                0,
+                0,
+                0,
+                HWND_MESSAGE,
+                ptr::null_mut(),
+                hinstance,
+                ptr::null(),
+            );
+            if (hwnd as usize) == 0 {
+                return;
+            }
+            WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION);
+            let mut handle = ptr::null_mut();
+            PowerRegisterSuspendResumeNotification(
+                DEVICE_NOTIFY_WINDOW_HANDLE,
+                hwnd as _,
+                &mut handle,
+            );
+
+            let mut msg: MSG = std::mem::zeroed();
+            while GetMessageW(&mut msg, ptr::null_mut(), 0, 0) > 0 {
+                TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+        }
+    });
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
     ensure_com_initialized();
 
@@ -528,6 +608,8 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let event_loop = EventLoop::<AppEvent>::with_user_event().build()?;
     let proxy = event_loop.create_proxy();
+    let _ = EVENT_PROXY.set(event_loop.create_proxy());
+    start_wake_listener();
 
     let tray_menu = Menu::new();
     let open_cfg_i = MenuItem::new("Open Config", true, None);
@@ -559,6 +641,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     event_loop.run(move |event, elwt| match event {
         Event::NewEvents(StartCause::Init)
         | Event::NewEvents(StartCause::ResumeTimeReached { .. }) => {
+            tick(&cfg, elwt);
+        }
+        Event::UserEvent(AppEvent::Wake) => {
             tick(&cfg, elwt);
         }
         Event::UserEvent(AppEvent::Menu(id)) => {

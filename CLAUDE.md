@@ -103,7 +103,22 @@ struct Config {
 
 `set_auto_start(true)` writes `HKCU\...\Run\WinThemeSwitcher` with the current exe path (quoted). `set_auto_start(false)` calls `RegDeleteValueW` — both directions work.
 
-### 5. Tray + menu
+### 5. Wake on session unlock / power resume
+
+`ControlFlow::WaitUntil` uses `Instant`, which is monotonic and pauses across system suspend. Before this listener existed, a sunrise transition scheduled at, say, 6 AM would never fire if the machine was asleep through it: after wake at 8 AM, the runtime still saw the deadline as ~22 hours away (24 − sleep duration). The user had to click Refresh to recover.
+
+`start_wake_listener` spawns a worker thread that creates a hidden message-only window (`HWND_MESSAGE`) and registers two notifications against it:
+
+- `WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION)` → delivers `WM_WTSSESSION_CHANGE`. We act on `WTS_SESSION_UNLOCK` (the user re-authenticated after Win+L or wake-from-sleep with a lock screen).
+- `PowerRegisterSuspendResumeNotification(DEVICE_NOTIFY_WINDOW_HANDLE, hwnd, ...)` → delivers `WM_POWERBROADCAST`. We act on `PBT_APMRESUMEAUTOMATIC` (resume from sleep without a lock screen — covers machines that don't require re-auth on resume).
+
+Both routes call `proxy.send_event(AppEvent::Wake)` via a process-wide `OnceLock<EventLoopProxy<AppEvent>>` (the WindowProc is `extern "system"` and can't capture). The main event loop handles `AppEvent::Wake` exactly like a scheduled transition — calls `tick()`, which is state-aware (no-op if `current == target`). Idempotent across both events firing in sequence.
+
+`WTS_SESSION_UNLOCK` (0x8) and `DEVICE_NOTIFY_WINDOW_HANDLE` (0x0) are defined as local consts because windows-sys 0.59 doesn't re-export them under their expected modules. Values are stable Win32 ABI; safe to inline.
+
+**Why this doesn't resurrect the manual-override-fight bug**: neither event fires when the user changes theme in Settings — `WM_WTSSESSION_CHANGE` is session lifecycle only, `WM_POWERBROADCAST` is power state only. So ticking on these is safe.
+
+### 6. Tray + menu
 
 Menu: Open Config, Refresh, separator, Quit. Menu events flow through `MenuEvent::set_event_handler` → `EventLoopProxy::send_event(AppEvent::Menu(id))` so clicks wake the event loop even when it's on a 12-hour WaitUntil.
 
@@ -114,12 +129,12 @@ Tray icon is generated in `make_tray_icon`: 32×32 RGBA, half orange (sun) + hal
 - `chrono`, `sun-times` — sunrise/sunset math.
 - `serde` + `serde_json` — config persistence.
 - `tray-icon`, `winit` — tray + event loop. Menu types come from `muda` (re-exported under `tray_icon::menu`).
-- `windows-sys` (features: `Win32_Foundation`, `Win32_System_Registry`, `Win32_UI_WindowsAndMessaging`, `Win32_UI_Shell`, `Win32_Graphics_Dwm`) — raw Win32 FFI.
+- `windows-sys` (features: `Win32_Foundation`, `Win32_System_LibraryLoader`, `Win32_System_Power`, `Win32_System_RemoteDesktop`, `Win32_System_Registry`, `Win32_UI_WindowsAndMessaging`, `Win32_UI_Shell`, `Win32_Graphics_Dwm`) — raw Win32 FFI. Library loader / power / remote-desktop are for the wake listener (`GetModuleHandleW`, `PowerRegisterSuspendResumeNotification`, `WTSRegisterSessionNotification`).
 - `windows` (features: `Devices_Geolocation`, `Foundation`, `Win32_System_Com`) — WinRT Geolocator + COM init. Feature-gated to keep compile time manageable.
 
 ## Invariants — don't break these
 
-- **`tick()` scope**: only Init / ResumeTimeReached / Refresh. Adding a callsite elsewhere resurrects the manual-override-fight bug.
+- **`tick()` scope**: only Init / ResumeTimeReached / Refresh / `AppEvent::Wake` (session unlock + power resume). Adding a callsite for any *other* trigger — especially anything that fires on `WM_SETTINGCHANGE` — resurrects the manual-override-fight bug. The wake events are safe specifically because they don't fire when the user changes the theme in Settings.
 - **`poke_shell` after every apply**: the entire reason this app exists over Auto Dark Mode.
 - **Refresh forces apply** (bypasses state check); scheduled transitions respect it (no-op if already matching). Don't invert.
 - **`ensure_com_initialized` before any WinRT call**: otherwise Geolocator returns errors silently.
