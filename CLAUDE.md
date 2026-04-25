@@ -118,6 +118,8 @@ Both routes call `proxy.send_event(AppEvent::Wake)` via a process-wide `OnceLock
 
 **Why this doesn't resurrect the manual-override-fight bug**: neither event fires when the user changes theme in Settings — `WM_WTSSESSION_CHANGE` is session lifecycle only, `WM_POWERBROADCAST` is power state only. So ticking on these is safe.
 
+**Deliberate side effect**: a manual override that diverges from the schedule (e.g., user picks Dark mid-day when the schedule says Light) does *not* survive a lock/unlock or wake-from-sleep — `tick()` snaps back to the scheduled theme on `AppEvent::Wake`. This was tested explicitly in the v0.2.0 cycle and accepted as acceptable behavior. Preserving overrides across session events would require tracking the last theme *we* applied and only re-applying on Wake when `last_applied != target` (so a missed transition still reconciles, but a user override doesn't get clobbered). Not implemented; revisit if it becomes annoying.
+
 ### 6. Tray + menu
 
 Menu: Open Config, Refresh, separator, Quit. Menu events flow through `MenuEvent::set_event_handler` → `EventLoopProxy::send_event(AppEvent::Menu(id))` so clicks wake the event loop even when it's on a 12-hour WaitUntil.

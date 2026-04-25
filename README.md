@@ -14,7 +14,8 @@ Design priorities:
 - **Tiny binary** (~310 KB).
 - **Near-zero CPU** — event-driven, sleeps on a kernel timer between sunrise and sunset; no polling.
 - **Full theme swap** — wallpaper, accent colors, and mode change together via Windows `.theme` files.
-- **Respects manual overrides** — if you change the theme in Settings between transitions, the app won't fight you. It re-applies only at the next natural transition.
+- **Respects manual overrides** — changing the theme in Settings sticks until the next natural transition; the app won't fight ambient setting-change broadcasts.
+- **Catches up after sleep / lock** — if your machine is suspended through a sunrise (or you lock overnight), the theme reconciles to the schedule the moment you log back in. No need to click Refresh.
 
 ## Install
 
@@ -73,7 +74,7 @@ After editing the config, right-click the tray icon → **Refresh**. No restart 
 
 ## Antivirus false positives
 
-Kaspersky flags this binary as `VHO:Trojan.Win32.Agent.gen`. Microsoft Defender, Bitdefender, Avast, and Norton have similar generic detections. **The binary is not malicious** — the full source is in this repo (~560 lines in `src/main.rs`).
+Kaspersky flags this binary as `VHO:Trojan.Win32.Agent.gen`. Microsoft Defender, Bitdefender, Avast, and Norton have similar generic detections. **The binary is not malicious** — the full source is in this repo (~675 lines in `src/main.rs`).
 
 Why it looks suspicious to heuristics:
 - Unsigned executable from an unknown publisher
@@ -108,7 +109,8 @@ Long-term, code signing will reduce these flags — see [Roadmap](#roadmap).
 - **Theme apply.** `ShellExecuteW("open", <.theme file>)` hands the file to Windows' theme engine, which applies wallpaper + colors + mode atomically. Falls back to a DWORD-only Light/Dark toggle if the theme file is missing.
 - **Settings flash workaround.** Opening a `.theme` file via the shell briefly pops the Windows Settings app open. A detached thread finds `ApplicationFrameWindow` windows titled "Settings" / "Themes" / "Personalization" and posts `WM_CLOSE` to each for ~2 seconds. Net result: Settings flashes for a few hundred milliseconds and closes itself.
 - **Taskbar fix.** After the apply, the app broadcasts `WM_SETTINGCHANGE("ImmersiveColorSet")`, then sends `WM_THEMECHANGED` + a targeted `WM_SETTINGCHANGE` to `Shell_TrayWnd` and `Shell_SecondaryTrayWnd`, then calls `DwmFlush()`. This is what makes the taskbar repaint reliably on Win11.
-- **Override respect.** The event loop only re-evaluates on `StartCause::Init`, `StartCause::ResumeTimeReached`, or a user-driven Refresh. Ambient events (including the `WM_SETTINGCHANGE` Windows fires when *you* change a theme manually) don't trigger a re-apply.
+- **Override respect.** The event loop only re-evaluates on `StartCause::Init`, `StartCause::ResumeTimeReached`, a user-driven Refresh, or a session-resume signal (see *Wake recovery*). Ambient events (including the `WM_SETTINGCHANGE` Windows fires when *you* change a theme manually) don't trigger a re-apply.
+- **Wake recovery.** A worker thread owns a hidden message-only window registered for `WTSRegisterSessionNotification` (delivers `WM_WTSSESSION_CHANGE` → `WTS_SESSION_UNLOCK`) and `PowerRegisterSuspendResumeNotification` (delivers `WM_POWERBROADCAST` → `PBT_APMRESUMEAUTOMATIC`). On either event the listener dispatches into the main event loop, which reconciles to the scheduled theme. This works around the fact that `winit`'s `WaitUntil` deadline uses a monotonic clock that pauses across system suspend — without this listener, a sunrise scheduled for 6 AM would never fire if the machine slept through it. The trade-off: a manual override that diverges from the schedule (e.g., Dark at noon when the schedule says Light) snaps back to the schedule on lock/unlock or wake; it persists otherwise.
 
 Full architecture details in [CLAUDE.md](CLAUDE.md).
 
