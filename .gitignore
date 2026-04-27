@@ -19,3 +19,6 @@
 Thumbs.db
 desktop.ini
 .DS_Store
+
+# Claude Code worktree state (machine-local; not for sharing)
+.claude/worktrees/
