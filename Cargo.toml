@@ -21,6 +21,7 @@ winit = "0.30"
 version = "0.59"
 features = [
     "Win32_Foundation",
+    "Win32_System_Com",
     "Win32_System_LibraryLoader",
     "Win32_System_Power",
     "Win32_System_RemoteDesktop",

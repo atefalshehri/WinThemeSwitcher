@@ -30,13 +30,25 @@ The `win-theme-switcher.exe` at the repo root is the pre-Cargo Manus build (2.6 
 
 ## Kaspersky false positive — critical context
 
-The binary trips `VHO:Trojan.Win32.Agent.gen` (unsigned Rust exe + `HKCU\Run` writes + `HWND_BROADCAST` of `WM_SETTINGCHANGE` + direct `WM_THEMECHANGED` to `Shell_TrayWnd` + WinRT Geolocation = every AV heuristic signal). Plain **path-based exclusions are insufficient** — Kaspersky's Behavior Detection quarantines regardless. The working setup is a **Trusted Applications rule** (Kaspersky Settings → Security → Threats and Exclusions → Specify trusted applications) with all checkboxes ticked: Do not scan opened files, Do not monitor application activity, Do not inherit restrictions, Do not monitor child application activity, Allow interaction with Kaspersky interface.
+**Resolved as of the IThemeManager2 + code-signing migration** — both root causes of the AV friction were addressed simultaneously. The signed binary (`CN=WinThemeSwitcher Self-Signed` cert in `Cert:\CurrentUser\Root` and `…\TrustedPublisher`) collapses the Authenticode-trust signal, and tier-1 theme apply via `IThemeManager2::SetCurrentTheme` removes the `HWND_BROADCAST WM_SETTINGCHANGE` + direct `WM_THEMECHANGED` signals that previously tripped behavior heuristics. **Sign every release build** (see Build section above) — unsigned builds will resurrect the issue. Everything below is preserved as historical context for unsigned-build scenarios; the current signed build should not need any of it.
+
+### Historical: pre-signing trust setup
+
+The unsigned binary tripped `VHO:Trojan.Win32.Agent.gen` (Rust exe with no Authenticode signature + `HKCU\Run` writes + `HWND_BROADCAST` of `WM_SETTINGCHANGE` + direct `WM_THEMECHANGED` to `Shell_TrayWnd` + WinRT Geolocation = every AV heuristic signal). Plain **path-based exclusions were insufficient** — Kaspersky's Behavior Detection quarantined regardless. The pre-signing workaround was a **Trusted Applications rule** (Kaspersky Settings → Security → Threats and Exclusions → Specify trusted applications) with all checkboxes ticked: Do not scan opened files, Do not monitor application activity, Do not inherit restrictions, Do not monitor child application activity, Allow interaction with Kaspersky interface.
 
 Rules are **path-based**, so two currently exist:
 1. `C:\Tools\WinThemeSwitcher\win-theme-switcher.exe` (the deployed binary — stable).
 2. `C:\Users\atef\Documents\Projects\WinThemeSwitcher\target\release\win-theme-switcher.exe` (the build output — rewritten by each `cargo build`).
 
 If a future rebuild gets quarantined anyway (the hash changes and Kaspersky occasionally re-evaluates): drop a 0-byte placeholder at the path first (`Set-Content -Path ... -Value "" -Encoding Byte -Force`), re-add the trust rule while the placeholder exists, then rebuild. Same trick works for new deployment paths.
+
+### When the trust rule is not enough (KSN cloud verdict)
+
+Trusted Applications rules cover File Anti-Virus + Behavior Detection but **not Kaspersky Security Network (KSN) cloud reputation**. KSN can independently flag a fresh hash and pop a hostile two-button modal — *"Disinfect and restart"* / *"Try to disinfect without computer restart"* — with no Skip / Esc / X dismiss option. Both buttons quarantine. Adding a Threats and Exclusions entry mid-modal does **not** clear the in-progress verdict — Kaspersky finishes quarantining anyway, and even subsequent rebuilds can be flagged by `svchost.exe` (the indexer-style scanner running as `NT AUTHORITY\NETWORK SERVICE`) before the popup re-appears.
+
+The reliable workaround for a deploy session is to **right-click the tray K → Pause protection → 15 minutes**, then immediately copy + launch within that window. Once the process is loaded into memory it survives even after protection resumes (Windows holds the file handle; on-disk re-detection won't kill the running PID). The autostart re-creation in `set_auto_start(true)` runs each launch, so even if Kaspersky deletes the `HKCU\Run` value during a quarantine event, the next launch restores it.
+
+**Both long-term fixes are now in place** — see the resolution note at the top of this section. Code-signing landed via `New-SelfSignedCertificate` + signtool (cert in Root + TrustedPublisher). Tier-1 theme apply landed via the `IThemeManager2` COM interface (CLSID `{9324da94-50ec-4a14-a770-e90ca03e7c8f}`). The legacy paths and the trust-rule + KSN documentation in this section are kept for the contingency where the cert expires, the signtool step is skipped, or someone strips the signature.
 
 ## Build
 
@@ -47,23 +59,58 @@ Rust toolchain is at `%USERPROFILE%\.cargo\bin\` (rustup, not on global PATH). U
     --manifest-path "C:\Users\atef\Documents\Projects\WinThemeSwitcher\Cargo.toml"
 ```
 
-Default toolchain is `stable-x86_64-pc-windows-msvc` (MSVC Build Tools required; the GNU toolchain's bundled linker/dlltool was broken on this machine). Release profile: `opt-level = "z"`, `lto = true`, `codegen-units = 1`, `panic = "abort"`, `strip = true`. Output ~310 KB. No `build.rs` — `windows-sys` and `windows` self-link.
+Default toolchain is `stable-x86_64-pc-windows-msvc` (MSVC Build Tools required; the GNU toolchain's bundled linker/dlltool was broken on this machine). Release profile: `opt-level = "z"`, `lto = true`, `codegen-units = 1`, `panic = "abort"`, `strip = true`. Output ~330 KB. No `build.rs` — `windows-sys` and `windows` self-link.
+
+### Sign every release build
+
+A self-signed Authenticode cert (`CN=WinThemeSwitcher Self-Signed`) is installed in `Cert:\CurrentUser\My`, `Cert:\CurrentUser\Root`, and `Cert:\CurrentUser\TrustedPublisher`. Exported pfx at `%LOCALAPPDATA%\WinThemeSwitcher\signing\winthemeswitcher-signing.pfx` (password: `wts-local-signing` — local-only, not a secret worth protecting). Sign every fresh build before deploy:
+
+```powershell
+& "C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\signtool.exe" sign `
+    /f "$env:LOCALAPPDATA\WinThemeSwitcher\signing\winthemeswitcher-signing.pfx" `
+    /p "wts-local-signing" /fd SHA256 `
+    "C:\Users\atef\Documents\Projects\WinThemeSwitcher\target\release\win-theme-switcher.exe"
+```
+
+This collapses the Kaspersky heuristic signal — signed builds pass without tripping the AV-pause dance documented below. If the cert ever needs regenerating: `New-SelfSignedCertificate -Type CodeSigning -Subject "CN=WinThemeSwitcher Self-Signed" -KeyAlgorithm RSA -KeyLength 2048 -HashAlgorithm SHA256 -CertStoreLocation Cert:\CurrentUser\My -KeyExportPolicy Exportable -NotAfter (Get-Date).AddYears(10)` and re-add to Root + TrustedPublisher stores. Signature has no countersigned timestamp — it expires when the cert does (10 years out).
 
 ## Architecture — `src/main.rs`
 
-Single file, ~560 lines, event-driven, no polling.
+Single file, ~870 lines, event-driven, no polling. Logs every state transition to `events.log` next to the exe (rotated to `events.log.old` past 256 KB).
 
-### 1. Theme apply (`apply_theme` → `apply_theme_file` → `start_settings_closer` → `poke_shell`)
+### 1. Theme apply — three-tier fallback in `apply_theme`
 
-Preferred path: `ShellExecuteW("open", <.theme path>, ..., SW_HIDE)`. Windows' theme engine applies wallpaper + colors + mode atomically.
+Tiered worst-case-degradation: each tier is more invasive but less reliable than the one above. `apply_theme` walks them top-down, returning a `&'static str` tag for the tier that succeeded (logged in the `applied=` field of the `cause=...` line).
 
-**Theme file resolution** (`resolve_theme_file`): if `config.theme_day` / `theme_night` is a valid path, use it; otherwise fall back to system defaults at `%SystemRoot%\Resources\Themes\aero.theme` (light) / `dark.theme` (dark).
+#### Tier 1: `IThemeManager2` (preferred — `applied=theme-manager2`)
 
-**Settings flash workaround**: `ShellExecute` on a `.theme` file pops the Settings UWP app regardless of `SW_HIDE` (UWP apps manage their own visibility). `start_settings_closer` spawns a detached thread that loops 14× over ~2 s, `FindWindowW`-ing for class `ApplicationFrameWindow` with titles `"Settings"`, `"Themes"`, `"Personalization"` and `PostMessage(WM_CLOSE)` on each. Net effect: Settings flashes for ~300 ms then disappears. Full silence would require parsing the `.theme` file and applying each key individually (`SystemParametersInfo(SPI_SETDESKWALLPAPER, ...)` for wallpaper, DWORD writes for mode, accent color, etc.) — not implemented; filed under polish.
+Undocumented-but-stable COM interface in `themeui.dll` that the Settings UWP itself wraps. CLSID `{9324da94-50ec-4a14-a770-e90ca03e7c8f}`, IID `{c1e8c83e-845d-4d95-81db-e283fdffc000}`. Vtable layout in the `IThemeManager2Vtbl` struct at the top of `main.rs`.
 
-**Fallback path**: if the theme file is missing or ShellExecute fails, drop to DWORD-only mode (`write_theme_registry` writing `AppsUseLightTheme` + `SystemUsesLightTheme` 0/1) + broadcast + poke.
+Flow (`apply_via_theme_manager2`):
+1. Resolve the target `.theme` file's `[Theme]\nDisplayName=...` value. System themes use SHLoadIndirectString-style refs (`@%SystemRoot%\System32\themeui.dll,-2060`); literal strings work too. `resolve_theme_display_name` parses the INI, `resolve_indirect_string` calls `SHLoadIndirectString`. For `dark.theme` → `"Windows (dark)"`; for `aero.theme` → `"Windows (light)"`.
+2. `CoCreateInstance(CLSID_THEME_MANAGER2)` + `Init(0)`.
+3. Enumerate via `GetThemeCount` + `GetTheme(i)` + `ITheme::GetDisplayName(&BSTR)` until a name match. Free each BSTR with `SysFreeString`. **Don't cache the index across launches** — enumeration order is not stable.
+4. `SetCurrentTheme(NULL, idx, apply_now=1, apply_flags=NO_HOURGLASS, pack_flags=0)`. This is the only tier-1 call that applies; it does the WM_THEMECHANGED + WM_SETTINGCHANGE broadcasts internally.
 
-**`poke_shell` is load-bearing**: after any apply (theme file or DWORD), sends `WM_THEMECHANGED` + targeted `WM_SETTINGCHANGE("ImmersiveColorSet")` to `Shell_TrayWnd` and `Shell_SecondaryTrayWnd`, then `DwmFlush()`. This is the trick that makes the Win11 taskbar repaint reliably; **don't remove it**. If future Win versions add new taskbar window classes, extend the list here.
+Why this is the primary path: ShellExecuteW(`.theme`) silently fails when the user isn't actively interactive (post-WTS_SESSION_UNLOCK, ResumeTimeReached while away, scheduled while no foreground UI). The UWP activation pipeline swallows the apply request — Settings flashes briefly but never commits. `IThemeManager2` is in-process, has no UI dependency, and is what every serious tool uses (AutoDarkMode, wtheme, etc.). Apply latency is ~200 ms vs. the ~5 s poll-then-fail of the legacy path.
+
+**STA threading is mandatory** for this interface ("Shell crap is always STA" per AutoDarkMode source). The main thread already calls `CoInitializeEx(None, COINIT_APARTMENTTHREADED)` at startup; tier-1 apply runs from winit event handlers on that same thread, which is correct. **Never call from a worker thread** without CoInitializeEx(STA) on it first — you'll get RPC_E_WRONG_THREAD or silent corruption.
+
+#### Tier 2: `ShellExecuteW(.theme)` + `commit_watcher` (legacy — `applied=theme-file`)
+
+Fires only if tier 1 errors out (logged as `theme_manager2_err msg="…"`). Same as the original implementation: `ShellExecuteW("open", <.theme path>, ..., SW_HIDE)` to launch the Themes UWP, plus `start_settings_closer` thread to `PostMessage(WM_CLOSE)` the Settings window once it appears, plus a 300 ms sleep + `poke_shell` (taskbar repaint).
+
+**`commit_watcher` is the safety net for tier 2's silent-fail mode**: spawns a thread that polls `current_theme()` every 200 ms for 5 s. If the registry never matches the target → logs `commit_timeout target=…` and **falls through to tier 3 from inside the watcher thread** — writes the registry directly, broadcasts, pokes shell, polls again to confirm, logs `fallback_registry target=… confirmed=true after_ms=…`. Without this, tier 2's silent-fail leaves the user stuck (e.g. sunset fires, ShellExecute reports success, registry stays light, no recovery).
+
+If tier 1 is healthy this path is rarely entered. It exists as backup in case future Windows builds break the COM interface.
+
+#### Tier 3: registry-only (last resort — `applied=registry`)
+
+`write_theme_registry` writes `AppsUseLightTheme` + `SystemUsesLightTheme`, broadcasts `WM_SETTINGCHANGE("ImmersiveColorSet")` to `HWND_BROADCAST`, calls `poke_shell`. **Flips light/dark mode but not wallpaper.** Hit when the `.theme` file is missing entirely, or when reached as the commit_watcher fallback.
+
+**`poke_shell`** sends `WM_THEMECHANGED` + targeted `WM_SETTINGCHANGE("ImmersiveColorSet")` to `Shell_TrayWnd` and `Shell_SecondaryTrayWnd`, then `DwmFlush()`. Required for tiers 2 and 3 — `IThemeManager2::SetCurrentTheme` does the broadcast internally so tier 1 doesn't need it. If future Win versions add new taskbar window classes, extend the list.
+
+**Theme file resolution** (`resolve_theme_file`): if `config.theme_day` / `theme_night` is a valid path, use it; otherwise fall back to system defaults at `%SystemRoot%\Resources\Themes\aero.theme` (light) / `dark.theme` (dark). Custom user themes work with tier 1 only if they're already registered with Windows (i.e. installed via Settings → Themes). Otherwise tier 1 errors with `no installed theme matches DisplayName "…"` and tier 2 takes over.
 
 ### 2. Event loop — only tick on specific events
 
@@ -131,14 +178,17 @@ Tray icon is generated in `make_tray_icon`: 32×32 RGBA, half orange (sun) + hal
 - `chrono`, `sun-times` — sunrise/sunset math.
 - `serde` + `serde_json` — config persistence.
 - `tray-icon`, `winit` — tray + event loop. Menu types come from `muda` (re-exported under `tray_icon::menu`).
-- `windows-sys` (features: `Win32_Foundation`, `Win32_System_LibraryLoader`, `Win32_System_Power`, `Win32_System_RemoteDesktop`, `Win32_System_Registry`, `Win32_UI_WindowsAndMessaging`, `Win32_UI_Shell`, `Win32_Graphics_Dwm`) — raw Win32 FFI. Library loader / power / remote-desktop are for the wake listener (`GetModuleHandleW`, `PowerRegisterSuspendResumeNotification`, `WTSRegisterSessionNotification`).
-- `windows` (features: `Devices_Geolocation`, `Foundation`, `Win32_System_Com`) — WinRT Geolocator + COM init. Feature-gated to keep compile time manageable.
+- `windows-sys` (features: `Win32_Foundation`, `Win32_System_Com`, `Win32_System_LibraryLoader`, `Win32_System_Power`, `Win32_System_RemoteDesktop`, `Win32_System_Registry`, `Win32_UI_WindowsAndMessaging`, `Win32_UI_Shell`, `Win32_Graphics_Dwm`) — raw Win32 FFI. `Win32_System_Com` is for `CoCreateInstance` + `CLSCTX_INPROC_SERVER` (IThemeManager2). `SysFreeString` lives in `Win32_Foundation` in windows-sys 0.59 (not `Win32_System_Ole` as you might expect).
+- `windows` (features: `Devices_Geolocation`, `Foundation`, `Win32_System_Com`) — WinRT Geolocator + `CoInitializeEx` for the main thread's STA. Kept separate from `windows-sys` because the `windows` crate's typed bindings make Geolocator usable; raw `windows-sys` is fine for everything else.
 
 ## Invariants — don't break these
 
 - **`tick()` scope**: only Init / ResumeTimeReached / Refresh / `AppEvent::Wake` (session unlock + power resume). Adding a callsite for any *other* trigger — especially anything that fires on `WM_SETTINGCHANGE` — resurrects the manual-override-fight bug. The wake events are safe specifically because they don't fire when the user changes the theme in Settings.
-- **`poke_shell` after every apply**: the entire reason the Win11 taskbar repaints reliably here. Without it, the taskbar lags or stays on the previous theme until the user opens Settings or restarts Explorer.
+- **STA thread for IThemeManager2**: `ensure_com_initialized` runs `CoInitializeEx(None, COINIT_APARTMENTTHREADED)` first in `main`. All theme apply runs on that thread. Don't spawn worker threads to call `IThemeManager2` methods — they need their own `CoInitializeEx(STA)` and proper marshaling.
+- **`poke_shell` after tier-2 / tier-3 apply only**: tier 1 (`IThemeManager2::SetCurrentTheme`) does the broadcast internally — calling `poke_shell` after it is wasted work and re-introduces the AV-tripping `HWND_BROADCAST WM_SETTINGCHANGE` signal that tier 1 was supposed to eliminate. Keep `poke_shell` for the legacy paths only; don't add it to tier 1.
 - **Refresh forces apply** (bypasses state check); scheduled transitions respect it (no-op if already matching). Don't invert.
+- **Free BSTRs from `ITheme::GetDisplayName` with `SysFreeString`** — not `CoTaskMemFree`, and definitely don't leak. The wtheme reference treats this strictly.
+- **Vtable order in `IThemeManager2Vtbl`**: every method's slot index must match the COM ABI. Wrong order = calling the wrong method (silently catastrophic). The struct only declares the slots we call; trailing slots can be omitted but never reordered. Reference: namazso C# gist + wtheme C header (linked in main.rs comments).
 - **`ensure_com_initialized` before any WinRT call**: otherwise Geolocator returns errors silently.
 - **UTF-16 + NUL**: all Win32 wide strings go through `wide()` which appends the null terminator. Never pass a bare `&str` to a `*W` API.
 - **HWND null check**: `(hwnd as usize) == 0` — robust to `windows-sys` flipping between `*mut c_void` and `isize`.
