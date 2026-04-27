@@ -6,9 +6,9 @@ Automatically swap between two Windows 11 **themes** at local sunrise and sunset
 
 ## Why
 
-Windows has no native auto-theme feature. The main community alternative, [Auto Dark Mode](https://github.com/AutoDarkMode/Windows-Auto-Night-Mode), works well for most of the UI but frequently leaves the **taskbar** and some tray icons stuck on the previous theme — a known Win11 issue with how `WM_SETTINGCHANGE` propagates to Explorer.
+Windows has no native auto-theme feature. The standard approach — toggling `AppsUseLightTheme` / `SystemUsesLightTheme` and broadcasting `WM_SETTINGCHANGE` — frequently leaves the **taskbar** and some tray icons stuck on the previous theme, a known Win11 issue with how the broadcast propagates to Explorer.
 
-This app's differentiator: after applying a `.theme` file, it sends `WM_THEMECHANGED` **directly to `Shell_TrayWnd`** (and `Shell_SecondaryTrayWnd` for multi-monitor setups) and calls `DwmFlush()`. That forces the taskbar to repaint reliably without the "restart Explorer" hammer.
+This app handles that: after applying a `.theme` file, it sends `WM_THEMECHANGED` **directly to `Shell_TrayWnd`** (and `Shell_SecondaryTrayWnd` for multi-monitor setups) and calls `DwmFlush()`. That forces the taskbar to repaint reliably without the "restart Explorer" hammer.
 
 Design priorities:
 - **Tiny binary** (~310 KB).
@@ -173,4 +173,3 @@ MIT — see [LICENSE](LICENSE).
 - [`sun-times`](https://crates.io/crates/sun-times) — local sunrise/sunset math.
 - [`tray-icon`](https://crates.io/crates/tray-icon) + [`winit`](https://crates.io/crates/winit) — tray icon and event loop.
 - [`windows-sys`](https://crates.io/crates/windows-sys) + [`windows`](https://crates.io/crates/windows) — official Microsoft Rust bindings.
-- The [Auto Dark Mode](https://github.com/AutoDarkMode/Windows-Auto-Night-Mode) project for pioneering this space on Windows and making clear exactly where the Win11 taskbar quirk lives.

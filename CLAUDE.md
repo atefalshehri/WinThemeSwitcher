@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-Windows tray app (Rust) that swaps the full Windows **theme** (wallpaper + colors + light/dark mode) at local sunrise/sunset — macOS's auto-theme behavior, on Win11. Differentiators vs community alternatives like Auto Dark Mode: (a) aggressive shell-poke so the Win11 taskbar actually repaints, and (b) full `.theme` file swap so the wallpaper changes too — not just the DWORD toggle.
+Windows tray app (Rust) that swaps the full Windows **theme** (wallpaper + colors + light/dark mode) at local sunrise/sunset — macOS's auto-theme behavior, on Win11. Two differentiators vs the standard DWORD-toggle approach: (a) aggressive shell-poke so the Win11 taskbar actually repaints, and (b) full `.theme` file swap so the wallpaper changes too — not just the light/dark mode flag.
 
 ## Source tree vs deployed binary — read first
 
@@ -137,7 +137,7 @@ Tray icon is generated in `make_tray_icon`: 32×32 RGBA, half orange (sun) + hal
 ## Invariants — don't break these
 
 - **`tick()` scope**: only Init / ResumeTimeReached / Refresh / `AppEvent::Wake` (session unlock + power resume). Adding a callsite for any *other* trigger — especially anything that fires on `WM_SETTINGCHANGE` — resurrects the manual-override-fight bug. The wake events are safe specifically because they don't fire when the user changes the theme in Settings.
-- **`poke_shell` after every apply**: the entire reason this app exists over Auto Dark Mode.
+- **`poke_shell` after every apply**: the entire reason the Win11 taskbar repaints reliably here. Without it, the taskbar lags or stays on the previous theme until the user opens Settings or restarts Explorer.
 - **Refresh forces apply** (bypasses state check); scheduled transitions respect it (no-op if already matching). Don't invert.
 - **`ensure_com_initialized` before any WinRT call**: otherwise Geolocator returns errors silently.
 - **UTF-16 + NUL**: all Win32 wide strings go through `wide()` which appends the null terminator. Never pass a bare `&str` to a `*W` API.
