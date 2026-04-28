@@ -2,7 +2,7 @@
 
 Automatically swap between two Windows 11 **themes** at local sunrise and sunset — the macOS automatic dark mode experience, on Windows 11. Full theme swap (wallpaper + colors + light/dark mode), not just a DWORD toggle.
 
-> **Alpha software.** Your antivirus will likely flag the binary as a false positive — see [Antivirus false positives](#antivirus-false-positives) for why and how to allowlist it. No code signing yet.
+> **Alpha software.** Releases since v0.3.0 are Authenticode-signed with a self-signed code-signing certificate (`CN=WinThemeSwitcher Self-Signed`). On first install you'll need to trust the certificate — see [Verifying the signature](#verifying-the-signature). Some AVs may still flag the binary because the publisher cert isn't from a recognized CA — see [Antivirus false positives](#antivirus-false-positives).
 
 ## Why
 
@@ -11,11 +11,12 @@ Windows has no native auto-theme feature. The standard approach — toggling `Ap
 This app handles that: after applying a `.theme` file, it sends `WM_THEMECHANGED` **directly to `Shell_TrayWnd`** (and `Shell_SecondaryTrayWnd` for multi-monitor setups) and calls `DwmFlush()`. That forces the taskbar to repaint reliably without the "restart Explorer" hammer.
 
 Design priorities:
-- **Tiny binary** (~310 KB).
+- **Tiny binary** (~330 KB).
 - **Near-zero CPU** — event-driven, sleeps on a kernel timer between sunrise and sunset; no polling.
-- **Full theme swap** — wallpaper, accent colors, and mode change together via Windows `.theme` files.
+- **Full theme swap** — wallpaper, accent colors, and mode change together via Windows `.theme` files. Primary apply path is the `IThemeManager2` COM interface (the same one the Settings UWP wraps internally), with a two-tier fallback if it ever errors.
 - **Respects manual overrides** — changing the theme in Settings sticks until the next natural transition; the app won't fight ambient setting-change broadcasts.
 - **Catches up after sleep / lock** — if your machine is suspended through a sunrise (or you lock overnight), the theme reconciles to the schedule the moment you log back in. No need to click Refresh.
+- **Diagnostic log** at `events.log` next to the exe, recording every transition with cause, target, applied tier, and timing (rotated past 256 KB).
 
 ## Install
 
@@ -72,19 +73,37 @@ After editing the config, right-click the tray icon → **Refresh**. No restart 
 - **Refresh** — re-reads config, retries Windows Location if coords are still unset, and force-applies the correct theme.
 - **Quit** — exits. The auto-start registry entry persists; set `auto_start: false` and relaunch once if you want to remove it.
 
+## Verifying the signature
+
+Releases since v0.3.0 are signed with a self-signed Authenticode certificate (`CN=WinThemeSwitcher Self-Signed`, RSA-2048, SHA-256, valid through 2036). Because it's not from a recognized CA, Windows / SmartScreen / your AV will still treat it as untrusted on first install — but the signature lets you verify the file was actually built from the source in this repo and hasn't been tampered with in transit.
+
+Inspect the signature in PowerShell:
+
+```powershell
+Get-AuthenticodeSignature .\win-theme-switcher.exe | Format-List Status, SignerCertificate, StatusMessage
+```
+
+Status should be `UnknownError` or `NotTrusted` until you install the cert in your Trusted Root + Trusted Publisher stores. The publisher cert is bundled in the release zip as `WinThemeSwitcher-publisher.cer`. Install it once with:
+
+```powershell
+Import-Certificate -FilePath .\WinThemeSwitcher-publisher.cer -CertStoreLocation Cert:\CurrentUser\Root
+Import-Certificate -FilePath .\WinThemeSwitcher-publisher.cer -CertStoreLocation Cert:\CurrentUser\TrustedPublisher
+```
+
+After that, `Get-AuthenticodeSignature` should return `Status: Valid`, and most AVs will stop flagging the file. (Self-signed certs can't suppress SmartScreen entirely — that needs a paid CA cert.)
+
 ## Antivirus false positives
 
-Kaspersky flags this binary as `VHO:Trojan.Win32.Agent.gen`. Microsoft Defender, Bitdefender, Avast, and Norton have similar generic detections. **The binary is not malicious** — the full source is in this repo (~675 lines in `src/main.rs`).
+Even with a valid signature, some AVs may still flag this binary because the publisher cert isn't from a recognized CA. Kaspersky historically flagged unsigned builds as `VHO:Trojan.Win32.Agent.gen`; Microsoft Defender, Bitdefender, Avast, and Norton have similar generic detections. **The binary is not malicious** — the full source is in this repo (~1100 lines in `src/main.rs`).
 
 Why it looks suspicious to heuristics:
-- Unsigned executable from an unknown publisher
+- Self-signed publisher (not a recognized CA)
 - Writes to `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` (auto-start)
 - Writes `HKCU\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize` DWORDs
-- Broadcasts `WM_SETTINGCHANGE` to every top-level window (`HWND_BROADCAST`)
-- Sends `WM_THEMECHANGED` directly to shell windows
+- Tier 2/3 fallback paths broadcast `WM_SETTINGCHANGE` to every top-level window (`HWND_BROADCAST`) and send `WM_THEMECHANGED` directly to shell windows. Tier 1 (the primary path) avoids both — `IThemeManager2::SetCurrentTheme` does the broadcast internally.
 - Uses WinRT Geolocation
 - Runs hidden (no console, `windows_subsystem = "windows"`)
-- Tiny binary, aggressive release-profile stripping
+- Aggressive release-profile stripping
 
 Every one of those is a signal real malware also produces. The only thing separating this app from malware is *intent*, which a heuristic can't read.
 
@@ -101,16 +120,17 @@ Look for "Exceptions," "Allowed applications," "Whitelist," or "Trusted applicat
 
 After allowlisting, if the app gets quarantined on first run anyway, you may need to restore it from the AV's quarantine (or re-download and drop in place). Most AV rules are path-based, so future updates at the same path will usually survive.
 
-Long-term, code signing will reduce these flags — see [Roadmap](#roadmap).
-
 ## How it works
 
 - **Scheduling.** Uses the [`sun-times`](https://crates.io/crates/sun-times) crate to compute today's sunrise and sunset locally (no network). Sets `winit`'s `ControlFlow::WaitUntil(next_transition)` — the process blocks on a kernel object until the deadline or a menu event; **zero CPU** between transitions.
-- **Theme apply.** `ShellExecuteW("open", <.theme file>)` hands the file to Windows' theme engine, which applies wallpaper + colors + mode atomically. Falls back to a DWORD-only Light/Dark toggle if the theme file is missing.
-- **Settings flash workaround.** Opening a `.theme` file via the shell briefly pops the Windows Settings app open. A detached thread finds `ApplicationFrameWindow` windows titled "Settings" / "Themes" / "Personalization" and posts `WM_CLOSE` to each for ~2 seconds. Net result: Settings flashes for a few hundred milliseconds and closes itself.
-- **Taskbar fix.** After the apply, the app broadcasts `WM_SETTINGCHANGE("ImmersiveColorSet")`, then sends `WM_THEMECHANGED` + a targeted `WM_SETTINGCHANGE` to `Shell_TrayWnd` and `Shell_SecondaryTrayWnd`, then calls `DwmFlush()`. This is what makes the taskbar repaint reliably on Win11.
+- **Theme apply.** Three-tier fallback in `apply_theme`:
+  1. **`IThemeManager2`** (primary) — undocumented-but-stable COM interface in `themeui.dll` (CLSID `9324da94-50ec-4a14-a770-e90ca03e7c8f`), the same API the Settings UWP wraps internally. `SetCurrentTheme(idx)` applies wallpaper + colors + mode atomically and broadcasts `WM_THEMECHANGED` itself. ~200 ms latency, no Settings flash, no manual broadcast needed.
+  2. **`ShellExecuteW(.theme)`** + Settings closer thread — legacy path, kept as backup if Microsoft removes the COM interface. A `commit_watcher` polls the registry for 5 s after this fires; if the apply silently failed (observed when the schedule fires while no foreground UI is active), it auto-promotes to tier 3.
+  3. **Direct registry write** — last resort. Writes `AppsUseLightTheme` / `SystemUsesLightTheme`, broadcasts `WM_SETTINGCHANGE("ImmersiveColorSet")`, sends `WM_THEMECHANGED` to `Shell_TrayWnd` and `Shell_SecondaryTrayWnd`, calls `DwmFlush()`. Flips light/dark mode but **not the wallpaper** (would need a `.theme` file apply for that).
+- **Taskbar fix.** Tier 1's `SetCurrentTheme` handles taskbar repaint internally. Tiers 2 and 3 send `WM_THEMECHANGED` + targeted `WM_SETTINGCHANGE("ImmersiveColorSet")` to `Shell_TrayWnd` and `Shell_SecondaryTrayWnd` plus `DwmFlush()` — the trick that makes the Win11 taskbar repaint reliably on the legacy paths.
 - **Override respect.** The event loop only re-evaluates on `StartCause::Init`, `StartCause::ResumeTimeReached`, a user-driven Refresh, or a session-resume signal (see *Wake recovery*). Ambient events (including the `WM_SETTINGCHANGE` Windows fires when *you* change a theme manually) don't trigger a re-apply.
 - **Wake recovery.** A worker thread owns a hidden message-only window registered for `WTSRegisterSessionNotification` (delivers `WM_WTSSESSION_CHANGE` → `WTS_SESSION_UNLOCK`) and `PowerRegisterSuspendResumeNotification` (delivers `WM_POWERBROADCAST` → `PBT_APMRESUMEAUTOMATIC`). On either event the listener dispatches into the main event loop, which reconciles to the scheduled theme. This works around the fact that `winit`'s `WaitUntil` deadline uses a monotonic clock that pauses across system suspend — without this listener, a sunrise scheduled for 6 AM would never fire if the machine slept through it. The trade-off: a manual override that diverges from the schedule (e.g., Dark at noon when the schedule says Light) snaps back to the schedule on lock/unlock or wake; it persists otherwise.
+- **Diagnostic log.** Every transition writes a line to `events.log` next to the exe (rotated to `events.log.old` past 256 KB). Format is space-separated key=value: `<rfc3339-timestamp> cause=<init|resume-time|wake-unlock|wake-power|refresh> current=<light|dark> target=<light|dark> applied=<theme-manager2|theme-file|registry|skip> next=<next-transition>`. Useful for diagnosing silent failures.
 
 Full architecture details in [CLAUDE.md](CLAUDE.md).
 
@@ -127,9 +147,35 @@ cargo build --release
 # Output: target\release\win-theme-switcher.exe
 ```
 
-Release profile is tuned for size (`opt-level = "z"`, `lto = true`, `strip = true`, `panic = "abort"`). Final binary ≈310 KB.
+Release profile is tuned for size (`opt-level = "z"`, `lto = true`, `strip = true`, `panic = "abort"`). Final binary ≈330 KB.
 
 No `build.rs` — `windows-sys` and `windows` self-link.
+
+### Signing
+
+Release builds are signed with a self-signed Authenticode certificate. To sign your own builds:
+
+```powershell
+# One-time: generate a code-signing cert and install it to your Trusted Root + Trusted Publisher stores
+$cert = New-SelfSignedCertificate -Type CodeSigning -Subject "CN=WinThemeSwitcher Self-Signed" `
+    -KeyAlgorithm RSA -KeyLength 2048 -HashAlgorithm SHA256 `
+    -CertStoreLocation Cert:\CurrentUser\My -KeyExportPolicy Exportable `
+    -NotAfter (Get-Date).AddYears(10)
+foreach ($s in @("Root", "TrustedPublisher")) {
+    $store = New-Object System.Security.Cryptography.X509Certificates.X509Store($s, "CurrentUser")
+    $store.Open("ReadWrite"); $store.Add($cert); $store.Close()
+}
+$pwd = ConvertTo-SecureString "wts-local-signing" -Force -AsPlainText
+Export-PfxCertificate -Cert "Cert:\CurrentUser\My\$($cert.Thumbprint)" `
+    -FilePath "$env:LOCALAPPDATA\WinThemeSwitcher\signing\winthemeswitcher-signing.pfx" -Password $pwd
+
+# Per-build: sign after each cargo build --release
+& "C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\signtool.exe" sign `
+    /f "$env:LOCALAPPDATA\WinThemeSwitcher\signing\winthemeswitcher-signing.pfx" `
+    /p "wts-local-signing" /fd SHA256 .\target\release\win-theme-switcher.exe
+```
+
+The signature has no countersigned timestamp, so it expires when the cert does.
 
 ## Uninstall
 
@@ -146,12 +192,11 @@ No installer, no uninstaller — it's a single-exe tool by design.
 
 Rough priority order:
 
-- **Code signing** via [SignPath.io's free OSS program](https://signpath.io/foss) — will reduce SmartScreen prompts and AV flags for signed releases.
+- **CA-signed certificate** via [SignPath.io's free OSS program](https://signpath.io/foss) to replace the self-signed cert — would eliminate SmartScreen prompts and most remaining AV flags. (Self-signed already lands in v0.3.0.)
 - **Submit FP reports** to Kaspersky / Microsoft Defender / Bitdefender.
-- **Silent theme apply** — parse `.theme` files and apply wallpaper + DWORDs + accent color directly via `SystemParametersInfo` / registry, removing the Settings flash entirely.
-- **Log file** at `%LocalAppData%\WinThemeSwitcher\log.txt` for diagnosing silent failures.
 - **Migrate to `winit::application::ApplicationHandler`** (current code uses the deprecated `EventLoop::run` callback API).
 - **winget package** submission for `winget install WinThemeSwitcher`.
+- **In-app update check** against GitHub Releases (passive notification only — no auto-download).
 - **Test matrix**: Windows 10, multiple timezones, multi-monitor, HiDPI, non-English locales.
 
 ### Not planned
