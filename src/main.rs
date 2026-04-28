@@ -694,8 +694,16 @@ fn start_commit_watcher(target: Theme) {
 /// use this — the actual user-visible name is in a localized string table).
 /// Returns the resolved literal string, or None if the file is unreadable / has no
 /// DisplayName / the indirect-string resolution fails.
+///
+/// Reads as raw bytes + lossy UTF-8 decode rather than `fs::read_to_string`
+/// because system .theme files are sometimes Windows-1252 (e.g. `aero.theme`'s
+/// copyright comment has a raw `0xa9` for `©`, which is invalid UTF-8 and would
+/// make the strict decode fail outright). The keyword we care about
+/// (`DisplayName=`) is pure ASCII, and comment lines (which contain the funky
+/// bytes) are skipped before any lossy replacement matters.
 fn resolve_theme_display_name(theme_file: &Path) -> Option<String> {
-    let content = fs::read_to_string(theme_file).ok()?;
+    let bytes = fs::read(theme_file).ok()?;
+    let content = String::from_utf8_lossy(&bytes);
     let mut in_theme_section = false;
     for raw_line in content.lines() {
         let line = raw_line.trim();
