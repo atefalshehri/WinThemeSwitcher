@@ -115,6 +115,7 @@ No installer, no uninstaller — it's a single-exe tool by design.
 - **Submit FP reports** to Kaspersky / Microsoft Defender / Bitdefender.
 - **Migrate to `winit::application::ApplicationHandler`** (current code uses the deprecated `EventLoop::run` callback API).
 - **In-app update check** against GitHub Releases (passive notification only — no auto-download).
+- **Auto-detect coordinates when Location gets enabled** — currently `try_get_windows_location()` only retries on Init or Refresh. Subscribing to `Geolocator::StatusChanged` (or polling the access status briefly after the user clicks Yes on the enable-Location prompt) would let the app pick up coords automatically the moment Location is allowed, removing the "now click Refresh" step from first-run UX.
 - **winget package** submission for `winget install WinThemeSwitcher`.
 - **Test matrix**: Windows 10, multi-monitor, HiDPI, non-English locales.
 
