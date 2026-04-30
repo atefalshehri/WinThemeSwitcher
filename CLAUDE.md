@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-Windows tray app (Rust) that swaps the full Windows **theme** (wallpaper + colors + light/dark mode) at local sunrise/sunset — macOS's auto-theme behavior, on Win11. Two differentiators vs the standard DWORD-toggle approach: (a) aggressive shell-poke so the Win11 taskbar actually repaints, and (b) full `.theme` file swap so the wallpaper changes too — not just the light/dark mode flag.
+Windows tray app (Rust) that swaps the full Windows **theme** (wallpaper + colors + light/dark mode) at local sunrise/sunset — macOS's auto-theme behavior, on Win11. Primary apply path is the `IThemeManager2` COM interface (the same one the Settings UWP wraps internally) for atomic, in-process theme apply; a two-tier fallback (legacy `ShellExecute(.theme)` → registry-only DWORD toggle) handles the case where the COM interface errors. ~330 KB single-exe, signed Authenticode, no installer.
 
 ## Source tree vs deployed binary — read first
 
@@ -76,7 +76,7 @@ This collapses the Kaspersky heuristic signal — signed builds pass without tri
 
 ## Architecture — `src/main.rs`
 
-Single file, ~870 lines, event-driven, no polling. Logs every state transition to `events.log` next to the exe (rotated to `events.log.old` past 256 KB).
+Single file, ~1100 lines, event-driven, no polling. Logs every state transition to `events.log` next to the exe (rotated to `events.log.old` past 256 KB).
 
 ### 1. Theme apply — three-tier fallback in `apply_theme`
 
