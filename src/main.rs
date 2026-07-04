@@ -23,12 +23,12 @@ use windows_sys::Win32::Graphics::Dwm::DwmFlush;
 use windows_sys::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::Power::PowerRegisterSuspendResumeNotification;
-use windows_sys::Win32::System::RemoteDesktop::{
-    WTSRegisterSessionNotification, NOTIFY_FOR_THIS_SESSION,
-};
 use windows_sys::Win32::System::Registry::{
     RegCloseKey, RegDeleteValueW, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW, HKEY,
     HKEY_CURRENT_USER, KEY_QUERY_VALUE, KEY_SET_VALUE, REG_DWORD, REG_SZ,
+};
+use windows_sys::Win32::System::RemoteDesktop::{
+    WTSRegisterSessionNotification, NOTIFY_FOR_THIS_SESSION,
 };
 use windows_sys::Win32::UI::Shell::{SHLoadIndirectString, ShellExecuteW};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
@@ -86,7 +86,8 @@ const THEME_APPLY_FLAG_NO_HOURGLASS: i32 = 1 << 8;
 #[repr(C)]
 struct IThemeManager2Vtbl {
     // IUnknown
-    query_interface: unsafe extern "system" fn(*mut c_void, *const GUID, *mut *mut c_void) -> HRESULT,
+    query_interface:
+        unsafe extern "system" fn(*mut c_void, *const GUID, *mut *mut c_void) -> HRESULT,
     add_ref: unsafe extern "system" fn(*mut c_void) -> u32,
     release: unsafe extern "system" fn(*mut c_void) -> u32,
     // IThemeManager2 — only the slots we actually call. ORDER MATTERS — must
@@ -108,7 +109,8 @@ struct IThemeManager2Vtbl {
 
 #[repr(C)]
 struct IThemeVtbl {
-    query_interface: unsafe extern "system" fn(*mut c_void, *const GUID, *mut *mut c_void) -> HRESULT,
+    query_interface:
+        unsafe extern "system" fn(*mut c_void, *const GUID, *mut *mut c_void) -> HRESULT,
     add_ref: unsafe extern "system" fn(*mut c_void) -> u32,
     release: unsafe extern "system" fn(*mut c_void) -> u32,
     // GetDisplayName returns a BSTR (allocated with SysAllocString — release with SysFreeString).
@@ -189,14 +191,8 @@ impl ThemeMgr {
     /// (registry write + WM_THEMECHANGED + WM_SETTINGCHANGE broadcast all happen
     /// inside SetCurrentTheme). `pack_flags=0` matches Settings UWP defaults.
     unsafe fn set_current(&self, index: i32, apply_flags: i32) -> Result<(), HRESULT> {
-        let hr = (self.vtbl().set_current_theme)(
-            self.ptr,
-            ptr::null_mut(),
-            index,
-            1,
-            apply_flags,
-            0,
-        );
+        let hr =
+            (self.vtbl().set_current_theme)(self.ptr, ptr::null_mut(), index, 1, apply_flags, 0);
         if hr < 0 {
             return Err(hr);
         }
@@ -455,7 +451,14 @@ fn current_theme() -> Option<Theme> {
     let value = wide("SystemUsesLightTheme");
     unsafe {
         let mut hkey: HKEY = ptr::null_mut();
-        if RegOpenKeyExW(HKEY_CURRENT_USER, subkey.as_ptr(), 0, KEY_QUERY_VALUE, &mut hkey) != 0 {
+        if RegOpenKeyExW(
+            HKEY_CURRENT_USER,
+            subkey.as_ptr(),
+            0,
+            KEY_QUERY_VALUE,
+            &mut hkey,
+        ) != 0
+        {
             return None;
         }
         let mut data: u32 = 0;
@@ -484,7 +487,14 @@ fn write_theme_registry(theme: Theme) -> Result<(), Box<dyn Error>> {
     let sys = wide("SystemUsesLightTheme");
     unsafe {
         let mut hkey: HKEY = ptr::null_mut();
-        if RegOpenKeyExW(HKEY_CURRENT_USER, subkey.as_ptr(), 0, KEY_SET_VALUE, &mut hkey) != 0 {
+        if RegOpenKeyExW(
+            HKEY_CURRENT_USER,
+            subkey.as_ptr(),
+            0,
+            KEY_SET_VALUE,
+            &mut hkey,
+        ) != 0
+        {
             return Err("RegOpenKeyExW failed for Personalize".into());
         }
         RegSetValueExW(
@@ -575,7 +585,10 @@ fn resolve_theme_file(theme: Theme, cfg: &Config) -> PathBuf {
         Theme::Light => "aero.theme",
         Theme::Dark => "dark.theme",
     };
-    PathBuf::from(win_dir).join("Resources").join("Themes").join(leaf)
+    PathBuf::from(win_dir)
+        .join("Resources")
+        .join("Themes")
+        .join(leaf)
 }
 
 fn apply_theme_file(path: &std::path::Path) -> bool {
@@ -843,7 +856,14 @@ fn set_auto_start(enable: bool) -> Result<(), Box<dyn Error>> {
     let name = wide(APP_NAME);
     unsafe {
         let mut hkey: HKEY = ptr::null_mut();
-        if RegOpenKeyExW(HKEY_CURRENT_USER, subkey.as_ptr(), 0, KEY_SET_VALUE, &mut hkey) != 0 {
+        if RegOpenKeyExW(
+            HKEY_CURRENT_USER,
+            subkey.as_ptr(),
+            0,
+            KEY_SET_VALUE,
+            &mut hkey,
+        ) != 0
+        {
             return Err("RegOpenKeyExW failed for Run".into());
         }
         if enable {
