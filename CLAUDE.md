@@ -146,6 +146,8 @@ On failure (service off / permission denied): `ask_enable_location()` MessageBox
 
 Exe-relative path (`current_exe().parent().join("config.json")`, never CWD). `#[serde(default)]` at struct level makes missing/unknown fields safe.
 
+**Broken files are never overwritten** (v0.3.2; unit-tested). `load_config_at(path) -> Result<Config, String>`: missing file → first-run, defaults written via `create_new` (so a file appearing in a delete-then-rename save window wins); empty/whitespace file → self-heals to defaults (crash-mid-write leftover, nothing to preserve); any other read/parse failure → `Err`, file untouched. Errors go through `report_config_error`: a `config_error` log line (inner quotes swapped to `'` to keep the `msg="…"` field parseable) plus a MessageBox on a **detached thread** (an `AtomicBool` prevents stacking) — never block startup or the event loop on it. Broken-config session policy: startup runs read-only against the file (in-memory defaults + best-effort WinRT coords, no `save_config`, **no `set_auto_start`** — the fallback `auto_start: true` must not override a broken file's `false`); Refresh keeps the last-known-good config and reports. `save_config` must only ever be called with a config successfully loaded from disk this session.
+
 ```rust
 struct Config {
     latitude: f64,
@@ -158,7 +160,7 @@ struct Config {
 
 `has_location()` returns false when both coords are `0.0` (null-island sentinel used for first-run detection).
 
-`set_auto_start(true)` writes `HKCU\...\Run\WinThemeSwitcher` with the current exe path (quoted). `set_auto_start(false)` calls `RegDeleteValueW` — both directions work. `main()` and the Refresh handler call `set_auto_start(cfg.auto_start)` unconditionally, so flipping the flag takes effect at the next launch or Refresh (before 2026-07-04 only the `true` direction was wired up and a `false` flag left the Run entry in place).
+`set_auto_start(true)` writes `HKCU\...\Run\WinThemeSwitcher` with the current exe path (quoted). `set_auto_start(false)` calls `RegDeleteValueW` — both directions work. `main()` (on a successful load only — see broken-file policy above) and the Refresh handler (always, using the last-known-good config when the reload fails — Refresh re-asserting the Run value is the documented recovery when an AV quarantine deletes it) call `set_auto_start(cfg.auto_start)`, so flipping the flag takes effect at the next launch or Refresh (before 2026-07-04 only the `true` direction was wired up and a `false` flag left the Run entry in place).
 
 ### 5. Wake on session unlock / power resume
 

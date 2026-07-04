@@ -119,7 +119,7 @@ Versioning before 1.0: a **patch** (0.x.y → 0.x.y+1) is pure bug fixes; a **mi
 
 | Version | Type | Contents |
 |---|---|---|
-| **v0.3.2** | patch | Sunrise/sunset day-bracketing fix + scheduling tests + CI gate (on main, unreleased); never overwrite `config.json` on a parse error |
+| **v0.3.2** | patch | **Shipped 2026-07-04.** Sunrise/sunset day-bracketing fix + scheduling tests + CI gate; `config.json` never overwritten on a parse error (error is logged + shown in a non-blocking dialog, empty file self-heals, autostart setting survives a broken file) |
 | **v0.4.0** | minor | Preserve manual overrides across lock/unlock/resume (changes documented behavior); "Toggle theme" tray item; fail-loudly bundle (panic hook, startup MessageBox, wake-listener logging, single-instance mutex, bounded apply retry); remaining unit tests (config parsing, `.theme`-name resolution) |
 | **v0.5.0** | minor | Scripted build → sign → verify → upload; first release not marked prerelease (fixes `/releases/latest`); candidate point to launch the Scoop bucket |
 | **v0.6.0** | minor | SignPath CA signing in CI (ends the manual signed-asset swap); submit the first CA-signed binary to Defender + Kaspersky |
@@ -128,12 +128,11 @@ Versioning before 1.0: a **patch** (0.x.y → 0.x.y+1) is pure bug fixes; a **mi
 
 ### Correctness fixes
 
-- **Never overwrite `config.json` on a parse error.** Today a JSON typo (e.g. a single backslash in a theme path) plus Refresh silently resets the file to defaults, wiping coordinates and custom theme paths — via the exact hand-edit flow the first-run dialogs instruct. Keep the file, log the error, and tell the user when Refresh hits it.
 - **Preserve manual overrides across lock/unlock and resume.** A theme picked manually in Settings is currently snapped back to schedule on the next Win+L unlock or wake-from-sleep. Fix: track the last *scheduled* target on every tick and skip the wake-time re-apply when it hasn't changed (missed transitions still reconcile). Once that lands, add a **"Toggle theme" tray item** — an action, not GUI configuration.
 
 ### Foundation
 
-- **Extend the unit tests.** The scheduling math is covered (UTC+13, polar, and midnight-sunset fixtures) and `cargo test` is a hard CI gate since 2026-07-04, when the sunrise/sunset day-bracketing bug (permanent dark mode in UTC+13/+14 timezones) was fixed. Still to cover: config parsing and `.theme`-name resolution. Replaces the old "manual test matrix" item: Windows 10 hit end-of-support in Oct 2025, and the multi-monitor/HiDPI surface is one 32×32 tray icon.
+- **Extend the unit tests.** The scheduling math (UTC+13, polar, and midnight-sunset fixtures) and config loading (parse-error preservation, first-run, empty-file heal) are covered, and `cargo test` is a hard CI gate since 2026-07-04. Still to cover: `.theme`-name resolution. Replaces the old "manual test matrix" item: Windows 10 hit end-of-support in Oct 2025, and the multi-monitor/HiDPI surface is one 32×32 tray icon.
 - **Fail loudly instead of silently.** A panic hook that writes to `events.log` before abort (`panic = "abort"` + windowed subsystem currently means zero-trace death), a MessageBox + log line when startup fails (e.g. tray creation racing the taskbar at login), logging on wake-listener registration failures, a single-instance mutex, and a bounded retry when a theme apply fails (today the next attempt can be ~12 h away).
 
 ### Release & distribution (dependency chain, in order)

@@ -5,6 +5,7 @@ use std::ffi::c_void;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::ptr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
@@ -34,7 +35,7 @@ use windows_sys::Win32::UI::Shell::{SHLoadIndirectString, ShellExecuteW};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DispatchMessageW, FindWindowW, GetMessageW, MessageBoxW,
     PostMessageW, RegisterClassW, SendMessageTimeoutW, TranslateMessage, HWND_BROADCAST,
-    HWND_MESSAGE, IDYES, MB_ICONINFORMATION, MB_ICONQUESTION, MB_OK, MB_YESNO, MSG,
+    HWND_MESSAGE, IDYES, MB_ICONINFORMATION, MB_ICONQUESTION, MB_ICONWARNING, MB_OK, MB_YESNO, MSG,
     SMTO_ABORTIFHUNG, SW_HIDE, SW_SHOWNORMAL, WM_CLOSE, WM_POWERBROADCAST, WM_SETTINGCHANGE,
     WM_THEMECHANGED, WM_WTSSESSION_CHANGE, WNDCLASSW,
 };
@@ -310,20 +311,49 @@ fn theme_str(t: Option<Theme>) -> &'static str {
     }
 }
 
-fn load_or_create_config() -> Config {
-    let path = config_path();
-    if let Ok(content) = fs::read_to_string(&path) {
-        if let Ok(cfg) = serde_json::from_str::<Config>(&content) {
-            return cfg;
+/// Load the config from `path`. A missing file is first-run: defaults are
+/// written and returned. `Err` means the file EXISTS but could not be read or
+/// parsed — it is left untouched on disk so a hand-edit typo can be fixed
+/// instead of silently wiping the user's coordinates and theme paths.
+fn load_config_at(path: &Path) -> Result<Config, String> {
+    match fs::read_to_string(path) {
+        Ok(content) if content.trim().is_empty() => {
+            // A crash mid-write (fs::write truncates before writing) leaves
+            // a 0-byte file. Nothing in it to preserve — self-heal like
+            // first run instead of erroring on every launch.
+            let cfg = Config::default();
+            if let Ok(json) = serde_json::to_string_pretty(&cfg) {
+                let _ = fs::write(path, json);
+            }
+            Ok(cfg)
         }
+        Ok(content) => serde_json::from_str::<Config>(&content)
+            .map_err(|e| format!("config.json is not valid JSON: {e}")),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let cfg = Config::default();
+            if let Ok(json) = serde_json::to_string_pretty(&cfg) {
+                // create_new, not fs::write: if the file appears between our
+                // read and this write (an editor saving via delete-then-
+                // rename), the user's file wins and the defaults are dropped.
+                use std::io::Write;
+                if let Ok(mut f) = fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(path)
+                {
+                    let _ = f.write_all(json.as_bytes());
+                }
+            }
+            Ok(cfg)
+        }
+        Err(e) => Err(format!("config.json could not be read: {e}")),
     }
-    let cfg = Config::default();
-    if let Ok(json) = serde_json::to_string_pretty(&cfg) {
-        let _ = fs::write(&path, json);
-    }
-    cfg
 }
 
+/// Serialize `cfg` over config.json unconditionally. Only call with a Config
+/// that was successfully loaded from disk this session — persisting a
+/// default/fallback Config here is exactly the settings-wipe bug fixed in
+/// v0.3.2 (broken files must stay on disk for the user to repair).
 fn save_config(cfg: &Config) -> Result<(), Box<dyn Error>> {
     let json = serde_json::to_string_pretty(cfg)?;
     fs::write(config_path(), json)?;
@@ -380,55 +410,74 @@ fn open_location_settings() {
     }
 }
 
+fn show_message_box(title: &str, body: &str, flags: u32) -> i32 {
+    let title_w = wide(title);
+    let body_w = wide(body);
+    unsafe { MessageBoxW(ptr::null_mut(), body_w.as_ptr(), title_w.as_ptr(), flags) }
+}
+
 fn ask_enable_location() -> bool {
-    let title = wide("WinThemeSwitcher — Location");
-    let body = wide(
+    show_message_box(
+        "WinThemeSwitcher — Location",
         "Windows Location is off or not allowed for desktop apps.\n\n\
          Enable it so sunrise and sunset can be computed automatically?\n\n\
          Yes opens Windows Settings. No lets you enter coordinates manually in config.json.",
-    );
-    unsafe {
-        let r = MessageBoxW(
-            ptr::null_mut(),
-            body.as_ptr(),
-            title.as_ptr(),
-            MB_YESNO | MB_ICONQUESTION,
-        );
-        r == IDYES as i32
-    }
+        MB_YESNO | MB_ICONQUESTION,
+    ) == IDYES
 }
 
 fn show_enable_pending_message() {
-    let title = wide("WinThemeSwitcher");
-    let body = wide(
+    show_message_box(
+        "WinThemeSwitcher",
         "Turn on \"Location services\" in the Settings window that just opened. \
          Then right-click the WinThemeSwitcher tray icon and choose Refresh.",
+        MB_OK | MB_ICONINFORMATION,
     );
-    unsafe {
-        MessageBoxW(
-            ptr::null_mut(),
-            body.as_ptr(),
-            title.as_ptr(),
-            MB_OK | MB_ICONINFORMATION,
-        );
-    }
 }
 
 fn show_manual_setup_prompt() {
-    let title = wide("WinThemeSwitcher — Setup");
-    let body = wide(
+    show_message_box(
+        "WinThemeSwitcher — Setup",
         "Please set latitude and longitude in config.json (opening now), \
          then right-click the tray icon and choose Refresh.",
+        MB_OK | MB_ICONINFORMATION,
     );
-    unsafe {
-        MessageBoxW(
-            ptr::null_mut(),
-            body.as_ptr(),
-            title.as_ptr(),
-            MB_OK | MB_ICONINFORMATION,
-        );
-    }
     open_config_in_editor();
+}
+
+/// A config-error box is already on screen (repeated Refresh clicks with a
+/// still-broken file must not stack duplicates).
+static CONFIG_ERROR_BOX_OPEN: AtomicBool = AtomicBool::new(false);
+
+/// Log + tell the user their hand-edited config is broken and was left
+/// untouched. Called from startup and from a user-initiated Refresh. The
+/// MessageBox runs on a detached thread — a modal here would otherwise park
+/// startup before the tray exists, or stall the event loop (scheduled
+/// transitions, wake events) until dismissed. Plain MessageBoxW has no STA
+/// requirement, so a worker thread is fine.
+fn report_config_error(err: &str) {
+    log_event(&format!(
+        "{} config_error msg=\"{}\"",
+        Local::now().to_rfc3339(),
+        // serde_json errors quote the offending token; keep the log's
+        // quoted-field convention parseable.
+        err.replace('"', "'"),
+    ));
+    if CONFIG_ERROR_BOX_OPEN.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let body = format!(
+        "{err}\n\nThe file was left unchanged — your settings are still in it. \
+         Fix the error (tray menu → Open Config), then choose Refresh.",
+    );
+    std::thread::spawn(move || {
+        show_message_box(
+            "WinThemeSwitcher — Config error",
+            &body,
+            MB_OK | MB_ICONWARNING,
+        );
+        CONFIG_ERROR_BOX_OPEN.store(false, Ordering::SeqCst);
+    });
 }
 
 fn acquire_location(cfg: &mut Config) {
@@ -1122,13 +1171,30 @@ fn start_wake_listener() {
 fn main() -> Result<(), Box<dyn Error>> {
     ensure_com_initialized();
 
-    let mut cfg = load_or_create_config();
-
-    if !cfg.has_location() {
-        acquire_location(&mut cfg);
-    }
-
-    let _ = set_auto_start(cfg.auto_start);
+    // On a broken config file the session runs read-only against it: theme
+    // switching continues with in-memory defaults + best-effort coordinates,
+    // but nothing is persisted (acquire_location saves on success, which
+    // would overwrite the very file the user needs to fix) and the autostart
+    // registration is left exactly as the user last set it (the fallback
+    // default auto_start=true must not override a broken file's false).
+    let mut cfg = match load_config_at(&config_path()) {
+        Ok(mut cfg) => {
+            if !cfg.has_location() {
+                acquire_location(&mut cfg);
+            }
+            let _ = set_auto_start(cfg.auto_start);
+            cfg
+        }
+        Err(e) => {
+            report_config_error(&e);
+            let mut cfg = Config::default();
+            if let Some((lat, lon)) = try_get_windows_location() {
+                cfg.latitude = lat;
+                cfg.longitude = lon;
+            }
+            cfg
+        }
+    };
 
     let event_loop = EventLoop::<AppEvent>::with_user_event().build()?;
     let proxy = event_loop.create_proxy();
@@ -1180,15 +1246,25 @@ fn main() -> Result<(), Box<dyn Error>> {
             } else if id == open_cfg_id {
                 open_config_in_editor();
             } else if id == refresh_id {
-                cfg = load_or_create_config();
-                let _ = set_auto_start(cfg.auto_start);
-                if !cfg.has_location() {
-                    if let Some((lat, lon)) = try_get_windows_location() {
-                        cfg.latitude = lat;
-                        cfg.longitude = lon;
-                        let _ = save_config(&cfg);
+                match load_config_at(&config_path()) {
+                    Ok(new_cfg) => {
+                        cfg = new_cfg;
+                        if !cfg.has_location() {
+                            if let Some((lat, lon)) = try_get_windows_location() {
+                                cfg.latitude = lat;
+                                cfg.longitude = lon;
+                                let _ = save_config(&cfg);
+                            }
+                        }
                     }
+                    // Keep the last-known-good config; the broken file stays
+                    // on disk for the user to fix.
+                    Err(e) => report_config_error(&e),
                 }
+                // Runs in both arms: Refresh re-asserting the Run value from
+                // the (possibly last-known-good) config is the documented
+                // recovery path when e.g. an AV quarantine deletes it.
+                let _ = set_auto_start(cfg.auto_start);
                 tick(&cfg, elwt, "refresh", true);
             }
         }
@@ -1314,6 +1390,105 @@ mod tests {
         assert_eq!(before, Theme::Light);
         assert_eq!(at, Theme::Dark);
         assert!(next_after > next);
+    }
+
+    /// Temp file that cleans up after itself. Uniqueness comes from the
+    /// caller-supplied `name` — every test must pass a distinct one or the
+    /// parallel runner will clobber files across tests. The pid only guards
+    /// against two simultaneous `cargo test` processes.
+    struct TempConfig(PathBuf);
+
+    impl TempConfig {
+        fn new(name: &str, content: Option<&str>) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "wts-test-{}-{}-config.json",
+                std::process::id(),
+                name
+            ));
+            let _ = fs::remove_file(&path);
+            if let Some(c) = content {
+                fs::write(&path, c).unwrap();
+            }
+            Self(path)
+        }
+    }
+
+    impl Drop for TempConfig {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.0);
+        }
+    }
+
+    #[test]
+    fn config_missing_file_creates_defaults() {
+        let t = TempConfig::new("missing", None);
+        let cfg = load_config_at(&t.0).expect("first run must succeed");
+        assert!(!cfg.has_location());
+        assert!(cfg.auto_start);
+        // First run writes the defaults file, and it must round-trip.
+        let written = fs::read_to_string(&t.0).expect("defaults file must be created");
+        let reparsed: Config = serde_json::from_str(&written).unwrap();
+        assert!(!reparsed.has_location());
+    }
+
+    #[test]
+    fn config_valid_file_loads_values_and_stays_untouched() {
+        let json = r#"{
+  "latitude": 24.753,
+  "longitude": 46.765,
+  "auto_start": false,
+  "theme_day": "C:\\Themes\\day.theme",
+  "theme_night": null
+}"#;
+        let t = TempConfig::new("valid", Some(json));
+        let cfg = load_config_at(&t.0).expect("valid config must parse");
+        assert_eq!(cfg.latitude, 24.753);
+        assert_eq!(cfg.longitude, 46.765);
+        assert!(!cfg.auto_start);
+        assert_eq!(cfg.theme_day.as_deref(), Some("C:\\Themes\\day.theme"));
+        // Loading must never rewrite a readable file — byte-identical.
+        assert_eq!(fs::read_to_string(&t.0).unwrap(), json);
+    }
+
+    #[test]
+    fn config_parse_error_is_reported_and_file_kept() {
+        // The roadmap's exact failure: a hand-edited theme path with single
+        // backslashes is invalid JSON. This must NOT be reset to defaults.
+        let json =
+            r#"{"latitude": 24.7, "longitude": 46.7, "theme_night": "C:\Tools\night.theme"}"#;
+        let t = TempConfig::new("broken", Some(json));
+        let err = load_config_at(&t.0).expect_err("parse error must be reported, not defaulted");
+        assert!(!err.is_empty());
+        assert_eq!(
+            fs::read_to_string(&t.0).unwrap(),
+            json,
+            "a broken config file must be left byte-identical on disk"
+        );
+    }
+
+    #[test]
+    fn config_empty_file_is_healed_to_defaults() {
+        // A crash mid-write (fs::write truncates first) leaves a 0-byte
+        // config.json. There is nothing in it to preserve, so it must
+        // self-heal like first run instead of erroring on every launch.
+        let t = TempConfig::new("empty", Some("  \n"));
+        let cfg = load_config_at(&t.0).expect("empty file must heal to defaults");
+        assert!(!cfg.has_location());
+        assert!(cfg.auto_start);
+        let written = fs::read_to_string(&t.0).unwrap();
+        let reparsed: Config = serde_json::from_str(&written).unwrap();
+        assert!(!reparsed.has_location());
+    }
+
+    #[test]
+    fn config_unknown_and_missing_fields_are_defaulted() {
+        let json = r#"{"latitude": 1.0, "some_future_field": true}"#;
+        let t = TempConfig::new("partial", Some(json));
+        let cfg = load_config_at(&t.0).expect("unknown/missing fields are not errors");
+        assert_eq!(cfg.latitude, 1.0);
+        assert_eq!(cfg.longitude, 0.0);
+        assert!(cfg.auto_start, "missing fields fall back to defaults");
+        assert_eq!(fs::read_to_string(&t.0).unwrap(), json);
     }
 
     #[test]
