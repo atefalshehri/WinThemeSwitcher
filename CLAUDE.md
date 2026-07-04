@@ -68,12 +68,13 @@ A self-signed Authenticode cert (`CN=WinThemeSwitcher Self-Signed`, thumbprint `
 ```powershell
 & "C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\signtool.exe" sign `
     /n "WinThemeSwitcher Self-Signed" /fd SHA256 `
+    /tr http://timestamp.digicert.com /td SHA256 `
     "C:\Users\atef\Documents\Projects\WinThemeSwitcher\target\release\win-theme-switcher.exe"
 ```
 
 (Backup: the original pfx export still exists, but MSIX virtualization redirected it to the Claude desktop app's sandbox — `C:\Users\atef\AppData\Local\Packages\Claude_pzs8sxrjxfjjc\LocalCache\Local\WinThemeSwitcher\signing\winthemeswitcher-signing.pfx`, password `wts-local-signing`. The literal `%LOCALAPPDATA%\WinThemeSwitcher\` path never existed outside the sandbox.)
 
-This collapses the Kaspersky heuristic signal — signed builds pass without tripping the AV-pause dance documented above (KSN subsection). If the cert ever needs regenerating: `New-SelfSignedCertificate -Type CodeSigning -Subject "CN=WinThemeSwitcher Self-Signed" -KeyAlgorithm RSA -KeyLength 2048 -HashAlgorithm SHA256 -CertStoreLocation Cert:\CurrentUser\My -KeyExportPolicy Exportable -NotAfter (Get-Date).AddYears(10)` and re-add it to the Root store. Signature has no countersigned timestamp — it expires when the cert does.
+This collapses the Kaspersky heuristic signal — signed builds pass without tripping the AV-pause dance documented above (KSN subsection). If the cert ever needs regenerating: `New-SelfSignedCertificate -Type CodeSigning -Subject "CN=WinThemeSwitcher Self-Signed" -KeyAlgorithm RSA -KeyLength 2048 -HashAlgorithm SHA256 -CertStoreLocation Cert:\CurrentUser\My -KeyExportPolicy Exportable -NotAfter (Get-Date).AddYears(10)` and re-add it to the Root store. The `/tr` timestamp countersignature (added 2026-07-04, free DigiCert TSA, needs network at sign time) keeps signatures valid after the cert expires; release assets signed before that date lack it and expire with the cert in 2036.
 
 ### CI and releases (`.github/workflows/`)
 
