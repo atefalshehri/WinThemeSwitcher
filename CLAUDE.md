@@ -26,11 +26,11 @@ Copy-Item `
 Start-Process "C:\Tools\WinThemeSwitcher\win-theme-switcher.exe"
 ```
 
-The `win-theme-switcher.exe` at the repo root is the pre-Cargo Manus build (2.6 MB, 60s polling, no theme-file support). Historical; ignore.
+(The pre-Cargo Manus prototype exe that used to sit at the repo root has been deleted; `/win-theme-switcher.exe` stays in `.gitignore` so it can't be re-committed.)
 
 ## Kaspersky false positive — critical context
 
-**Resolved as of the IThemeManager2 + code-signing migration** — both root causes of the AV friction were addressed simultaneously. The signed binary (`CN=WinThemeSwitcher Self-Signed` cert in `Cert:\CurrentUser\Root` and `…\TrustedPublisher`) collapses the Authenticode-trust signal, and tier-1 theme apply via `IThemeManager2::SetCurrentTheme` removes the `HWND_BROADCAST WM_SETTINGCHANGE` + direct `WM_THEMECHANGED` signals that previously tripped behavior heuristics. **Sign every release build** (see Build section above) — unsigned builds will resurrect the issue. Everything below is preserved as historical context for unsigned-build scenarios; the current signed build should not need any of it.
+**Resolved as of the IThemeManager2 + code-signing migration** — both root causes of the AV friction were addressed simultaneously. The signed binary (`CN=WinThemeSwitcher Self-Signed` cert trusted via `Cert:\CurrentUser\Root`) collapses the Authenticode-trust signal, and tier-1 theme apply via `IThemeManager2::SetCurrentTheme` removes the `HWND_BROADCAST WM_SETTINGCHANGE` + direct `WM_THEMECHANGED` signals that previously tripped behavior heuristics. **Sign every release build** (see Build section below) — unsigned builds will resurrect the issue. Everything below is preserved as historical context for unsigned-build scenarios; the current signed build should not need any of it.
 
 ### Historical: pre-signing trust setup
 
@@ -48,11 +48,11 @@ Trusted Applications rules cover File Anti-Virus + Behavior Detection but **not 
 
 The reliable workaround for a deploy session is to **right-click the tray K → Pause protection → 15 minutes**, then immediately copy + launch within that window. Once the process is loaded into memory it survives even after protection resumes (Windows holds the file handle; on-disk re-detection won't kill the running PID). The autostart re-creation in `set_auto_start(true)` runs each launch, so even if Kaspersky deletes the `HKCU\Run` value during a quarantine event, the next launch restores it.
 
-**Both long-term fixes are now in place** — see the resolution note at the top of this section. Code-signing landed via `New-SelfSignedCertificate` + signtool (cert in Root + TrustedPublisher). Tier-1 theme apply landed via the `IThemeManager2` COM interface (CLSID `{9324da94-50ec-4a14-a770-e90ca03e7c8f}`). The legacy paths and the trust-rule + KSN documentation in this section are kept for the contingency where the cert expires, the signtool step is skipped, or someone strips the signature.
+**Both long-term fixes are now in place** — see the resolution note at the top of this section. Code-signing landed via `New-SelfSignedCertificate` + signtool (cert in My + Root; chain trust comes from Root — see Build section). Tier-1 theme apply landed via the `IThemeManager2` COM interface (CLSID `{9324da94-50ec-4a14-a770-e90ca03e7c8f}`). The legacy paths and the trust-rule + KSN documentation in this section are kept for the contingency where the cert expires, the signtool step is skipped, or someone strips the signature.
 
 ## Build
 
-Rust toolchain is at `%USERPROFILE%\.cargo\bin\` (rustup, not on global PATH). Use the full path:
+Rust toolchain is at `%USERPROFILE%\.cargo\bin\` via rustup — on the user PATH, so plain `cargo` resolves in a normal shell; the full path is kept here for shell-agnostic robustness:
 
 ```powershell
 & "$env:USERPROFILE\.cargo\bin\cargo.exe" build --release `
@@ -63,16 +63,22 @@ Default toolchain is `stable-x86_64-pc-windows-msvc` (MSVC Build Tools required;
 
 ### Sign every release build
 
-A self-signed Authenticode cert (`CN=WinThemeSwitcher Self-Signed`) is installed in `Cert:\CurrentUser\My`, `Cert:\CurrentUser\Root`, and `Cert:\CurrentUser\TrustedPublisher`. Exported pfx at `%LOCALAPPDATA%\WinThemeSwitcher\signing\winthemeswitcher-signing.pfx` (password: `wts-local-signing` — local-only, not a secret worth protecting). Sign every fresh build before deploy:
+A self-signed Authenticode cert (`CN=WinThemeSwitcher Self-Signed`, thumbprint `40E0D1EB58DAC255EB37E9D64FF34448E3D33D12`, expires 2036-04-28) lives in `Cert:\CurrentUser\My` (with private key) and `Cert:\CurrentUser\Root`. It is **not** in `TrustedPublisher` and doesn't need to be — Root membership is what makes the chain validate (`Get-AuthenticodeSignature` → `Valid`); the README's TrustedPublisher import step is for end users' prompt suppression. The pfx export documented in older revisions is **not** at the literal `%LOCALAPPDATA%\WinThemeSwitcher\signing\` path (see backup note below) — sign from the cert store instead (verified working):
 
 ```powershell
 & "C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\signtool.exe" sign `
-    /f "$env:LOCALAPPDATA\WinThemeSwitcher\signing\winthemeswitcher-signing.pfx" `
-    /p "wts-local-signing" /fd SHA256 `
+    /n "WinThemeSwitcher Self-Signed" /fd SHA256 `
     "C:\Users\atef\Documents\Projects\WinThemeSwitcher\target\release\win-theme-switcher.exe"
 ```
 
-This collapses the Kaspersky heuristic signal — signed builds pass without tripping the AV-pause dance documented below. If the cert ever needs regenerating: `New-SelfSignedCertificate -Type CodeSigning -Subject "CN=WinThemeSwitcher Self-Signed" -KeyAlgorithm RSA -KeyLength 2048 -HashAlgorithm SHA256 -CertStoreLocation Cert:\CurrentUser\My -KeyExportPolicy Exportable -NotAfter (Get-Date).AddYears(10)` and re-add to Root + TrustedPublisher stores. Signature has no countersigned timestamp — it expires when the cert does (10 years out).
+(Backup: the original pfx export still exists, but MSIX virtualization redirected it to the Claude desktop app's sandbox — `C:\Users\atef\AppData\Local\Packages\Claude_pzs8sxrjxfjjc\LocalCache\Local\WinThemeSwitcher\signing\winthemeswitcher-signing.pfx`, password `wts-local-signing`. The literal `%LOCALAPPDATA%\WinThemeSwitcher\` path never existed outside the sandbox.)
+
+This collapses the Kaspersky heuristic signal — signed builds pass without tripping the AV-pause dance documented above (KSN subsection). If the cert ever needs regenerating: `New-SelfSignedCertificate -Type CodeSigning -Subject "CN=WinThemeSwitcher Self-Signed" -KeyAlgorithm RSA -KeyLength 2048 -HashAlgorithm SHA256 -CertStoreLocation Cert:\CurrentUser\My -KeyExportPolicy Exportable -NotAfter (Get-Date).AddYears(10)` and re-add it to the Root store. Signature has no countersigned timestamp — it expires when the cert does.
+
+### CI and releases (`.github/workflows/`)
+
+- `ci.yml` — on push/PR to main: `cargo build --release`, then `cargo fmt --check` and `cargo clippy --release -- -W clippy::all`, both `continue-on-error` (advisory, not gates). Run them locally via the full cargo path above. There are no tests in the repo.
+- `release.yml` — on tag push `v*` (or manual dispatch): builds on GitHub runners and attaches a zip + bare exe to a **prerelease**. **These CI artifacts are unsigned** — the signing cert exists only on this machine, so the signed exe and `WinThemeSwitcher-publisher.cer` that the README promises are produced locally and uploaded to the release manually afterwards (v0.3.0's third asset, the `.cer`, got there that way). The hardcoded release-body text in `release.yml` still carries the pre-signing "your antivirus will flag this" warning — stale since v0.3.0; update it if you touch the workflow.
 
 ## Architecture — `src/main.rs`
 
@@ -98,7 +104,7 @@ Why this is the primary path: ShellExecuteW(`.theme`) silently fails when the us
 
 #### Tier 2: `ShellExecuteW(.theme)` + `commit_watcher` (legacy — `applied=theme-file`)
 
-Fires only if tier 1 errors out (logged as `theme_manager2_err msg="…"`). Same as the original implementation: `ShellExecuteW("open", <.theme path>, ..., SW_HIDE)` to launch the Themes UWP, plus `start_settings_closer` thread to `PostMessage(WM_CLOSE)` the Settings window once it appears, plus a 300 ms sleep + `poke_shell` (taskbar repaint).
+Fires only if tier 1 errors out (logged as `theme_manager2_err target=… msg="…"`). Same as the original implementation: `ShellExecuteW("open", <.theme path>, ..., SW_HIDE)` to launch the Themes UWP, plus `start_settings_closer` thread to `PostMessage(WM_CLOSE)` the Settings window once it appears, plus a 300 ms sleep + `poke_shell` (taskbar repaint).
 
 **`commit_watcher` is the safety net for tier 2's silent-fail mode**: spawns a thread that polls `current_theme()` every 200 ms for 5 s. If the registry never matches the target → logs `commit_timeout target=…` and **falls through to tier 3 from inside the watcher thread** — writes the registry directly, broadcasts, pokes shell, polls again to confirm, logs `fallback_registry target=… confirmed=true after_ms=…`. Without this, tier 2's silent-fail leaves the user stuck (e.g. sunset fires, ShellExecute reports success, registry stays light, no recovery).
 
@@ -119,10 +125,13 @@ The run closure must **not** call `tick()` on every event. An earlier version di
 - `Event::NewEvents(StartCause::Init)` — first event after launch.
 - `Event::NewEvents(StartCause::ResumeTimeReached { .. })` — scheduled sunrise/sunset fired.
 - `Event::UserEvent(AppEvent::Menu(refresh_id))` — user clicked Refresh.
+- `Event::UserEvent(AppEvent::Wake(_))` — session unlock / power resume (see section 5; safe because these never fire on a Settings theme change).
 
-Everything else is `_ => {}`. This matches macOS behavior: manual overrides persist until the next natural transition. `ControlFlow::WaitUntil(deadline)` is set once per tick and sticks across unrelated events (no need to re-set on WaitCancelled).
+Everything else is `_ => {}` (the Menu arm also handles Open Config and Quit, which don't tick). This matches macOS behavior: manual overrides persist until the next natural transition. `ControlFlow::WaitUntil(deadline)` is set once per tick and sticks across unrelated events (no need to re-set on WaitCancelled).
 
 **State-aware apply**: `tick` calls `apply_theme` only if `current_theme() != target`. **Refresh bypasses this check** and always force-applies — needed so config edits (e.g., user points `theme_night` at a new file) take effect without waiting for the next transition.
+
+Scheduling math: `target_theme` / `next_transition` use the `sun-times` crate. When it returns `None` (polar day/night at extreme latitudes), `sun_times_for` falls back to fixed 06:00/18:00 local.
 
 ### 3. Location (WinRT Geolocation)
 
@@ -159,9 +168,9 @@ struct Config {
 - `WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION)` → delivers `WM_WTSSESSION_CHANGE`. We act on `WTS_SESSION_UNLOCK` (the user re-authenticated after Win+L or wake-from-sleep with a lock screen).
 - `PowerRegisterSuspendResumeNotification(DEVICE_NOTIFY_WINDOW_HANDLE, hwnd, ...)` → delivers `WM_POWERBROADCAST`. We act on `PBT_APMRESUMEAUTOMATIC` (resume from sleep without a lock screen — covers machines that don't require re-auth on resume).
 
-Both routes call `proxy.send_event(AppEvent::Wake)` via a process-wide `OnceLock<EventLoopProxy<AppEvent>>` (the WindowProc is `extern "system"` and can't capture). The main event loop handles `AppEvent::Wake` exactly like a scheduled transition — calls `tick()`, which is state-aware (no-op if `current == target`). Idempotent across both events firing in sequence.
+Both routes call `proxy.send_event(AppEvent::Wake(WakeKind::Unlock | WakeKind::Power))` via a process-wide `OnceLock<EventLoopProxy<AppEvent>>` (the WindowProc is `extern "system"` and can't capture). The main event loop handles both kinds exactly like a scheduled transition — calls `tick()` (logged as `cause=wake-unlock` / `cause=wake-power`), which is state-aware (no-op if `current == target`). Idempotent across both events firing in sequence.
 
-`WTS_SESSION_UNLOCK` (0x8) and `DEVICE_NOTIFY_WINDOW_HANDLE` (0x0) are defined as local consts because windows-sys 0.59 doesn't re-export them under their expected modules. Values are stable Win32 ABI; safe to inline.
+`WTS_SESSION_UNLOCK` (0x8), `PBT_APMRESUMEAUTOMATIC` (0x12), and `DEVICE_NOTIFY_WINDOW_HANDLE` (0x0) are defined as local consts. windows-sys 0.59 does export all three — but under `Win32::UI::WindowsAndMessaging` rather than the RemoteDesktop/Power modules you'd look in, and the locals carry `WPARAM`/`u32` typing for direct comparison in the WindowProc. Values are stable Win32 ABI; safe to inline.
 
 **Why this doesn't resurrect the manual-override-fight bug**: neither event fires when the user changes theme in Settings — `WM_WTSSESSION_CHANGE` is session lifecycle only, `WM_POWERBROADCAST` is power state only. So ticking on these is safe.
 
@@ -188,7 +197,7 @@ Tray icon is generated in `make_tray_icon`: 32×32 RGBA, half orange (sun) + hal
 - **`poke_shell` after tier-2 / tier-3 apply only**: tier 1 (`IThemeManager2::SetCurrentTheme`) does the broadcast internally — calling `poke_shell` after it is wasted work and re-introduces the AV-tripping `HWND_BROADCAST WM_SETTINGCHANGE` signal that tier 1 was supposed to eliminate. Keep `poke_shell` for the legacy paths only; don't add it to tier 1.
 - **Refresh forces apply** (bypasses state check); scheduled transitions respect it (no-op if already matching). Don't invert.
 - **Free BSTRs from `ITheme::GetDisplayName` with `SysFreeString`** — not `CoTaskMemFree`, and definitely don't leak. The wtheme reference treats this strictly.
-- **Vtable order in `IThemeManager2Vtbl`**: every method's slot index must match the COM ABI. Wrong order = calling the wrong method (silently catastrophic). The struct only declares the slots we call; trailing slots can be omitted but never reordered. Reference: namazso C# gist + wtheme C header (linked in main.rs comments).
+- **Vtable order in `IThemeManager2Vtbl`**: every method's slot index must match the COM ABI. Wrong order = calling the wrong method (silently catastrophic). The struct declares every slot up through `set_current_theme` — uncalled interior slots are `_`-prefixed placeholders that are **mandatory padding, never removable**; only trailing slots after the last called method may be omitted, and nothing may ever be reordered. Reference: namazso C# gist + wtheme C header (linked in main.rs comments).
 - **`ensure_com_initialized` before any WinRT call**: otherwise Geolocator returns errors silently.
 - **UTF-16 + NUL**: all Win32 wide strings go through `wide()` which appends the null terminator. Never pass a bare `&str` to a `*W` API.
 - **HWND null check**: `(hwnd as usize) == 0` — robust to `windows-sys` flipping between `*mut c_void` and `isize`.
