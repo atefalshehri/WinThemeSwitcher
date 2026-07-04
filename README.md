@@ -113,6 +113,19 @@ No installer, no uninstaller — it's a single-exe tool by design.
 
 Ordered by priority. The correctness items come first — they are confirmed bugs in the shipped code (July 2026 audit), not features.
 
+### Release plan
+
+Versioning before 1.0: a **patch** (0.x.y → 0.x.y+1) is pure bug fixes; a **minor** (0.x → 0.x+1) is anything that adds surface (menu items, config fields) or changes behavior. v1.0 is a gate, not a feature drop. Numbers are assigned at ship time — the 0.6/0.7 order can swap if the SignPath approval wait stalls, and regression patches (e.g. 0.4.1) slot in anywhere.
+
+| Version | Type | Contents |
+|---|---|---|
+| **v0.3.2** | patch | Sunrise/sunset day-bracketing fix + scheduling tests + CI gate (on main, unreleased); never overwrite `config.json` on a parse error |
+| **v0.4.0** | minor | Preserve manual overrides across lock/unlock/resume (changes documented behavior); "Toggle theme" tray item; fail-loudly bundle (panic hook, startup MessageBox, wake-listener logging, single-instance mutex, bounded apply retry); remaining unit tests (config parsing, `.theme`-name resolution) |
+| **v0.5.0** | minor | Scripted build → sign → verify → upload; first release not marked prerelease (fixes `/releases/latest`); candidate point to launch the Scoop bucket |
+| **v0.6.0** | minor | SignPath CA signing in CI (ends the manual signed-asset swap); submit the first CA-signed binary to Defender + Kaspersky |
+| **v0.7.0** | minor | Live tray tooltip; "Open Log" menu item; Refresh-failure MessageBox; first-run location retry; `offset_sunrise_min` / `offset_sunset_min` |
+| **v1.0.0** | gate | Cut when winget accepts the package, the Correctness and Foundation sections below are empty, and a full release cycle has shipped CA-signed with no AV flags — i.e. a stranger can install it without reading the Kaspersky section |
+
 ### Correctness fixes
 
 - **Never overwrite `config.json` on a parse error.** Today a JSON typo (e.g. a single backslash in a theme path) plus Refresh silently resets the file to defaults, wiping coordinates and custom theme paths — via the exact hand-edit flow the first-run dialogs instruct. Keep the file, log the error, and tell the user when Refresh hits it.
