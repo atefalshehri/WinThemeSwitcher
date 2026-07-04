@@ -40,6 +40,7 @@ jobs:
           Copy-Item target/x86_64-pc-windows-msvc/release/win-theme-switcher.exe staging/
           Copy-Item README.md staging/
           Copy-Item LICENSE staging/
+          Copy-Item WinThemeSwitcher-publisher.cer staging/
           $zipName = "win-theme-switcher-$version-windows-x64.zip"
           Compress-Archive -Path staging/* -DestinationPath $zipName -Force
           Write-Host "Created $zipName"
@@ -52,14 +53,15 @@ jobs:
           files: |
             ${{ env.ZIP_NAME }}
             target/x86_64-pc-windows-msvc/release/win-theme-switcher.exe
+            WinThemeSwitcher-publisher.cer
           body: |
             ## WinThemeSwitcher ${{ github.ref_name }}
 
             See the [README](https://github.com/${{ github.repository }}/blob/${{ github.ref_name }}/README.md) for install and configuration.
 
-            > 🔏 **Signed with a self-signed certificate** (`CN=WinThemeSwitcher Self-Signed`, since v0.3.0). Import the attached `WinThemeSwitcher-publisher.cer` and verify with `Get-AuthenticodeSignature` — see the README's "Verifying the signature" section. Because the cert isn't CA-issued, SmartScreen and some antivirus products may still warn; the binary is not malicious and the full source is in this repo. If your AV flags it, see the README's "Antivirus false positives" section.
+            > ⚠ **CI-built binaries are unsigned** and may trigger antivirus false positives — the binary is not malicious, the full source is in this repo, and the README's "Antivirus false positives" section has allowlist instructions. The included `WinThemeSwitcher-publisher.cer` is the project's self-signed publisher certificate (`CN=WinThemeSwitcher Self-Signed`) — when a release ships Authenticode-signed binaries, import the cert and verify per the README's "Verifying the signature" section.
 
-            Download `win-theme-switcher-${{ github.ref_name }}-windows-x64.zip` (includes README + LICENSE) or the bare `win-theme-switcher.exe`.
+            Download `win-theme-switcher-${{ github.ref_name }}-windows-x64.zip` (includes README, LICENSE, and the publisher `.cer`) or the bare `win-theme-switcher.exe`.
           draft: false
           prerelease: true
           generate_release_notes: true
