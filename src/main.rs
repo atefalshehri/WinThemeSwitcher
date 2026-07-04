@@ -964,9 +964,12 @@ fn tick(cfg: &Config, elwt: &ActiveEventLoop, cause: &str, force: bool) {
 
     let next = next_transition(now, cfg.latitude, cfg.longitude);
 
+    // Stamp at write time, not tick start — apply_theme logs detail lines
+    // (theme_manager2_apply, theme_manager2_err) mid-tick, and reusing the
+    // tick-start timestamp here made this summary line sort before them.
     log_event(&format!(
         "{} cause={} current={} target={} {} next={}",
-        now_str,
+        Local::now().to_rfc3339(),
         cause,
         theme_str(current),
         theme_str(Some(want)),
