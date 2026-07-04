@@ -8,7 +8,7 @@ use std::ptr;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
-use chrono::{DateTime, Local, NaiveDate, TimeZone};
+use chrono::{DateTime, Local, Utc};
 use serde::{Deserialize, Serialize};
 use sun_times::sun_times;
 use tray_icon::{
@@ -865,44 +865,99 @@ fn set_auto_start(enable: bool) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn sun_times_for(date: NaiveDate, lat: f64, lon: f64) -> (DateTime<Local>, DateTime<Local>) {
-    match sun_times(date, lat, lon, 0.0) {
-        Some((sr, ss)) => (sr.with_timezone(&Local), ss.with_timezone(&Local)),
-        None => {
-            let sr = Local
-                .from_local_datetime(&date.and_hms_opt(6, 0, 0).unwrap())
-                .single()
-                .unwrap();
-            let ss = Local
-                .from_local_datetime(&date.and_hms_opt(18, 0, 0).unwrap())
-                .single()
-                .unwrap();
-            (sr, ss)
+/// Civil sunrise/sunset threshold: sun center 0.833° below the horizon
+/// (accounts for refraction + solar radius; same convention as `sun_times`).
+const SUNRISE_ALTITUDE_DEG: f64 = -0.833;
+
+/// Solar altitude in degrees at `t` for the given location. Standard
+/// low-precision solar position (declination + hour angle against Greenwich
+/// sidereal time) — well under a degree of error, plenty for deciding polar
+/// day vs. polar night. Implemented locally because the `sun_times` crate's
+/// own `altitude` has math bugs (seconds term, spurious to_degrees on an
+/// already-degrees longitude).
+fn solar_altitude_deg(t: DateTime<Utc>, lat: f64, lon: f64) -> f64 {
+    // Fractional days since J2000.0 (JD 2451545.0).
+    let n = t.timestamp_millis() as f64 / 86_400_000.0 + 2_440_587.5 - 2_451_545.0;
+    let mean_long = (280.460 + 0.985_647_4 * n).rem_euclid(360.0);
+    let mean_anom = (357.528 + 0.985_600_3 * n).rem_euclid(360.0).to_radians();
+    let ecl_long =
+        (mean_long + 1.915 * mean_anom.sin() + 0.020 * (2.0 * mean_anom).sin()).to_radians();
+    let obliquity = (23.439 - 0.000_000_4 * n).to_radians();
+    let declination = (obliquity.sin() * ecl_long.sin()).asin();
+    let right_ascension = f64::atan2(obliquity.cos() * ecl_long.sin(), ecl_long.cos());
+    let gmst_deg = (280.460_618_37 + 360.985_647_366_29 * n).rem_euclid(360.0);
+    let hour_angle = (gmst_deg + lon - right_ascension.to_degrees())
+        .rem_euclid(360.0)
+        .to_radians();
+    let lat_r = lat.to_radians();
+    (lat_r.sin() * declination.sin() + lat_r.cos() * declination.cos() * hour_angle.cos())
+        .asin()
+        .to_degrees()
+}
+
+/// Sunrise/sunset instants for the UTC dates `d-1 ..= d+1` around `now`,
+/// sorted, each tagged with the theme in effect AFTER it. All comparisons are
+/// on UTC instants — an event must never be assumed to fall on any particular
+/// LOCAL calendar date (`sun_times` takes a UTC date and keys events to the
+/// solar day: in UTC+13/+14 the events for UTC date d land on local d+1, and
+/// near the arctic circle a sunset crosses local midnight).
+fn transitions_window(now: DateTime<Utc>, lat: f64, lon: f64) -> Vec<(DateTime<Utc>, Theme)> {
+    let base = now.date_naive();
+    let mut events = Vec::with_capacity(6);
+    for off in -1..=1 {
+        let date = base + chrono::Duration::days(off);
+        if let Some((sunrise, sunset)) = sun_times(date, lat, lon, 0.0) {
+            events.push((sunrise, Theme::Light));
+            events.push((sunset, Theme::Dark));
         }
     }
+    events.sort_by_key(|&(t, _)| t);
+    events
 }
 
-fn target_theme(now: DateTime<Local>, lat: f64, lon: f64) -> Theme {
-    let (sr, ss) = sun_times_for(now.date_naive(), lat, lon);
-    if now >= sr && now < ss {
-        Theme::Light
-    } else {
-        Theme::Dark
-    }
+/// Current theme and next transition instant — the single source of truth
+/// for tick(). When the ±1-day window has no usable events (polar day/night),
+/// the current state comes from the solar altitude and the next transition
+/// from a forward scan.
+fn schedule(now: DateTime<Utc>, lat: f64, lon: f64) -> (Theme, DateTime<Utc>) {
+    let window = transitions_window(now, lat, lon);
+    let current = window
+        .iter()
+        .rev()
+        .find(|&&(t, _)| t <= now)
+        .map(|&(_, theme)| theme)
+        .unwrap_or_else(|| {
+            if solar_altitude_deg(now, lat, lon) > SUNRISE_ALTITUDE_DEG {
+                Theme::Light
+            } else {
+                Theme::Dark
+            }
+        });
+    let next = window
+        .iter()
+        .find(|&&(t, _)| t > now)
+        .map(|&(t, _)| t)
+        .unwrap_or_else(|| next_transition_beyond_window(now, lat, lon));
+    (current, next)
 }
 
-fn next_transition(now: DateTime<Local>, lat: f64, lon: f64) -> DateTime<Local> {
-    let today = now.date_naive();
-    let (sr, ss) = sun_times_for(today, lat, lon);
-    if now < sr {
-        sr
-    } else if now < ss {
-        ss
-    } else {
-        let tomorrow = today.succ_opt().expect("date overflow");
-        let (tom_sr, _) = sun_times_for(tomorrow, lat, lon);
-        tom_sr
+/// Forward scan for the first transition after a polar day/night period.
+/// 200 days covers even the poles' ~6-month seasons; each probe is pure math.
+fn next_transition_beyond_window(now: DateTime<Utc>, lat: f64, lon: f64) -> DateTime<Utc> {
+    let base = now.date_naive();
+    for off in 2..=200 {
+        if let Some((sunrise, sunset)) =
+            sun_times(base + chrono::Duration::days(off), lat, lon, 0.0)
+        {
+            if sunrise > now {
+                return sunrise;
+            }
+            if sunset > now {
+                return sunset;
+            }
+        }
     }
+    now + chrono::Duration::days(1)
 }
 
 fn deadline_instant(target: DateTime<Local>) -> Instant {
@@ -950,7 +1005,7 @@ fn tick(cfg: &Config, elwt: &ActiveEventLoop, cause: &str, force: bool) {
         return;
     }
 
-    let want = target_theme(now, cfg.latitude, cfg.longitude);
+    let (want, next_utc) = schedule(now.with_timezone(&Utc), cfg.latitude, cfg.longitude);
     let current = current_theme();
 
     let outcome = if force || current != Some(want) {
@@ -962,7 +1017,7 @@ fn tick(cfg: &Config, elwt: &ActiveEventLoop, cause: &str, force: bool) {
         "applied=skip".to_string()
     };
 
-    let next = next_transition(now, cfg.latitude, cfg.longitude);
+    let next = next_utc.with_timezone(&Local);
 
     // Stamp at write time, not tick start — apply_theme logs detail lines
     // (theme_manager2_apply, theme_manager2_err) mid-tick, and reusing the
@@ -1121,4 +1176,136 @@ fn main() -> Result<(), Box<dyn Error>> {
     })?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    fn utc(y: i32, mo: u32, d: u32, h: u32, mi: u32, s: u32) -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(y, mo, d, h, mi, s).unwrap()
+    }
+
+    fn mins(m: i64) -> chrono::Duration {
+        chrono::Duration::minutes(m)
+    }
+
+    // Apia, Samoa — UTC+13, west of the antimeridian. Regression fixture for
+    // the wrong-solar-day bug: the old code passed the LOCAL date to
+    // sun_times (which wants a UTC date), so every event landed on the wrong
+    // local day and the app was permanently dark here.
+    const APIA: (f64, f64) = (-13.83, -171.77);
+    // Riyadh — baseline the deployed build has verified for months.
+    const RIYADH: (f64, f64) = (24.753, 46.765);
+    // Reykjavik — UTC+0 year-round; in June sunset falls just past midnight.
+    const REYKJAVIK: (f64, f64) = (64.147, -21.94);
+    // Tromsø — above the arctic circle: midnight sun in June, polar night in December.
+    const TROMSO: (f64, f64) = (69.65, 18.96);
+
+    #[test]
+    fn apia_noon_is_light() {
+        // 2026-01-15 12:00 local (UTC+13) = 2026-01-14 23:00 UTC
+        let now = utc(2026, 1, 14, 23, 0, 0);
+        let (theme, next) = schedule(now, APIA.0, APIA.1);
+        assert_eq!(theme, Theme::Light);
+        // next transition is that evening's sunset (~19:10 local)
+        assert!(next > now && next - now < mins(9 * 60), "next = {next}");
+    }
+
+    #[test]
+    fn apia_night_is_dark() {
+        // 2026-01-15 22:00 local = 2026-01-15 09:00 UTC
+        let now = utc(2026, 1, 15, 9, 0, 0);
+        let (theme, next) = schedule(now, APIA.0, APIA.1);
+        assert_eq!(theme, Theme::Dark);
+        // next transition is the ~06:20 local sunrise
+        assert!(next > now && next - now < mins(9 * 60), "next = {next}");
+    }
+
+    #[test]
+    fn riyadh_matches_deployed_log() {
+        // The deployed build logged next=2026-07-04T18:46:05+03:00 (15:46:05Z)
+        // for a mid-day tick. Riyadh is a same-day timezone, where the old
+        // math was correct — the new math must agree with it.
+        let now = utc(2026, 7, 4, 9, 0, 0); // 12:00 local
+        let (theme, next) = schedule(now, RIYADH.0, RIYADH.1);
+        assert_eq!(theme, Theme::Light);
+        let expected = utc(2026, 7, 4, 15, 46, 5);
+        assert!((next - expected).abs() < mins(5), "next = {next}");
+    }
+
+    #[test]
+    fn riyadh_evening_is_dark_until_sunrise() {
+        let now = utc(2026, 7, 4, 19, 0, 0); // 22:00 local
+        let (theme, next) = schedule(now, RIYADH.0, RIYADH.1);
+        assert_eq!(theme, Theme::Dark);
+        // sunrise is ~05:35 local = 02:35Z, ~7.6 h away
+        assert!(next > now && next - now < mins(11 * 60), "next = {next}");
+    }
+
+    #[test]
+    fn reykjavik_june_sunset_crosses_midnight() {
+        // Sun sets a few minutes past local midnight on June 21; at 23:30 on
+        // June 20 it is still up. The old single-local-date math missed the
+        // post-midnight sunset entirely.
+        let now = utc(2026, 6, 20, 23, 30, 0);
+        let (theme, next) = schedule(now, REYKJAVIK.0, REYKJAVIK.1);
+        assert_eq!(theme, Theme::Light);
+        assert!(
+            next - now < mins(120),
+            "sunset should be < 2h away, next = {next}"
+        );
+        // Just after that sunset: dark until the ~03:00 sunrise.
+        let later = next + mins(1);
+        let (theme2, next2) = schedule(later, REYKJAVIK.0, REYKJAVIK.1);
+        assert_eq!(theme2, Theme::Dark);
+        assert!(
+            next2 > later && next2 - later < mins(4 * 60),
+            "next2 = {next2}"
+        );
+    }
+
+    #[test]
+    fn tromso_midnight_sun_is_light_with_far_next() {
+        let now = utc(2026, 6, 21, 12, 0, 0);
+        let (theme, next) = schedule(now, TROMSO.0, TROMSO.1);
+        assert_eq!(theme, Theme::Light);
+        // Polar day runs to ~late July — the next transition is weeks away
+        // and must come from the forward scan, not a 24 h fallback.
+        assert!(next - now > mins(5 * 24 * 60), "next = {next}");
+        assert!(next - now < mins(60 * 24 * 60), "next = {next}");
+    }
+
+    #[test]
+    fn tromso_polar_night_is_dark() {
+        let now = utc(2026, 12, 21, 12, 0, 0);
+        let (theme, next) = schedule(now, TROMSO.0, TROMSO.1);
+        assert_eq!(theme, Theme::Dark);
+        assert!(next > now);
+    }
+
+    #[test]
+    fn theme_flips_exactly_at_transition() {
+        let now = utc(2026, 7, 4, 9, 0, 0);
+        let (_, next) = schedule(now, RIYADH.0, RIYADH.1);
+        let (before, _) = schedule(next - mins(1), RIYADH.0, RIYADH.1);
+        let (at, next_after) = schedule(next, RIYADH.0, RIYADH.1);
+        assert_eq!(before, Theme::Light);
+        assert_eq!(at, Theme::Dark);
+        assert!(next_after > next);
+    }
+
+    #[test]
+    fn solar_altitude_sanity() {
+        // Riyadh at local solar noon in July: sun nearly overhead (~88°).
+        assert!(solar_altitude_deg(utc(2026, 7, 4, 8, 53, 0), RIYADH.0, RIYADH.1) > 80.0);
+        // Tromsø, December noon: polar night — below the sunrise threshold.
+        assert!(
+            solar_altitude_deg(utc(2026, 12, 21, 11, 0, 0), TROMSO.0, TROMSO.1)
+                < SUNRISE_ALTITUDE_DEG
+        );
+        // Tromsø, June, near local solar midnight: midnight sun stays up (~3°).
+        assert!(solar_altitude_deg(utc(2026, 6, 20, 22, 45, 0), TROMSO.0, TROMSO.1) > 0.0);
+    }
 }

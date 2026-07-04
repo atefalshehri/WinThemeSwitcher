@@ -78,7 +78,7 @@ This collapses the Kaspersky heuristic signal — signed builds pass without tri
 
 ### CI and releases (`.github/workflows/`)
 
-- `ci.yml` — on push/PR to main: `cargo build --release`, then `cargo fmt --check` and `cargo clippy --release -- -W clippy::all`, both `continue-on-error` (advisory, not gates). Run them locally via the full cargo path above. There are no tests in the repo.
+- `ci.yml` — on push/PR to main: `cargo build --release`, then `cargo test` (**hard gate**), then `cargo fmt --check` and `cargo clippy --release -- -W clippy::all`, the last two `continue-on-error` (advisory, not gates). Run them locally via the full cargo path above. Tests live in `mod tests` at the bottom of `main.rs` — pure scheduling math with fixture locations (Apia/UTC+13 regression, Riyadh baseline, Reykjavik midnight-sunset, Tromsø polar); they are timezone-independent (all instants constructed in UTC), so they pass on any machine.
 - `release.yml` — on tag push `v*` (or manual dispatch): builds on GitHub runners and attaches a zip (exe + README + LICENSE + publisher `.cer`) plus the bare exe and `WinThemeSwitcher-publisher.cer` to a **prerelease**. The `.cer` is committed at the repo root (public cert only — byte-identical to the store cert's export). **CI binaries are unsigned** — the signing key exists only on this machine, so every tagged release needs a manual post-tag step: build locally from the tag, sign (section above), zip (exe + the tag's README + LICENSE + `.cer`), then replace the workflow's assets with `gh release upload <tag> <files> --clobber`. Don't skip it: v0.3.0 originally shipped unsigned CI builds because this step was missed; the assets were replaced with signed builds on 2026-07-04, so all current v0.3.0 assets verify `Valid`.
 
 ## Architecture — `src/main.rs`
@@ -132,7 +132,7 @@ Everything else is `_ => {}` (the Menu arm also handles Open Config and Quit, wh
 
 **State-aware apply**: `tick` calls `apply_theme` only if `current_theme() != target`. **Refresh bypasses this check** and always force-applies — needed so config edits (e.g., user points `theme_night` at a new file) take effect without waiting for the next transition.
 
-Scheduling math: `target_theme` / `next_transition` use the `sun-times` crate. When it returns `None` (polar day/night at extreme latitudes), `sun_times_for` falls back to fixed 06:00/18:00 local.
+Scheduling math: `schedule(now_utc) -> (Theme, next_utc)` is the single source of truth (rewritten 2026-07-04; unit-tested in `mod tests`). It collects sunrise/sunset instants for the **UTC** dates D−1..D+1 via the `sun-times` crate, sorts them as instants, and picks state-after-last-event ≤ now / first-event > now. **Never pass a local date to `sun_times`** — it takes a UTC date and keys events to the solar day; the old code did exactly that, which made UTC+13/+14 locales permanently dark and skipped post-midnight sunsets (Reykjavik in June). When the ±1-day window is empty (polar day/night), current state comes from `solar_altitude_deg` (local implementation — the crate's `altitude` has math bugs) vs. the −0.833° civil threshold, and the next transition from a ≤200-day forward scan (covers the poles' ~6-month seasons). Everything is pure math on UTC instants; `tick` converts to `Local` only for logging.
 
 ### 3. Location (WinRT Geolocation)
 

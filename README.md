@@ -115,13 +115,12 @@ Ordered by priority. The correctness items come first — they are confirmed bug
 
 ### Correctness fixes
 
-- **Fix sunrise/sunset day-bracketing.** `target_theme`/`next_transition` pass the *local* calendar date to the `sun-times` crate, which expects a UTC date and keys events to the solar day. In UTC+13/+14 timezones (Samoa, Tonga, Chatham Islands) every computed sunrise/sunset lands on the wrong local day and the app is stuck permanently dark; near-midnight sunsets (Reykjavik in June) skew by minutes. Fix: compute transitions for local dates D−1/D/D+1 as UTC instants and pick the bracketing pair. Pairs with fixing the polar fallback (decide by solar altitude instead of fixed 06:00/18:00) and removing two `.unwrap()`s that can abort the process silently.
 - **Never overwrite `config.json` on a parse error.** Today a JSON typo (e.g. a single backslash in a theme path) plus Refresh silently resets the file to defaults, wiping coordinates and custom theme paths — via the exact hand-edit flow the first-run dialogs instruct. Keep the file, log the error, and tell the user when Refresh hits it.
 - **Preserve manual overrides across lock/unlock and resume.** A theme picked manually in Settings is currently snapped back to schedule on the next Win+L unlock or wake-from-sleep. Fix: track the last *scheduled* target on every tick and skip the wake-time re-apply when it hasn't changed (missed transitions still reconcile). Once that lands, add a **"Toggle theme" tray item** — an action, not GUI configuration.
 
 ### Foundation
 
-- **Unit tests + CI gate.** The repo ships zero tests. The scheduling math, config parsing, and `.theme`-name resolution are pure functions — cover them (UTC+14, polar, and Riyadh fixtures) and make `cargo test` a hard CI gate. Replaces the old "manual test matrix" item: Windows 10 hit end-of-support in Oct 2025, and the multi-monitor/HiDPI surface is one 32×32 tray icon.
+- **Extend the unit tests.** The scheduling math is covered (UTC+13, polar, and midnight-sunset fixtures) and `cargo test` is a hard CI gate since 2026-07-04, when the sunrise/sunset day-bracketing bug (permanent dark mode in UTC+13/+14 timezones) was fixed. Still to cover: config parsing and `.theme`-name resolution. Replaces the old "manual test matrix" item: Windows 10 hit end-of-support in Oct 2025, and the multi-monitor/HiDPI surface is one 32×32 tray icon.
 - **Fail loudly instead of silently.** A panic hook that writes to `events.log` before abort (`panic = "abort"` + windowed subsystem currently means zero-trace death), a MessageBox + log line when startup fails (e.g. tray creation racing the taskbar at login), logging on wake-listener registration failures, a single-instance mutex, and a bounded retry when a theme apply fails (today the next attempt can be ~12 h away).
 
 ### Release & distribution (dependency chain, in order)
