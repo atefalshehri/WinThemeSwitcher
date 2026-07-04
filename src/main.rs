@@ -1053,9 +1053,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         acquire_location(&mut cfg);
     }
 
-    if cfg.auto_start {
-        let _ = set_auto_start(true);
-    }
+    let _ = set_auto_start(cfg.auto_start);
 
     let event_loop = EventLoop::<AppEvent>::with_user_event().build()?;
     let proxy = event_loop.create_proxy();
@@ -1108,6 +1106,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 open_config_in_editor();
             } else if id == refresh_id {
                 cfg = load_or_create_config();
+                let _ = set_auto_start(cfg.auto_start);
                 if !cfg.has_location() {
                     if let Some((lat, lon)) = try_get_windows_location() {
                         cfg.latitude = lat;

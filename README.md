@@ -41,7 +41,7 @@ On first launch the app reads your coordinates via Windows Location. If Location
 | Field | Default | Meaning |
 |---|---|---|
 | `latitude` / `longitude` | from Windows Location, else `0.0` | Decimal degrees. `0.0, 0.0` triggers the first-run location flow. |
-| `auto_start` | `true` | When `true`, registers `HKCU\...\Run\WinThemeSwitcher` on every launch. `false` only stops re-registering — it doesn't delete an existing entry; remove it manually (see [Uninstall](#uninstall)). |
+| `auto_start` | `true` | When `true`, registers `HKCU\...\Run\WinThemeSwitcher`; when `false`, removes the entry. Applied on every launch and on Refresh. |
 | `theme_day` | `null` → `%SystemRoot%\Resources\Themes\aero.theme` | Path to the `.theme` applied after sunrise. |
 | `theme_night` | `null` → `%SystemRoot%\Resources\Themes\dark.theme` | Path to the `.theme` applied after sunset. |
 
@@ -53,7 +53,7 @@ After editing config, right-click tray → **Refresh**. No restart needed.
 
 - **Open Config** — opens `config.json` in your default editor.
 - **Refresh** — re-reads config, retries Windows Location if needed, force-applies the correct theme.
-- **Quit** — exits. The auto-start entry persists; remove it with the `reg delete` command in [Uninstall](#uninstall).
+- **Quit** — exits. The auto-start entry persists; set `auto_start: false` and click Refresh (or relaunch) once to remove it.
 
 ## Verifying the signature
 

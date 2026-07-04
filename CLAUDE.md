@@ -158,7 +158,7 @@ struct Config {
 
 `has_location()` returns false when both coords are `0.0` (null-island sentinel used for first-run detection).
 
-`set_auto_start(true)` writes `HKCU\...\Run\WinThemeSwitcher` with the current exe path (quoted). `set_auto_start(false)` calls `RegDeleteValueW` — both directions work.
+`set_auto_start(true)` writes `HKCU\...\Run\WinThemeSwitcher` with the current exe path (quoted). `set_auto_start(false)` calls `RegDeleteValueW` — both directions work. `main()` and the Refresh handler call `set_auto_start(cfg.auto_start)` unconditionally, so flipping the flag takes effect at the next launch or Refresh (before 2026-07-04 only the `true` direction was wired up and a `false` flag left the Run entry in place).
 
 ### 5. Wake on session unlock / power resume
 
