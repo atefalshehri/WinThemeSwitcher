@@ -78,7 +78,7 @@ This collapses the Kaspersky heuristic signal — signed builds pass without tri
 ### CI and releases (`.github/workflows/`)
 
 - `ci.yml` — on push/PR to main: `cargo build --release`, then `cargo fmt --check` and `cargo clippy --release -- -W clippy::all`, both `continue-on-error` (advisory, not gates). Run them locally via the full cargo path above. There are no tests in the repo.
-- `release.yml` — on tag push `v*` (or manual dispatch): builds on GitHub runners and attaches a zip + bare exe to a **prerelease**. **These CI artifacts are unsigned** — the signing cert exists only on this machine, so the signed exe and `WinThemeSwitcher-publisher.cer` that the README promises are produced locally and uploaded to the release manually afterwards (v0.3.0's third asset, the `.cer`, got there that way). The hardcoded release-body text in `release.yml` still carries the pre-signing "your antivirus will flag this" warning — stale since v0.3.0; update it if you touch the workflow.
+- `release.yml` — on tag push `v*` (or manual dispatch): builds on GitHub runners and attaches a zip + bare exe to a **prerelease**. **These CI artifacts are unsigned** — the signing cert exists only on this machine, so the signed exe and `WinThemeSwitcher-publisher.cer` that the README promises are produced locally and uploaded to the release manually afterwards (v0.3.0's third asset, the `.cer`, got there that way). The hardcoded release-body text in `release.yml` describes the signed-release state (self-signed cert, import the attached `.cer`) — it references the `.cer` asset even though the workflow itself doesn't upload it (the manual post-tag step does).
 
 ## Architecture — `src/main.rs`
 

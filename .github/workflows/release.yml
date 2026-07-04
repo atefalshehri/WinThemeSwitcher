@@ -57,7 +57,7 @@ jobs:
 
             See the [README](https://github.com/${{ github.repository }}/blob/${{ github.ref_name }}/README.md) for install and configuration.
 
-            > ⚠ **Your antivirus will likely flag the binary as a false positive** (`VHO:Trojan.Win32.Agent.gen` on Kaspersky, similar generic detections on others). This is an unsigned Rust app that does registry writes + system broadcasts + shell pokes — every heuristic signal fires. Source is fully open in this repo. See the README's "Antivirus false positives" section for allowlist instructions.
+            > 🔏 **Signed with a self-signed certificate** (`CN=WinThemeSwitcher Self-Signed`, since v0.3.0). Import the attached `WinThemeSwitcher-publisher.cer` and verify with `Get-AuthenticodeSignature` — see the README's "Verifying the signature" section. Because the cert isn't CA-issued, SmartScreen and some antivirus products may still warn; the binary is not malicious and the full source is in this repo. If your AV flags it, see the README's "Antivirus false positives" section.
 
             Download `win-theme-switcher-${{ github.ref_name }}-windows-x64.zip` (includes README + LICENSE) or the bare `win-theme-switcher.exe`.
           draft: false
