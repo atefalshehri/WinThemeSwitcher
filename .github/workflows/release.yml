@@ -13,23 +13,29 @@ jobs:
   build-and-release:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: x86_64-pc-windows-msvc
+      - id: toolchain
+        uses: dtolnay/rust-toolchain@stable
 
       - name: Cache cargo
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-release-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('**/Cargo.lock', '.cargo/config.toml') }}
+          # Tag-scoped caches aren't visible to later tags; seed from main's
+          # CI cache instead of a cold build (same host-target build as CI).
+          restore-keys: |
+            ${{ runner.os }}-cargo-${{ steps.toolchain.outputs.cachekey }}-
 
       - name: Build
-        run: cargo build --release --target x86_64-pc-windows-msvc
+        run: cargo build --release --locked
+
+      - name: Verify linker hardening
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File scripts/check-hardening.ps1 -Exe target/release/win-theme-switcher.exe
 
       - name: Package
         shell: pwsh
@@ -37,7 +43,7 @@ jobs:
           $version = "${{ github.ref_name }}"
           if ($version -eq "") { $version = "dev" }
           New-Item -ItemType Directory -Path staging -Force | Out-Null
-          Copy-Item target/x86_64-pc-windows-msvc/release/win-theme-switcher.exe staging/
+          Copy-Item target/release/win-theme-switcher.exe staging/
           Copy-Item README.md staging/
           Copy-Item LICENSE staging/
           Copy-Item WinThemeSwitcher-publisher.cer staging/
@@ -48,11 +54,11 @@ jobs:
 
       - name: Create GitHub Release
         if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: |
             ${{ env.ZIP_NAME }}
-            target/x86_64-pc-windows-msvc/release/win-theme-switcher.exe
+            target/release/win-theme-switcher.exe
             WinThemeSwitcher-publisher.cer
           body: |
             ## WinThemeSwitcher ${{ github.ref_name }}

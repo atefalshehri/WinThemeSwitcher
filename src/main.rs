@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use sun_times::sun_times;
 use tray_icon::{
     menu::{Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem},
-    TrayIconBuilder,
+    TrayIconBuilder, TrayIconEvent,
 };
 use windows::Devices::Geolocation::{GeolocationAccessStatus, Geolocator};
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
@@ -23,9 +23,16 @@ use windows_sys::Win32::Foundation::{
     GetLastError, SysFreeString, ERROR_ALREADY_EXISTS, HWND, LPARAM, LRESULT, WPARAM,
 };
 use windows_sys::Win32::Graphics::Dwm::DwmFlush;
+use windows_sys::Win32::Storage::FileSystem::{
+    GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+};
 use windows_sys::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
-use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows_sys::Win32::System::Power::PowerRegisterSuspendResumeNotification;
+use windows_sys::Win32::System::LibraryLoader::{
+    GetModuleHandleW, SetDefaultDllDirectories, LOAD_LIBRARY_SEARCH_SYSTEM32,
+};
+use windows_sys::Win32::System::Power::{
+    PowerRegisterSuspendResumeNotification, DEVICE_NOTIFY_SUBSCRIBE_PARAMETERS,
+};
 use windows_sys::Win32::System::Registry::{
     RegCloseKey, RegDeleteValueW, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW, HKEY,
     HKEY_CURRENT_USER, KEY_QUERY_VALUE, KEY_SET_VALUE, REG_DWORD, REG_SZ,
@@ -33,21 +40,24 @@ use windows_sys::Win32::System::Registry::{
 use windows_sys::Win32::System::RemoteDesktop::{
     WTSRegisterSessionNotification, NOTIFY_FOR_THIS_SESSION,
 };
+use windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW;
 use windows_sys::Win32::System::Threading::CreateMutexW;
-use windows_sys::Win32::UI::Shell::{SHLoadIndirectString, ShellExecuteW};
+use windows_sys::Win32::System::WindowsProgramming::GetPrivateProfileStringW;
+use windows_sys::Win32::UI::Shell::{
+    AssocQueryStringW, SHLoadIndirectString, ShellExecuteW, ASSOCF_INIT_IGNOREUNKNOWN,
+    ASSOCSTR_FRIENDLYAPPNAME,
+};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DispatchMessageW, FindWindowW, GetMessageW, MessageBoxW,
-    PostMessageW, RegisterClassW, SendMessageTimeoutW, TranslateMessage, HWND_BROADCAST,
-    HWND_MESSAGE, IDYES, MB_ICONINFORMATION, MB_ICONQUESTION, MB_ICONWARNING, MB_OK, MB_YESNO, MSG,
-    SMTO_ABORTIFHUNG, SW_HIDE, SW_SHOWNORMAL, WM_CLOSE, WM_POWERBROADCAST, WM_SETTINGCHANGE,
-    WM_THEMECHANGED, WM_WTSSESSION_CHANGE, WNDCLASSW,
+    PostMessageW, RegisterClassW, SendMessageTimeoutW, TranslateMessage, DEVICE_NOTIFY_CALLBACK,
+    HWND_BROADCAST, HWND_MESSAGE, IDYES, MB_ICONINFORMATION, MB_ICONQUESTION, MB_ICONWARNING,
+    MB_OK, MB_YESNO, MSG, PBT_APMRESUMEAUTOMATIC, SMTO_ABORTIFHUNG, SW_HIDE, SW_SHOWNORMAL,
+    WM_CLOSE, WM_SETTINGCHANGE, WM_THEMECHANGED, WM_WTSSESSION_CHANGE, WNDCLASSW,
 };
 use winit::event::{Event, StartCause};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 
-const PBT_APMRESUMEAUTOMATIC: WPARAM = 0x12;
 const WTS_SESSION_UNLOCK: WPARAM = 0x8;
-const DEVICE_NOTIFY_WINDOW_HANDLE: u32 = 0x0;
 
 const THEME_KEY: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize";
 const RUN_KEY: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Run";
@@ -94,8 +104,11 @@ struct IThemeManager2Vtbl {
         unsafe extern "system" fn(*mut c_void, *const GUID, *mut *mut c_void) -> HRESULT,
     add_ref: unsafe extern "system" fn(*mut c_void) -> u32,
     release: unsafe extern "system" fn(*mut c_void) -> u32,
-    // IThemeManager2 — only the slots we actually call. ORDER MATTERS — must
-    // match vtable layout exactly. Reference: namazso C# gist + wtheme C header.
+    // IThemeManager2 — every slot up through the last one we call.
+    // ORDER MATTERS — must match the vtable layout exactly; the `_`-prefixed
+    // entries are never called but are mandatory padding that keeps the
+    // called slots at the right offsets. Reference: namazso C# gist + wtheme
+    // C header.
     init: unsafe extern "system" fn(*mut c_void, i32) -> HRESULT,
     _init_async: unsafe extern "system" fn(*mut c_void, HWND, i32) -> HRESULT,
     _refresh: unsafe extern "system" fn(*mut c_void) -> HRESULT,
@@ -107,8 +120,8 @@ struct IThemeManager2Vtbl {
     _get_current_theme: unsafe extern "system" fn(*mut c_void, *mut i32) -> HRESULT,
     set_current_theme: unsafe extern "system" fn(*mut c_void, HWND, i32, i32, i32, i32) -> HRESULT,
     // Remaining slots (GetCustomTheme, GetDefaultTheme, CreateThemePack, ...) omitted —
-    // not called from this app. The struct only needs to expose what we call;
-    // unused trailing slots don't affect ABI.
+    // only TRAILING slots after the last called method may be left out; they
+    // don't affect the offsets above.
 }
 
 #[repr(C)]
@@ -229,6 +242,11 @@ struct Config {
     auto_start: bool,
     theme_day: Option<String>,
     theme_night: Option<String>,
+    /// Keys this version doesn't know (a user's note, a newer version's
+    /// setting). Kept so save_config writes them back instead of silently
+    /// deleting them.
+    #[serde(flatten)]
+    extra: serde_json::Map<String, serde_json::Value>,
 }
 
 impl Default for Config {
@@ -239,6 +257,7 @@ impl Default for Config {
             auto_start: true,
             theme_day: None,
             theme_night: None,
+            extra: serde_json::Map::new(),
         }
     }
 }
@@ -265,7 +284,7 @@ impl Theme {
 }
 
 /// Why a tick is running — decides whether an apply is forced, state-aware, or
-/// override-preserving (see `should_apply`).
+/// override-preserving (see `decide_tick`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TickKind {
     /// First tick after launch.
@@ -286,10 +305,10 @@ struct TickState {
     /// later tick means at least one transition has passed since we were
     /// last in sync, regardless of how many were missed (a same-THEME parity
     /// comparison would wrongly preserve an override across an ordinary
-    /// overnight lock that spans sunset AND sunrise). A FAILED apply leaves
-    /// this stale on purpose: every subsequent wake then sees the transition
-    /// as still-unreconciled and re-applies, instead of misreading the
-    /// failure as a user override.
+    /// overnight lock that spans sunset AND sunrise). A FAILED apply never
+    /// advances it — a retry leaves it stale, an exhausted budget clears it —
+    /// so every subsequent wake sees the transition as still-unreconciled
+    /// and re-applies, instead of misreading the failure as a user override.
     reconciled_next: Option<DateTime<Utc>>,
     /// Consecutive failed applies in the current failure episode.
     retry_count: u32,
@@ -304,6 +323,13 @@ struct TickState {
     /// intervention right before a suspend that spans a transition would be
     /// promoted to a day-long override).
     episode_next: Option<DateTime<Utc>>,
+    /// Wall-clock deadline of the pending wait (None = plain Wait, e.g. no
+    /// location). See `plan_wake`.
+    armed: Option<DateTime<Utc>>,
+    /// (wall, monotonic) clock readings the last tick decided from — the
+    /// reference for detecting a clock step. Only `tick` writes it (via `arm`,
+    /// or clearing it on the no-location path); wake handling never re-marks.
+    mark: Option<(DateTime<Utc>, Instant)>,
 }
 
 impl TickState {
@@ -313,6 +339,8 @@ impl TickState {
             retry_count: 0,
             retry_baseline: None,
             episode_next: None,
+            armed: None,
+            mark: None,
         }
     }
 }
@@ -324,8 +352,9 @@ enum TickAction {
     Apply,
     /// Screen already matches the schedule.
     SkipInSync,
-    /// Wake tick, screen diverges, but no transition passed since the last
-    /// reconciled tick: a manual override is being preserved.
+    /// Wake (or early Scheduled) tick, screen diverges, but no transition
+    /// passed since the last reconciled tick: a manual override is being
+    /// preserved.
     SkipOverride,
     /// The user changed the theme during a pending retry window — cancel the
     /// retry episode and let their choice stand until the next transition.
@@ -341,6 +370,8 @@ fn decide_tick(
     current: Option<Theme>,
     target: Theme,
     now: DateTime<Utc>,
+    next: DateTime<Utc>,
+    clock_stepped_back: bool,
     state: &TickState,
 ) -> TickAction {
     // Refresh is fresh user intent: always force-apply.
@@ -365,12 +396,33 @@ fn decide_tick(
     if current == Some(target) {
         return TickAction::SkipInSync;
     }
-    let transition_passed = state.reconciled_next.is_none_or(|n| now >= n);
-    // Override preservation yields to a pending retry: a wake during an
-    // active failure episode is a free retry opportunity (the divergence is
-    // the FAILURE, not an override), including episodes started mid-window
-    // by a failed Refresh where reconciled_next is still in the future.
-    if kind == TickKind::Wake && !transition_passed && state.retry_count == 0 {
+    // A transition has passed since we were last in sync if now is at/after
+    // the recorded next transition — OR if the wall clock was observed to
+    // step BACKWARDS and the schedule's upcoming transition is now earlier
+    // than the recorded one: a clock that had been running ahead got
+    // corrected across a transition, so the frame we reconciled in no longer
+    // exists and a diverged screen is the app's own stale apply, not a user
+    // override. Gated on an observed step because `next` can also move
+    // earlier without one — e.g. after Refresh adopts new coordinates.
+    let transition_passed = state.reconciled_next.is_none_or(|n| {
+        now >= n || (clock_stepped_back && next + chrono::Duration::seconds(60) < n)
+    });
+    // No transition has passed since we were last in sync, so a diverged
+    // screen is a manual override: preserve it. This covers Wake ticks and
+    // ALSO Scheduled ticks that run before reconciled_next — which, since
+    // plan_wake never ticks before the armed deadline, are clock-jump ticks
+    // (a forward step or suspend artifact that didn't reach the transition,
+    // or a backward step within the same frame). Re-applying the schedule
+    // there would revert the user's override for no transition at all.
+    // Override preservation yields to a pending retry:
+    // during an active failure episode the divergence is the FAILURE, not
+    // an override (including episodes started mid-window by a failed
+    // Refresh, where reconciled_next is still in the future), so retry
+    // ticks and wakes re-apply.
+    if matches!(kind, TickKind::Wake | TickKind::Scheduled)
+        && !transition_passed
+        && state.retry_count == 0
+    {
         return TickAction::SkipOverride;
     }
     TickAction::Apply
@@ -385,9 +437,10 @@ fn note_reconciled(state: &mut TickState, next: DateTime<Utc>) {
 }
 
 /// Record a failed apply. Returns true when a quick retry should be
-/// scheduled; false when the budget is exhausted (the episode resets so the
-/// NEXT transition window gets a fresh budget, and reconciled_next stays
-/// stale so wake events remain free retry opportunities).
+/// scheduled (reconciled_next is left stale); false when the budget is
+/// exhausted (the episode resets so the NEXT transition window gets a fresh
+/// budget, and reconciled_next is cleared so later wakes remain free retry
+/// opportunities).
 fn note_apply_failed(
     state: &mut TickState,
     observed: Option<Theme>,
@@ -399,6 +452,11 @@ fn note_apply_failed(
         state.retry_count = 0;
         state.retry_baseline = None;
         state.episode_next = None;
+        // Budget spent: the screen is still wrong, so later wakes must keep
+        // treating it as a failure to retry, never as an override to
+        // preserve — including an episode a failed Refresh started mid-
+        // window, where reconciled_next is still in the future.
+        state.reconciled_next = None;
         false
     } else {
         state.episode_next = Some(next_utc);
@@ -470,7 +528,26 @@ fn log_path() -> PathBuf {
         .join("events.log")
 }
 
+/// Serializes rotation + append across threads (main loop, commit watcher,
+/// settings closer, wake listener, detached MessageBox threads).
+static LOG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn log_event(line: &str) {
+    // A poisoned lock just means another thread panicked mid-write; logging
+    // must keep working.
+    let _guard = LOG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    write_log_line(line);
+}
+
+/// The panic hook's variant: never blocks. std's Mutex isn't reentrant, so a
+/// panic raised while this thread holds LOG_LOCK would otherwise deadlock
+/// instead of aborting. Best effort is right for a dying process.
+fn log_event_from_panic(line: &str) {
+    let _guard = LOG_LOCK.try_lock();
+    write_log_line(line);
+}
+
+fn write_log_line(line: &str) {
     use std::io::Write;
     let path = log_path();
     if let Ok(meta) = fs::metadata(&path) {
@@ -483,7 +560,8 @@ fn log_event(line: &str) {
         .append(true)
         .open(&path)
     {
-        let _ = writeln!(f, "{}", line);
+        // One write per line, so concurrent lines can't interleave.
+        let _ = f.write_all(format!("{line}\n").as_bytes());
     }
 }
 
@@ -495,28 +573,53 @@ fn theme_str(t: Option<Theme>) -> &'static str {
     }
 }
 
+/// A self-heal performed by `load_config_ex`.
+#[derive(Debug)]
+struct Healed {
+    reason: &'static str,
+    /// Set when writing the healed defaults back failed (the reset then only
+    /// exists in memory, and repeats next launch).
+    save_err: Option<String>,
+}
+
+/// `load_config_ex` without the heal flag (tests use this form).
+#[cfg(test)]
+fn load_config_at(path: &Path) -> Result<Config, String> {
+    load_config_ex(path).map(|(cfg, _)| cfg)
+}
+
 /// Load the config from `path`. A missing file is first-run: defaults are
 /// written and returned. `Err` means the file EXISTS but could not be read or
 /// parsed — it is left untouched on disk so a hand-edit typo can be fixed
 /// instead of silently wiping the user's coordinates and theme paths.
-fn load_config_at(path: &Path) -> Result<Config, String> {
-    match fs::read_to_string(path) {
-        Ok(content) if content.trim().is_empty() => {
-            // A crash mid-write (fs::write truncates before writing) leaves
-            // a 0-byte file. Nothing in it to preserve — self-heal like
-            // first run instead of erroring on every launch.
+///
+/// Also reports whether the file was self-healed (so callers can log it — a
+/// heal resets settings, and must not be silent). Logging stays out of here
+/// because tests call this directly and log_path() is exe-relative.
+fn load_config_ex(path: &Path) -> Result<(Config, Option<Healed>), String> {
+    match read_config_text(path) {
+        Ok(content) if config_content_is_empty(&content) => {
+            // A crash mid-write can leave a 0-byte or NUL-filled file (the
+            // latter when the size was extended but the data never flushed).
+            // Nothing in it to preserve — self-heal like first run instead
+            // of erroring on every launch.
             let cfg = Config::default();
-            if let Ok(json) = serde_json::to_string_pretty(&cfg) {
-                let _ = fs::write(path, json);
-            }
-            Ok(cfg)
+            let save_err = save_config_at(path, &cfg).err().map(|e| e.to_string());
+            Ok((
+                cfg,
+                Some(Healed {
+                    reason: "empty",
+                    save_err,
+                }),
+            ))
         }
         Ok(content) => serde_json::from_str::<Config>(&content)
+            .map(|cfg| (cfg, None))
             .map_err(|e| format!("config.json is not valid JSON: {e}")),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             let cfg = Config::default();
             if let Ok(json) = serde_json::to_string_pretty(&cfg) {
-                // create_new, not fs::write: if the file appears between our
+                // create_new, not a replace: if the file appears between our
                 // read and this write (an editor saving via delete-then-
                 // rename), the user's file wins and the defaults are dropped.
                 use std::io::Write;
@@ -528,10 +631,55 @@ fn load_config_at(path: &Path) -> Result<Config, String> {
                     let _ = f.write_all(json.as_bytes());
                 }
             }
-            Ok(cfg)
+            Ok((cfg, None))
         }
         Err(e) => Err(format!("config.json could not be read: {e}")),
     }
+}
+
+/// config.json as text, whatever encoding a Windows editor saved it in:
+/// UTF-8 with or without a BOM (Notepad), or UTF-16 LE/BE with a BOM
+/// (PowerShell 5.1's `>` / Out-File default is LE; Notepad offers both).
+fn read_config_text(path: &Path) -> std::io::Result<String> {
+    use std::io::{Error, ErrorKind};
+    let bytes = fs::read(path)?;
+    let utf16 = |rest: &[u8], le: bool| -> std::io::Result<String> {
+        if !rest.len().is_multiple_of(2) {
+            return Err(Error::new(ErrorKind::InvalidData, "truncated UTF-16 text"));
+        }
+        let units: Vec<u16> = rest
+            .chunks_exact(2)
+            .map(|c| {
+                if le {
+                    u16::from_le_bytes([c[0], c[1]])
+                } else {
+                    u16::from_be_bytes([c[0], c[1]])
+                }
+            })
+            .collect();
+        String::from_utf16(&units)
+            .map_err(|_| Error::new(ErrorKind::InvalidData, "not valid UTF-16 text"))
+    };
+    if let Some(rest) = bytes.strip_prefix(&[0xFF, 0xFE]) {
+        return utf16(rest, true);
+    }
+    if let Some(rest) = bytes.strip_prefix(&[0xFE, 0xFF]) {
+        return utf16(rest, false);
+    }
+    let rest = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(&bytes);
+    String::from_utf8(rest.to_vec()).map_err(|_| {
+        Error::new(
+            ErrorKind::InvalidData,
+            "not UTF-8 or UTF-16 text (save it as UTF-8)",
+        )
+    })
+}
+
+/// Nothing worth preserving: only whitespace, NULs, and/or a BOM.
+fn config_content_is_empty(content: &str) -> bool {
+    content
+        .trim_matches(|c: char| c.is_whitespace() || c == '\0' || c == '\u{feff}')
+        .is_empty()
 }
 
 /// Serialize `cfg` over config.json unconditionally. Only call with a Config
@@ -539,9 +687,141 @@ fn load_config_at(path: &Path) -> Result<Config, String> {
 /// default/fallback Config here is exactly the settings-wipe bug fixed in
 /// v0.3.2 (broken files must stay on disk for the user to repair).
 fn save_config(cfg: &Config) -> Result<(), Box<dyn Error>> {
+    save_config_at(&config_path(), cfg)
+}
+
+/// Atomic replace: write a sibling temp file, then rename it over `path`
+/// (std's rename replaces an existing file on Windows). A crash leaves either
+/// the old file or the new one — never the truncated/NUL-filled middle state
+/// that a direct fs::write can.
+fn save_config_at(path: &Path, cfg: &Config) -> Result<(), Box<dyn Error>> {
+    use std::io::Write;
     let json = serde_json::to_string_pretty(cfg)?;
-    fs::write(config_path(), json)?;
-    Ok(())
+    if is_linked_file(path) {
+        // A rename would detach this name from the shared file (e.g. a
+        // package manager's hard-linked "persisted" config) — write in place
+        // instead, accepting the non-atomic window for this rare case.
+        let mut f = fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(path)?;
+        f.write_all(json.as_bytes())?;
+        f.sync_all()?;
+        return Ok(());
+    }
+    let tmp = path.with_extension("json.tmp");
+    let written = (|| -> std::io::Result<()> {
+        let mut f = fs::File::create(&tmp)?;
+        f.write_all(json.as_bytes())?;
+        // Data must be on disk before the rename publishes it.
+        f.sync_all()
+    })();
+    if let Err(e) = written {
+        let _ = fs::remove_file(&tmp);
+        return Err(e.into());
+    }
+    // An on-access AV scan of the fresh temp file can briefly hold it
+    // (ERROR_ACCESS_DENIED / ERROR_SHARING_VIOLATION) — retry a moment
+    // before giving up. A read-only config.json fails the same way, for good.
+    let mut last = None;
+    for attempt in 0..5 {
+        match fs::rename(&tmp, path) {
+            Ok(()) => return Ok(()),
+            Err(e) if matches!(e.raw_os_error(), Some(5) | Some(32)) && attempt < 4 => {
+                std::thread::sleep(Duration::from_millis(100));
+                last = Some(e);
+            }
+            Err(e) => {
+                last = Some(e);
+                break;
+            }
+        }
+    }
+    let _ = fs::remove_file(&tmp);
+    Err(last
+        .map(|e| e.into())
+        .unwrap_or_else(|| "rename failed".into()))
+}
+
+/// Load config.json from its real location, logging a self-heal.
+fn load_config_logged() -> Result<Config, String> {
+    load_config_ex(&config_path()).map(|(cfg, healed)| {
+        if let Some(h) = healed {
+            let action = if h.save_err.is_some() {
+                "reset-in-memory"
+            } else {
+                "reset-to-defaults"
+            };
+            log_event(&format!(
+                "{} config_healed reason={} action={}",
+                Local::now().to_rfc3339(),
+                h.reason,
+                action,
+            ));
+            if let Some(e) = h.save_err {
+                log_event(&format!(
+                    "{} config_save_err msg=\"{}\"",
+                    Local::now().to_rfc3339(),
+                    sanitize_log_msg(&e),
+                ));
+            }
+        }
+        cfg
+    })
+}
+
+/// Whether `path` is a symlink/junction or a hard link with other names —
+/// replacing it by rename would silently detach it from the shared file.
+/// Only name-surrogate reparse points count (`is_symlink()`: symlinks,
+/// junctions, LX symlinks): OneDrive/cloud and dedup files are reparse
+/// points too, but renaming over them is fine.
+fn is_linked_file(path: &Path) -> bool {
+    use std::os::windows::io::AsRawHandle;
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => return true,
+        Ok(_) => {}
+        Err(_) => return false,
+    }
+    let Ok(f) = fs::File::open(path) else {
+        return false;
+    };
+    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    let ok = unsafe { GetFileInformationByHandle(f.as_raw_handle() as _, &mut info) };
+    ok != 0 && info.nNumberOfLinks > 1
+}
+
+/// save_config with the failure logged instead of dropped.
+fn persist_config(cfg: &Config) {
+    if let Err(e) = save_config(cfg) {
+        log_event(&format!(
+            "{} config_save_err msg=\"{}\"",
+            Local::now().to_rfc3339(),
+            sanitize_log_msg(&e.to_string()),
+        ));
+    }
+}
+
+/// Refresh's config step, minus I/O. Adopts a freshly (re)loaded config when
+/// it parsed. Returns whether the autostart registration may be re-asserted —
+/// only from a config that came from disk at some point this session, never
+/// from the in-memory fallback of a session that started with a broken file
+/// (whose auto_start=true default must not override the file's false) — and
+/// the load error to report, if any. Pure — unit-tested.
+fn adopt_reloaded_config(
+    load: Result<Config, String>,
+    cfg: &mut Config,
+    have_disk_cfg: &mut bool,
+) -> (bool, Option<String>) {
+    match load {
+        Ok(new_cfg) => {
+            *cfg = new_cfg;
+            *have_disk_cfg = true;
+            (true, None)
+        }
+        // Keep the last-known-good (or fallback) config; the broken file
+        // stays on disk for the user to fix.
+        Err(e) => (*have_disk_cfg, Some(e)),
+    }
 }
 
 fn ensure_com_initialized() {
@@ -563,19 +843,84 @@ fn try_get_windows_location() -> Option<(f64, f64)> {
     Some((p.Latitude, p.Longitude))
 }
 
+/// Whether `.json` has a real "open" handler. Without one (common on a fresh
+/// Windows — and true on the maintainer's machine), ShellExecute("open") on
+/// config.json doesn't fail: it resolves to the "Unknown" class and shows the
+/// "How do you want to open this file?" picker. ASSOCF_INIT_IGNOREUNKNOWN
+/// makes that case fail here instead.
+fn json_has_open_handler() -> bool {
+    let ext = wide(".json");
+    let verb = wide("open");
+    let mut len: u32 = 0;
+    // FRIENDLYAPPNAME, not EXECUTABLE: packaged (Store) handlers have no
+    // executable path but do have a name. A null buffer just asks for the
+    // length — S_FALSE/S_OK both mean "there is a handler".
+    let hr = unsafe {
+        AssocQueryStringW(
+            ASSOCF_INIT_IGNOREUNKNOWN,
+            ASSOCSTR_FRIENDLYAPPNAME,
+            ext.as_ptr(),
+            verb.as_ptr(),
+            ptr::null_mut(),
+            &mut len,
+        )
+    };
+    hr >= 0
+}
+
+/// Full path of System32\notepad.exe — never a bare "notepad.exe", which
+/// ShellExecute would resolve by search starting in the working directory
+/// (the exe's own folder on a double-click launch).
+fn system_notepad() -> PathBuf {
+    let mut buf = [0u16; 260];
+    let n = unsafe { GetSystemDirectoryW(buf.as_mut_ptr(), buf.len() as u32) } as usize;
+    let dir = if n > 0 && n < buf.len() {
+        PathBuf::from(String::from_utf16_lossy(&buf[..n]))
+    } else {
+        PathBuf::from("C:\\Windows\\System32")
+    };
+    dir.join("notepad.exe")
+}
+
 fn open_config_in_editor() {
     let path = config_path();
     let path_w = wide(&path.to_string_lossy());
     let verb = wide("open");
     unsafe {
-        ShellExecuteW(
+        let mut code: isize = -1;
+        if json_has_open_handler() {
+            let h = ShellExecuteW(
+                ptr::null_mut(),
+                verb.as_ptr(),
+                path_w.as_ptr(),
+                ptr::null(),
+                ptr::null(),
+                SW_SHOWNORMAL,
+            );
+            code = h as isize;
+            if code > 32 {
+                return;
+            }
+        }
+        // No usable .json handler: Notepad (by full path).
+        let notepad = wide(&system_notepad().to_string_lossy());
+        let arg = wide(&format!("\"{}\"", path.to_string_lossy()));
+        let h2 = ShellExecuteW(
             ptr::null_mut(),
             verb.as_ptr(),
-            path_w.as_ptr(),
-            ptr::null(),
+            notepad.as_ptr(),
+            arg.as_ptr(),
             ptr::null(),
             SW_SHOWNORMAL,
         );
+        if (h2 as isize) <= 32 {
+            log_event(&format!(
+                "{} open_config_err code={} fallback_code={}",
+                Local::now().to_rfc3339(),
+                code,
+                h2 as isize,
+            ));
+        }
     }
 }
 
@@ -668,7 +1013,7 @@ fn acquire_location(cfg: &mut Config) {
     if let Some((lat, lon)) = try_get_windows_location() {
         cfg.latitude = lat;
         cfg.longitude = lon;
-        let _ = save_config(cfg);
+        persist_config(cfg);
         return;
     }
     if ask_enable_location() {
@@ -730,23 +1075,42 @@ fn write_theme_registry(theme: Theme) -> Result<(), Box<dyn Error>> {
         {
             return Err("RegOpenKeyExW failed for Personalize".into());
         }
-        RegSetValueExW(
-            hkey,
-            apps.as_ptr(),
-            0,
-            REG_DWORD,
-            &value as *const u32 as *const u8,
-            4,
-        );
-        RegSetValueExW(
-            hkey,
-            sys.as_ptr(),
-            0,
-            REG_DWORD,
-            &value as *const u32 as *const u8,
-            4,
-        );
+        // Both results matter: a blocked write (AV/HIPS, ACL, hive error)
+        // must surface as Err so tick's bounded retry runs, instead of being
+        // logged as applied=registry while nothing changed.
+        // Order matters: SystemUsesLightTheme — the value current_theme()
+        // reads — is written LAST and only if Apps succeeded, so the only
+        // possible half state ("Apps new, System old") reads as not-applied
+        // and gets retried. The reverse would read as the screen having
+        // moved, which the retry gate would take for a user intervention.
+        let mut failed: Option<String> = None;
+        let mut any_ok = false;
+        for (name, name_w) in [("AppsUseLightTheme", &apps), ("SystemUsesLightTheme", &sys)] {
+            let rc = RegSetValueExW(
+                hkey,
+                name_w.as_ptr(),
+                0,
+                REG_DWORD,
+                &value as *const u32 as *const u8,
+                4,
+            );
+            if rc != 0 {
+                failed = Some(format!("RegSetValueExW {name} rc={rc}"));
+                break;
+            }
+            any_ok = true;
+        }
         RegCloseKey(hkey);
+        if let Some(e) = failed {
+            if any_ok {
+                // Half-written (one mode flipped): callers skip their
+                // broadcast on Err, so repaint here rather than leave a
+                // changed value un-announced.
+                broadcast_setting_change();
+                poke_shell();
+            }
+            return Err(e.into());
+        }
     }
     Ok(())
 }
@@ -927,7 +1291,7 @@ fn start_commit_watcher(target: Theme) {
                     "{} fallback_registry_err target={} err=\"{}\"",
                     Local::now().to_rfc3339(),
                     theme_str(Some(target)),
-                    e,
+                    sanitize_log_msg(&e.to_string()),
                 ));
             }
         }
@@ -941,37 +1305,43 @@ fn start_commit_watcher(target: Theme) {
 /// Returns the resolved literal string, or None if the file is unreadable / has no
 /// DisplayName / the indirect-string resolution fails.
 ///
-/// Reads as raw bytes + lossy UTF-8 decode rather than `fs::read_to_string`
-/// because system .theme files are sometimes Windows-1252 (e.g. `aero.theme`'s
-/// copyright comment has a raw `0xa9` for `©`, which is invalid UTF-8 and would
-/// make the strict decode fail outright). The keyword we care about
-/// (`DisplayName=`) is pure ASCII, and comment lines (which contain the funky
-/// bytes) are skipped before any lossy replacement matters.
+/// Parsed with Windows' own INI reader (GetPrivateProfileStringW), not by hand,
+/// so the name we match in tier 1 is exactly the one Windows reads: section
+/// and key names case-insensitive, whitespace around `=` trimmed, enclosing
+/// quotes stripped, and the file decoded the way Windows decodes it (UTF-16
+/// with a BOM, otherwise the system ANSI code page — system .theme files are
+/// Windows-1252, e.g. `aero.theme`'s raw `0xa9` copyright byte).
 fn resolve_theme_display_name(theme_file: &Path) -> Option<String> {
-    let bytes = fs::read(theme_file).ok()?;
-    let content = String::from_utf8_lossy(&bytes);
-    let mut in_theme_section = false;
-    for raw_line in content.lines() {
-        let line = raw_line.trim();
-        if line.starts_with(';') || line.is_empty() {
-            continue;
-        }
-        if line.starts_with('[') && line.ends_with(']') {
-            in_theme_section = line.eq_ignore_ascii_case("[Theme]");
-            continue;
-        }
-        if !in_theme_section {
-            continue;
-        }
-        if let Some(rest) = line.strip_prefix("DisplayName=") {
-            let raw = rest.trim();
-            if raw.starts_with('@') {
-                return resolve_indirect_string(raw);
-            }
-            return Some(raw.to_string());
-        }
+    if !theme_file.is_file() {
+        return None;
     }
-    None
+    let section = wide("Theme");
+    let key = wide("DisplayName");
+    let empty = wide("");
+    // Absolute: given a bare file name, GetPrivateProfileStringW looks in
+    // %WINDIR%, not the directory is_file() just checked.
+    let abs = std::path::absolute(theme_file).unwrap_or_else(|_| theme_file.to_path_buf());
+    let file = wide(&abs.to_string_lossy());
+    let mut buf = vec![0u16; 1024];
+    let n = unsafe {
+        GetPrivateProfileStringW(
+            section.as_ptr(),
+            key.as_ptr(),
+            empty.as_ptr(),
+            buf.as_mut_ptr(),
+            buf.len() as u32,
+            file.as_ptr(),
+        )
+    } as usize;
+    if n == 0 {
+        return None;
+    }
+    let raw = String::from_utf16_lossy(&buf[..n.min(buf.len())]);
+    let raw = raw.trim();
+    if raw.starts_with('@') {
+        return resolve_indirect_string(raw);
+    }
+    Some(raw.to_string())
 }
 
 /// Resolves `@dll,-id` resource string references using SHLoadIndirectString.
@@ -1040,7 +1410,7 @@ fn apply_via_theme_manager2(theme: Theme, theme_file: &Path) -> Result<(), Box<d
                     "{} theme_manager2_apply target={} display=\"{}\" idx={} after_ms={}",
                     Local::now().to_rfc3339(),
                     theme_str(Some(theme)),
-                    name,
+                    sanitize_log_msg(&name),
                     i,
                     started.elapsed().as_millis(),
                 ));
@@ -1057,6 +1427,23 @@ fn apply_via_theme_manager2(theme: Theme, theme_file: &Path) -> Result<(), Box<d
 ///   3. Direct registry write — flips light/dark mode but not wallpaper. Last resort.
 fn apply_theme(theme: Theme, cfg: &Config) -> Result<&'static str, Box<dyn Error>> {
     let theme_file = resolve_theme_file(theme, cfg);
+    let configured = match theme {
+        Theme::Light => cfg.theme_day.as_deref(),
+        Theme::Dark => cfg.theme_night.as_deref(),
+    };
+    if let Some(p) = configured {
+        if Path::new(p) != theme_file {
+            // resolve_theme_file fell back to the stock theme — say so, or a
+            // typo in theme_day/theme_night is invisible.
+            log_event(&format!(
+                "{} theme_path_missing target={} path=\"{}\" using=\"{}\"",
+                Local::now().to_rfc3339(),
+                theme_str(Some(theme)),
+                sanitize_log_msg(p),
+                sanitize_log_msg(&theme_file.to_string_lossy()),
+            ));
+        }
+    }
 
     if theme_file.exists() {
         match apply_via_theme_manager2(theme, &theme_file) {
@@ -1065,7 +1452,7 @@ fn apply_theme(theme: Theme, cfg: &Config) -> Result<&'static str, Box<dyn Error
                 "{} theme_manager2_err target={} msg=\"{}\"",
                 Local::now().to_rfc3339(),
                 theme_str(Some(theme)),
-                e,
+                sanitize_log_msg(&e.to_string()),
             )),
         }
     }
@@ -1084,38 +1471,114 @@ fn apply_theme(theme: Theme, cfg: &Config) -> Result<&'static str, Box<dyn Error
     Ok("registry")
 }
 
+/// Make the HKCU Run value match `enable`. Writes only when the value differs
+/// (a missing value — e.g. deleted by an AV quarantine — always differs, so
+/// the documented re-assert-on-launch/Refresh recovery still works), and
+/// surfaces every registry failure as Err instead of dropping it.
 fn set_auto_start(enable: bool) -> Result<(), Box<dyn Error>> {
+    const ERROR_FILE_NOT_FOUND: u32 = 2;
     let subkey = wide(RUN_KEY);
     let name = wide(APP_NAME);
     unsafe {
         let mut hkey: HKEY = ptr::null_mut();
-        if RegOpenKeyExW(
+        let rc = RegOpenKeyExW(
             HKEY_CURRENT_USER,
             subkey.as_ptr(),
             0,
-            KEY_SET_VALUE,
+            KEY_QUERY_VALUE | KEY_SET_VALUE,
             &mut hkey,
-        ) != 0
-        {
-            return Err("RegOpenKeyExW failed for Run".into());
+        );
+        if rc == ERROR_FILE_NOT_FOUND && !enable {
+            // No Run key at all → certainly no Run value to remove.
+            return Ok(());
         }
-        if enable {
-            let exe = std::env::current_exe()?;
-            let exe_w = wide(&format!("\"{}\"", exe.to_string_lossy()));
-            RegSetValueExW(
-                hkey,
-                name.as_ptr(),
-                0,
-                REG_SZ,
-                exe_w.as_ptr() as *const u8,
-                (exe_w.len() * 2) as u32,
-            );
+        if rc != 0 {
+            return Err(format!("RegOpenKeyExW Run rc={rc}").into());
+        }
+        let result = if enable {
+            match std::env::current_exe() {
+                Ok(exe) => {
+                    let want = format!("\"{}\"", exe.to_string_lossy());
+                    if read_reg_sz(hkey, &name).as_deref() == Some(want.as_str()) {
+                        Ok(())
+                    } else {
+                        let want_w = wide(&want);
+                        let rc = RegSetValueExW(
+                            hkey,
+                            name.as_ptr(),
+                            0,
+                            REG_SZ,
+                            want_w.as_ptr() as *const u8,
+                            (want_w.len() * 2) as u32,
+                        );
+                        if rc == 0 {
+                            Ok(())
+                        } else {
+                            Err(format!("RegSetValueExW Run rc={rc}"))
+                        }
+                    }
+                }
+                Err(e) => Err(format!("current_exe: {e}")),
+            }
         } else {
-            RegDeleteValueW(hkey, name.as_ptr());
-        }
+            let rc = RegDeleteValueW(hkey, name.as_ptr());
+            if rc == 0 || rc == ERROR_FILE_NOT_FOUND {
+                Ok(())
+            } else {
+                Err(format!("RegDeleteValueW Run rc={rc}"))
+            }
+        };
         RegCloseKey(hkey);
+        result.map_err(|e| e.into())
     }
-    Ok(())
+}
+
+/// Read a REG_SZ value from an open key; None if absent, not REG_SZ, or
+/// unreadable. `name` must be NUL-terminated (from `wide`).
+unsafe fn read_reg_sz(hkey: HKEY, name: &[u16]) -> Option<String> {
+    let mut kind: u32 = 0;
+    let mut size: u32 = 0;
+    if RegQueryValueExW(
+        hkey,
+        name.as_ptr(),
+        ptr::null_mut(),
+        &mut kind,
+        ptr::null_mut(),
+        &mut size,
+    ) != 0
+        || kind != REG_SZ
+    {
+        return None;
+    }
+    // +1 u16 so the buffer is NUL-terminated even if the stored data isn't.
+    let mut buf = vec![0u16; (size as usize).div_ceil(2) + 1];
+    let mut bytes = (buf.len() * 2) as u32;
+    if RegQueryValueExW(
+        hkey,
+        name.as_ptr(),
+        ptr::null_mut(),
+        &mut kind,
+        buf.as_mut_ptr() as *mut u8,
+        &mut bytes,
+    ) != 0
+    {
+        return None;
+    }
+    let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+    Some(String::from_utf16_lossy(&buf[..len]))
+}
+
+/// set_auto_start with the failure logged — a missing autostart entry must
+/// leave a diagnosable trace in events.log.
+fn apply_auto_start(enable: bool) {
+    if let Err(e) = set_auto_start(enable) {
+        log_event(&format!(
+            "{} autostart_err op={} msg=\"{}\"",
+            Local::now().to_rfc3339(),
+            if enable { "set" } else { "delete" },
+            sanitize_log_msg(&e.to_string()),
+        ));
+    }
 }
 
 /// Civil sunrise/sunset threshold: sun center 0.833° below the horizon
@@ -1168,24 +1631,94 @@ fn transitions_window(now: DateTime<Utc>, lat: f64, lon: f64) -> Vec<(DateTime<U
     events
 }
 
+/// Theme implied by the sun's position alone.
+fn altitude_theme(t: DateTime<Utc>, lat: f64, lon: f64) -> Theme {
+    if solar_altitude_deg(t, lat, lon) > SUNRISE_ALTITUDE_DEG {
+        Theme::Light
+    } else {
+        Theme::Dark
+    }
+}
+
+/// First instant after `now` (within 48 h) where `altitude_theme` flips,
+/// refined to 1 ms and returned on the far side of the crossing (so a tick
+/// scheduled there already sees the new theme; the ms precision leaves a
+/// negligible window in which the theme has flipped but `next` hasn't come).
+///
+/// Probes are at least 15 s apart — fine enough that whether a short polar
+/// "day" is found no longer depends on where the search starts (with a
+/// 5-minute floor, a 2-minute segment was found from some start times and
+/// not others, breaking `schedule`'s contract) — and further apart when the
+/// sun is far from the threshold: the solar altitude changes by at most
+/// 15.04°/h × |cos(latitude)| (Earth's rotation; exactly that times
+/// sin(azimuth)) plus a little declination drift, so the threshold can't be
+/// reached sooner than |altitude − threshold| / that rate. Near the poles the
+/// bound shrinks toward the declination drift, so months-long seasons cost a
+/// few hundred to ~2k probes.
+fn next_altitude_crossing(now: DateTime<Utc>, lat: f64, lon: f64) -> Option<DateTime<Utc>> {
+    let max_deg_per_hour = 15.05 * lat.to_radians().cos().abs() + 0.02;
+    let start = altitude_theme(now, lat, lon);
+    let min_step = chrono::Duration::seconds(15);
+    let end = now + chrono::Duration::hours(48);
+    let mut lo = now;
+    while lo < end {
+        let margin = (solar_altitude_deg(lo, lat, lon) - SUNRISE_ALTITUDE_DEG).abs();
+        let safe = chrono::Duration::seconds((margin / max_deg_per_hour * 3600.0) as i64);
+        let hi = std::cmp::min(lo + std::cmp::max(min_step, safe), end);
+        if altitude_theme(hi, lat, lon) != start {
+            let (mut a, mut b) = (lo, hi);
+            while b - a > chrono::Duration::milliseconds(1) {
+                let mid = a + (b - a) / 2;
+                if altitude_theme(mid, lat, lon) == start {
+                    a = mid;
+                } else {
+                    b = mid;
+                }
+            }
+            return Some(b);
+        }
+        lo = hi;
+    }
+    None
+}
+
+/// Latitude from which the schedule uses the solar-altitude model instead of
+/// `sun_times`. With the −0.833° threshold and the 23.44° axial tilt, whole
+/// days without a sunrise or sunset begin at ~65.73°; below that
+/// `sun_times` always has events and stays in charge (Reykjavik, 64.1°,
+/// included).
+const POLAR_MODEL_LAT: f64 = 65.5;
+
 /// Current theme and next transition instant — the single source of truth
-/// for tick(). When the ±1-day window has no usable events (polar day/night),
-/// the current state comes from the solar altitude and the next transition
-/// from a forward scan.
+/// for tick(). Contract (unit-tested by an edge sweep): the theme stays
+/// `current` for every instant in [now, next), and `next` is a real flip.
+///
+/// Below POLAR_MODEL_LAT: from the sorted `sun_times` sunrise/sunset events
+/// around `now`.
+///
+/// At polar latitudes: purely from the solar altitude — current state from
+/// `altitude_theme`, next from the next altitude crossing, however far.
+/// Mixing in `sun_times` there is what went wrong before v0.4.1: after the
+/// last sunset before the midnight sun it reports no following sunrise
+/// (~68 days stuck on Dark in Tromsø), and switching between the two models
+/// at UTC midnights made them disagree — phantom transitions that reverted
+/// overrides, and minute-long flickers. One model per location avoids all
+/// of that; it differs from `sun_times` by at most a few minutes on ordinary
+/// days.
 fn schedule(now: DateTime<Utc>, lat: f64, lon: f64) -> (Theme, DateTime<Utc>) {
+    if lat.abs() >= POLAR_MODEL_LAT {
+        return (
+            altitude_theme(now, lat, lon),
+            next_altitude_flip(now, lat, lon),
+        );
+    }
     let window = transitions_window(now, lat, lon);
     let current = window
         .iter()
         .rev()
         .find(|&&(t, _)| t <= now)
         .map(|&(_, theme)| theme)
-        .unwrap_or_else(|| {
-            if solar_altitude_deg(now, lat, lon) > SUNRISE_ALTITUDE_DEG {
-                Theme::Light
-            } else {
-                Theme::Dark
-            }
-        });
+        .unwrap_or_else(|| altitude_theme(now, lat, lon));
     let next = window
         .iter()
         .find(|&&(t, _)| t > now)
@@ -1194,8 +1727,25 @@ fn schedule(now: DateTime<Utc>, lat: f64, lon: f64) -> (Theme, DateTime<Utc>) {
     (current, next)
 }
 
-/// Forward scan for the first transition after a polar day/night period.
-/// 200 days covers even the poles' ~6-month seasons; each probe is pure math.
+/// The next `altitude_theme` flip after `now`, searched in 48 h chunks up to
+/// 200 days (the poles' seasons are ~6 months). Adaptive probe steps keep
+/// even a months-long polar season to a few thousand altitude evaluations.
+fn next_altitude_flip(now: DateTime<Utc>, lat: f64, lon: f64) -> DateTime<Utc> {
+    let limit = now + chrono::Duration::days(200);
+    let mut from = now;
+    while from < limit {
+        if let Some(t) = next_altitude_crossing(from, lat, lon) {
+            return t;
+        }
+        from += chrono::Duration::hours(48);
+    }
+    // Unreachable on Earth; re-check tomorrow rather than never.
+    now + chrono::Duration::days(1)
+}
+
+/// Safety net for the `sun_times` path: the first event beyond the ±1-day
+/// window. (Below POLAR_MODEL_LAT the window always has events, so this
+/// shouldn't run.)
 fn next_transition_beyond_window(now: DateTime<Utc>, lat: f64, lon: f64) -> DateTime<Utc> {
     let base = now.date_naive();
     for off in 2..=200 {
@@ -1213,10 +1763,114 @@ fn next_transition_beyond_window(now: DateTime<Utc>, lat: f64, lon: f64) -> Date
     now + chrono::Duration::days(1)
 }
 
-fn deadline_instant(target: DateTime<Local>) -> Instant {
-    let now = Local::now();
-    let delta = (target - now).to_std().unwrap_or(Duration::from_secs(1));
-    Instant::now() + delta
+// === Wall clock vs. monotonic clock ===
+//
+// The schedule is wall-clock (sunrise at 05:43 local), but winit's WaitUntil
+// is a monotonic Instant. The mapping between them breaks when the system
+// clock is STEPPED — w32time correcting a PC that booted 3 h behind after an
+// Ubuntu session (Ubuntu keeps the RTC in UTC), a manual change, a VM
+// restore. Before v0.4.1 a deadline armed from a wrong clock fired up to
+// hours late, and the Init tick's decision (made from the wrong time) stood
+// until then.
+//
+// So every arm records a (wall, mono) mark, and every wake of the loop —
+// the deadline itself, a heartbeat at most HEARTBEAT later, or any other
+// message (including the WM_TIMECHANGE broadcast winit's hidden top-level
+// window receives) — compares how far each clock advanced since the mark.
+// A divergence beyond CLOCK_STEP_MS is a step: re-evaluate now. The
+// heartbeat makes this independent of whether WM_TIMECHANGE is delivered.
+
+/// Longest the loop ever sleeps without re-checking the clocks.
+const HEARTBEAT: Duration = Duration::from_secs(10 * 60);
+/// Wall-vs-monotonic divergence treated as a clock step (drift and w32time's
+/// gradual slewing are far smaller).
+const CLOCK_STEP_MS: i64 = 60_000;
+
+/// Map a wall-clock deadline onto the monotonic clock. A deadline already in
+/// the past maps to `now_mono` (fire immediately). Pure — unit-tested.
+fn wall_to_instant(target: DateTime<Utc>, now_wall: DateTime<Utc>, now_mono: Instant) -> Instant {
+    now_mono + (target - now_wall).to_std().unwrap_or(Duration::ZERO)
+}
+
+/// How much further the wall clock moved than the monotonic clock since the
+/// mark, in ms. ~0 normally; +10_800_000 after a 3 h forward step; negative
+/// after a backward step. Pure — unit-tested.
+fn clock_step_ms(
+    mark: (DateTime<Utc>, Instant),
+    now_wall: DateTime<Utc>,
+    now_mono: Instant,
+) -> i64 {
+    let wall_ms = (now_wall - mark.0).num_milliseconds();
+    let mono_ms = now_mono.saturating_duration_since(mark.1).as_millis() as i64;
+    wall_ms - mono_ms
+}
+
+/// The clock step since `mark`, if it exceeds CLOCK_STEP_MS (positive =
+/// the wall clock jumped forward). Pure — unit-tested.
+fn detected_clock_step(
+    mark: Option<(DateTime<Utc>, Instant)>,
+    now_wall: DateTime<Utc>,
+    now_mono: Instant,
+) -> Option<i64> {
+    let step = clock_step_ms(mark?, now_wall, now_mono);
+    (step.abs() > CLOCK_STEP_MS).then_some(step)
+}
+
+/// What to do when the loop wakes without a tick-worthy event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WakePlan {
+    /// Nothing armed (no location → plain Wait).
+    Idle,
+    /// Due, or the clock was stepped: run a Scheduled tick. `step_ms` is set
+    /// when a clock step was detected.
+    Tick { step_ms: Option<i64> },
+    /// Not due: sleep until this Instant (the deadline, or the heartbeat).
+    Arm(Instant),
+}
+
+/// Decide a wake from the armed wall deadline and the arming mark. Pure —
+/// unit-tested.
+fn plan_wake(
+    armed: Option<DateTime<Utc>>,
+    mark: Option<(DateTime<Utc>, Instant)>,
+    now_wall: DateTime<Utc>,
+    now_mono: Instant,
+) -> WakePlan {
+    let Some(deadline) = armed else {
+        return WakePlan::Idle;
+    };
+    if let Some(step) = detected_clock_step(mark, now_wall, now_mono) {
+        return WakePlan::Tick {
+            step_ms: Some(step),
+        };
+    }
+    if now_wall >= deadline {
+        return WakePlan::Tick { step_ms: None };
+    }
+    WakePlan::Arm(std::cmp::min(
+        wall_to_instant(deadline, now_wall, now_mono),
+        now_mono + HEARTBEAT,
+    ))
+}
+
+/// Arm the loop for the wall-clock `deadline` (capped at the heartbeat) and
+/// record `mark` — the (wall, mono) readings the tick DECIDED from — as the
+/// reference clock steps are measured against. Taking the mark at decision
+/// time, not here after the apply, means a step during a slow apply is still
+/// detected at the next wake.
+fn arm(
+    elwt: &ActiveEventLoop,
+    state: &mut TickState,
+    deadline: DateTime<Utc>,
+    mark: (DateTime<Utc>, Instant),
+) {
+    let (now_wall, now_mono) = (Utc::now(), Instant::now());
+    state.armed = Some(deadline);
+    state.mark = Some(mark);
+    elwt.set_control_flow(ControlFlow::WaitUntil(std::cmp::min(
+        wall_to_instant(deadline, now_wall, now_mono),
+        now_mono + HEARTBEAT,
+    )));
 }
 
 fn make_tray_icon() -> Option<tray_icon::Icon> {
@@ -1250,10 +1904,13 @@ fn make_tray_icon() -> Option<tray_icon::Icon> {
 
 fn tick(cfg: &Config, elwt: &ActiveEventLoop, kind: TickKind, cause: &str, state: &mut TickState) {
     let now = Local::now();
+    let now_mono = Instant::now();
     let now_str = now.to_rfc3339();
 
     if !cfg.has_location() {
         log_event(&format!("{} cause={} skipped=no-location", now_str, cause));
+        state.armed = None;
+        state.mark = None;
         elwt.set_control_flow(ControlFlow::Wait);
         return;
     }
@@ -1263,10 +1920,32 @@ fn tick(cfg: &Config, elwt: &ActiveEventLoop, kind: TickKind, cause: &str, state
     let current = current_theme();
     let next = next_utc.with_timezone(&Local);
 
+    // A clock step since the PRE-tick mark is consumed by THIS tick (the
+    // clock-jump tick, or a wake/Refresh that beat it) — log it here so every
+    // consumer logs it once, and let a backward one enable the frame rule.
+    let step = detected_clock_step(state.mark, now_utc, now_mono);
+    if let Some(ms) = step {
+        log_event(&format!(
+            "{} clock_jump step_s={:+} consumed_by={}",
+            Local::now().to_rfc3339(),
+            ms / 1000,
+            cause,
+        ));
+    }
+    let clock_stepped_back = step.is_some_and(|ms| ms < 0);
+
     // Decide with the PRE-tick state; record the outcome after the apply
-    // result is known (a failed apply must leave reconciled_next stale — see
-    // TickState).
-    let action = decide_tick(kind, current, want, now_utc, state);
+    // result is known (a failed apply must never advance reconciled_next —
+    // see TickState).
+    let action = decide_tick(
+        kind,
+        current,
+        want,
+        now_utc,
+        next_utc,
+        clock_stepped_back,
+        state,
+    );
 
     let mut retry_note = String::new();
     let mut deadline = next;
@@ -1328,7 +2007,12 @@ fn tick(cfg: &Config, elwt: &ActiveEventLoop, kind: TickKind, cause: &str, state
         deadline.to_rfc3339(),
     ));
 
-    elwt.set_control_flow(ControlFlow::WaitUntil(deadline_instant(deadline)));
+    arm(
+        elwt,
+        state,
+        deadline.with_timezone(&Utc),
+        (now_utc, now_mono),
+    );
 }
 
 unsafe extern "system" fn wake_window_proc(
@@ -1337,20 +2021,69 @@ unsafe extern "system" fn wake_window_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
-    let kind = match msg {
-        WM_WTSSESSION_CHANGE if wparam == WTS_SESSION_UNLOCK => Some(WakeKind::Unlock),
-        WM_POWERBROADCAST if wparam == PBT_APMRESUMEAUTOMATIC => Some(WakeKind::Power),
-        _ => None,
-    };
-    if let Some(k) = kind {
+    if msg == WM_WTSSESSION_CHANGE && wparam == WTS_SESSION_UNLOCK {
         if let Some(proxy) = EVENT_PROXY.get() {
-            let _ = proxy.send_event(AppEvent::Wake(k));
+            let _ = proxy.send_event(AppEvent::Wake(WakeKind::Unlock));
         }
     }
     DefWindowProcW(hwnd, msg, wparam, lparam)
 }
 
+/// Suspend/resume callback (DEVICE_NOTIFY_CALLBACK registration). Runs on a
+/// system thread; EventLoopProxy::send_event is thread-safe. Only
+/// PBT_APMRESUMEAUTOMATIC matters: the system sends it on EVERY resume
+/// (PBT_APMRESUMESUSPEND follows only after user input, and would just be a
+/// duplicate, idempotent wake). Note this wake can run while the session is
+/// still at the lock screen; the unlock that follows is then a SkipInSync.
+unsafe extern "system" fn power_callback(
+    _context: *const c_void,
+    kind: u32,
+    _setting: *const c_void,
+) -> u32 {
+    if kind == PBT_APMRESUMEAUTOMATIC {
+        if let Some(proxy) = EVENT_PROXY.get() {
+            let _ = proxy.send_event(AppEvent::Wake(WakeKind::Power));
+        }
+    }
+    0 // ERROR_SUCCESS
+}
+
+/// Register for resume-from-sleep via the documented callback form.
+/// PowerRegisterSuspendResumeNotification accepts ONLY DEVICE_NOTIFY_CALLBACK
+/// — until v0.4.1 this passed a window handle instead, failed with 87
+/// (ERROR_INVALID_PARAMETER) on every launch, and the resume hook never fired.
+/// The callback form also avoids depending on a message-only window receiving
+/// WM_POWERBROADCAST, which Microsoft doesn't document. The subscribe
+/// parameters must outlive the registration, which lasts as long as the
+/// process — both are intentionally leaked.
+fn register_power_resume() {
+    let params: &'static mut DEVICE_NOTIFY_SUBSCRIBE_PARAMETERS =
+        Box::leak(Box::new(DEVICE_NOTIFY_SUBSCRIBE_PARAMETERS {
+            Callback: Some(power_callback),
+            Context: ptr::null_mut(),
+        }));
+    let mut handle: *mut c_void = ptr::null_mut();
+    let rc = unsafe {
+        PowerRegisterSuspendResumeNotification(
+            DEVICE_NOTIFY_CALLBACK,
+            params as *mut DEVICE_NOTIFY_SUBSCRIBE_PARAMETERS as _,
+            &mut handle,
+        )
+    };
+    if rc != 0 {
+        // The error code IS the return value (WIN32_ERROR), not GetLastError.
+        log_event(&format!(
+            "{} wake_listener_err stage=power_register code={}",
+            Local::now().to_rfc3339(),
+            rc,
+        ));
+    }
+}
+
 fn start_wake_listener() {
+    // Independent of the unlock window below, and first — so a slow WTS
+    // registration at logon can't delay it.
+    register_power_resume();
     std::thread::spawn(|| {
         let class_name = wide("WinThemeSwitcherWakeListener");
         unsafe {
@@ -1419,20 +2152,9 @@ fn start_wake_listener() {
                     attempt,
                     err,
                 ));
-                std::thread::sleep(Duration::from_secs(2));
-            }
-            let mut handle = ptr::null_mut();
-            let power_rc = PowerRegisterSuspendResumeNotification(
-                DEVICE_NOTIFY_WINDOW_HANDLE,
-                hwnd as _,
-                &mut handle,
-            );
-            if power_rc != 0 {
-                log_event(&format!(
-                    "{} wake_listener_err stage=power_register code={}",
-                    Local::now().to_rfc3339(),
-                    power_rc,
-                ));
+                if attempt < 3 {
+                    std::thread::sleep(Duration::from_secs(2));
+                }
             }
 
             let mut msg: MSG = std::mem::zeroed();
@@ -1457,7 +2179,7 @@ fn install_panic_hook() {
             .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
             .unwrap_or_else(|| "unknown".to_string());
         let msg = info.payload_as_str().unwrap_or("<non-string panic>");
-        log_event(&format!(
+        log_event_from_panic(&format!(
             "{} panic at={} msg=\"{}\"",
             Local::now().to_rfc3339(),
             at,
@@ -1491,6 +2213,14 @@ fn claim_single_instance() -> bool {
 }
 
 fn main() {
+    // Runtime LoadLibrary calls by bare name (dependencies load e.g.
+    // uxtheme.dll that way) search System32 only — never the exe's own
+    // folder. .cargo\config.toml's /DEPENDENTLOADFLAG does the same for the
+    // static imports. Everything this app loads is a system DLL; COM/WinRT
+    // activation uses full paths.
+    unsafe {
+        SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32);
+    }
     install_panic_hook();
     if !claim_single_instance() {
         log_event(&format!(
@@ -1535,12 +2265,18 @@ fn run() -> Result<(), Box<dyn Error>> {
     // would overwrite the very file the user needs to fix) and the autostart
     // registration is left exactly as the user last set it (the fallback
     // default auto_start=true must not override a broken file's false).
-    let mut cfg = match load_config_at(&config_path()) {
+    let loaded = load_config_logged();
+    // Whether `cfg` has ever come from a successfully parsed file this
+    // session. Until it has, the autostart registration must be left as the
+    // user last set it — the in-memory fallback's auto_start=true must never
+    // override a broken file's false, on startup OR on a Refresh.
+    let mut have_disk_cfg = loaded.is_ok();
+    let mut cfg = match loaded {
         Ok(mut cfg) => {
             if !cfg.has_location() {
                 acquire_location(&mut cfg);
             }
-            let _ = set_auto_start(cfg.auto_start);
+            apply_auto_start(cfg.auto_start);
             cfg
         }
         Err(e) => {
@@ -1583,6 +2319,10 @@ fn run() -> Result<(), Box<dyn Error>> {
     MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
         let _ = proxy.send_event(AppEvent::Menu(event.id));
     }));
+    // Without a handler, tray-icon queues every mouse event over the icon
+    // (dozens of Move events per hover) in an unbounded channel that nothing
+    // drains — a slow leak over long uptimes. Nothing here needs them.
+    TrayIconEvent::set_event_handler(Some(|_: TrayIconEvent| {}));
 
     let toggle_id = toggle_i.id().clone();
     let open_cfg_id = open_cfg_i.id().clone();
@@ -1591,10 +2331,42 @@ fn run() -> Result<(), Box<dyn Error>> {
 
     let mut state = TickState::new();
 
+    // winit 0.30 deprecates EventLoop::run in favor of ApplicationHandler;
+    // the migration is deferred until a winit 0.31 bump forces it (README →
+    // Roadmap → Maintenance notes).
+    #[allow(deprecated)]
     event_loop.run(move |event, elwt| match event {
         Event::NewEvents(StartCause::Init) => tick(&cfg, elwt, TickKind::Init, "init", &mut state),
+        // The armed deadline — or the heartbeat, or a clock step. Only a due
+        // deadline or a detected step ticks; a heartbeat just re-arms.
         Event::NewEvents(StartCause::ResumeTimeReached { .. }) => {
-            tick(&cfg, elwt, TickKind::Scheduled, "resume-time", &mut state);
+            match plan_wake(state.armed, state.mark, Utc::now(), Instant::now()) {
+                WakePlan::Tick { step_ms } => {
+                    // tick() logs the clock_jump line itself.
+                    let cause = if step_ms.is_some() {
+                        "clock-jump"
+                    } else {
+                        "resume-time"
+                    };
+                    tick(&cfg, elwt, TickKind::Scheduled, cause, &mut state);
+                }
+                WakePlan::Arm(i) => elwt.set_control_flow(ControlFlow::WaitUntil(i)),
+                WakePlan::Idle => {}
+            }
+        }
+        // Any other wake (the WM_TIMECHANGE broadcast, tray/menu input):
+        // never a tick (tick-scope invariant). If plan_wake says Tick (a
+        // clock step, or the wall-clock deadline is already due), resume
+        // immediately so the ResumeTimeReached arm ticks; otherwise re-arm
+        // (idempotent).
+        Event::NewEvents(StartCause::WaitCancelled { .. }) => {
+            match plan_wake(state.armed, state.mark, Utc::now(), Instant::now()) {
+                WakePlan::Tick { .. } => {
+                    elwt.set_control_flow(ControlFlow::WaitUntil(Instant::now()));
+                }
+                WakePlan::Arm(i) => elwt.set_control_flow(ControlFlow::WaitUntil(i)),
+                WakePlan::Idle => {}
+            }
         }
         Event::UserEvent(AppEvent::Wake(kind)) => {
             let cause = match kind {
@@ -1615,9 +2387,11 @@ fn run() -> Result<(), Box<dyn Error>> {
                 // or disturb the pending WaitUntil — so the override
                 // survives lock/unlock (see decide_tick) and resets at the
                 // next natural transition, exactly like an override made in
-                // Settings. If a failed-apply retry is pending, the toggled
-                // theme diverges from the retry baseline and the
-                // pending-retry gate stands the retry down.
+                // Settings. If a failed-apply retry is pending, one toggle
+                // moves the screen off the retry baseline and the
+                // pending-retry gate stands the retry down; a SECOND toggle
+                // lands back on the baseline, which the gate can't tell from
+                // the original failure, so the retry proceeds (known gap).
                 let before = current_theme();
                 let target = toggle_target(before);
                 let outcome = match apply_theme(target, &cfg) {
@@ -1632,25 +2406,27 @@ fn run() -> Result<(), Box<dyn Error>> {
                     outcome,
                 ));
             } else if id == refresh_id {
-                match load_config_at(&config_path()) {
-                    Ok(new_cfg) => {
-                        cfg = new_cfg;
+                let (assert_autostart, error) =
+                    adopt_reloaded_config(load_config_logged(), &mut cfg, &mut have_disk_cfg);
+                match error {
+                    Some(e) => report_config_error(&e),
+                    None => {
                         if !cfg.has_location() {
                             if let Some((lat, lon)) = try_get_windows_location() {
                                 cfg.latitude = lat;
                                 cfg.longitude = lon;
-                                let _ = save_config(&cfg);
+                                persist_config(&cfg);
                             }
                         }
                     }
-                    // Keep the last-known-good config; the broken file stays
-                    // on disk for the user to fix.
-                    Err(e) => report_config_error(&e),
                 }
-                // Runs in both arms: Refresh re-asserting the Run value from
-                // the (possibly last-known-good) config is the documented
-                // recovery path when e.g. an AV quarantine deletes it.
-                let _ = set_auto_start(cfg.auto_start);
+                // Refresh re-asserting the Run value from the (possibly
+                // last-known-good) config is the documented recovery path
+                // when e.g. an AV quarantine deletes it — but never from the
+                // in-memory fallback of a broken-config session.
+                if assert_autostart {
+                    apply_auto_start(cfg.auto_start);
+                }
                 tick(&cfg, elwt, TickKind::Refresh, "refresh", &mut state);
             }
         }
@@ -1764,7 +2540,281 @@ mod tests {
         let now = utc(2026, 12, 21, 12, 0, 0);
         let (theme, next) = schedule(now, TROMSO.0, TROMSO.1);
         assert_eq!(theme, Theme::Dark);
+        // Polar night ends mid-January (first sun_times event 2026-01-15 in
+        // the previous season) — the forward scan must find it, not fall
+        // back to a 24 h guess or run past the season.
+        assert!(next - now > mins(10 * 24 * 60), "next = {next}");
+        assert!(next - now < mins(40 * 24 * 60), "next = {next}");
+    }
+
+    // --- polar boundaries (v0.4.1) ---
+    // Tromsø 2026: sun_times' last sunset before the midnight sun is
+    // 2026-05-18T22:31:36Z, then None until the first events again on
+    // 2026-07-26; polar night: last events 2026-11-27, None from 11-28 until
+    // 2027-01-15. Expected instants below were cross-checked against an
+    // independent port of sun_times + the altitude model (±5 min).
+
+    /// Assert `schedule(at)` = (theme, next ≈ expect ± 5 min).
+    fn assert_sched(at: DateTime<Utc>, loc: (f64, f64), theme: Theme, expect: DateTime<Utc>) {
+        let (t, n) = schedule(at, loc.0, loc.1);
+        assert_eq!(t, theme, "theme at {at}");
+        assert!(
+            (n - expect).abs() < mins(5),
+            "next at {at} = {n}, expected ≈ {expect}"
+        );
+    }
+
+    #[test]
+    fn tromso_after_last_sunset_before_midnight_sun_is_not_dark_for_months() {
+        // Regression: "the last event was a sunset" + no following sunrise
+        // from sun_times made this Dark with next ≈ 68 days away. By the
+        // altitude model the sun never gets below the threshold that night,
+        // and the next real darkening is at the end of the polar day.
+        let now = utc(2026, 5, 18, 22, 32, 36);
+        let (theme, next) = schedule(now, TROMSO.0, TROMSO.1);
+        assert_eq!(theme, Theme::Light);
+        assert!(next - now > mins(30 * 24 * 60), "next = {next}");
+        assert_sched(now, TROMSO, Theme::Light, utc(2026, 7, 25, 22, 37, 19));
+    }
+
+    #[test]
+    fn tromso_polar_day_onset_details() {
+        // By the altitude model the last darkness before the midnight sun is
+        // 05-17 22:29–22:52Z; from then on the next flip is the end of the
+        // polar day — no phantom transition at sun_times' 05-18 "sunset".
+        assert_sched(
+            utc(2026, 5, 17, 23, 59, 59),
+            TROMSO,
+            Theme::Light,
+            utc(2026, 7, 25, 22, 37, 19),
+        );
+        assert_eq!(
+            schedule(utc(2026, 5, 18, 22, 31, 36), TROMSO.0, TROMSO.1).0,
+            Theme::Light
+        );
+        assert_eq!(
+            schedule(utc(2026, 5, 19, 11, 31, 0), TROMSO.0, TROMSO.1).0,
+            Theme::Light
+        );
+    }
+
+    #[test]
+    fn polar_model_threshold_and_southern_hemisphere() {
+        // At exactly 65.5° the altitude model applies (>=); values from an
+        // independent port, ±5 min.
+        assert_sched(
+            utc(2026, 6, 21, 0, 0, 0),
+            (65.5, 0.0),
+            Theme::Dark,
+            utc(2026, 6, 21, 0, 35, 12),
+        );
+        assert_sched(
+            utc(2026, 12, 21, 12, 0, 0),
+            (-65.5, 0.0),
+            Theme::Light,
+            utc(2026, 12, 21, 23, 24, 50),
+        );
+        // Above the polar-day onset latitude the midnight sun is found
+        // (guards against moving the threshold past ~65.73°).
+        assert_sched(
+            utc(2026, 6, 21, 0, 0, 0),
+            (65.8, 0.0),
+            Theme::Light,
+            utc(2026, 6, 25, 23, 57, 18),
+        );
+    }
+
+    #[test]
+    fn short_polar_segments_are_found_from_any_start() {
+        // Near the polar-night edge the altitude model can produce a day of
+        // only minutes. Whether it's found must not depend on where the
+        // search starts, or schedule's contract breaks.
+        let starts = [
+            utc(2026, 12, 2, 20, 0, 0),
+            utc(2026, 12, 3, 6, 0, 0),
+            utc(2026, 12, 3, 11, 2, 0),
+        ];
+        let nexts: Vec<_> = starts
+            .iter()
+            .map(|&t| schedule(t, TROMSO.0, TROMSO.1).1)
+            .collect();
+        for w in nexts.windows(2) {
+            assert!(
+                (w[0] - w[1]).abs() < chrono::Duration::seconds(1),
+                "{nexts:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn below_the_polar_model_latitude_sun_times_still_decides() {
+        // Reykjavik (64.1°) keeps sun_times' exact events.
+        let now = utc(2026, 7, 4, 12, 0, 0);
+        let (_, next) = schedule(now, REYKJAVIK.0, REYKJAVIK.1);
+        let window = transitions_window(now, REYKJAVIK.0, REYKJAVIK.1);
+        assert!(
+            window.iter().any(|&(t, _)| t == next),
+            "next {next} must be a sun_times event"
+        );
+    }
+
+    #[test]
+    fn tromso_polar_day_end_uses_the_first_real_darkening() {
+        // The old forward scan pointed at sun_times' 23:05 "sunrise" while
+        // it was still light; the altitude model darkens at ~22:37.
+        assert_sched(
+            utc(2026, 7, 25, 12, 0, 0),
+            TROMSO,
+            Theme::Light,
+            utc(2026, 7, 25, 22, 37, 19),
+        );
+        assert_sched(
+            utc(2026, 7, 25, 22, 45, 0),
+            TROMSO,
+            Theme::Dark,
+            utc(2026, 7, 25, 23, 4, 59),
+        );
+        assert_sched(
+            utc(2026, 6, 21, 12, 0, 0),
+            TROMSO,
+            Theme::Light,
+            utc(2026, 7, 25, 22, 37, 19),
+        );
+    }
+
+    #[test]
+    fn tromso_polar_night_boundaries() {
+        assert_sched(
+            utc(2026, 11, 27, 10, 31, 0),
+            TROMSO,
+            Theme::Light,
+            utc(2026, 11, 27, 10, 42, 38),
+        );
+        let (t, n) = schedule(utc(2026, 11, 27, 12, 0, 0), TROMSO.0, TROMSO.1);
+        assert_eq!(t, Theme::Dark);
+        let days = (n - utc(2026, 11, 27, 12, 0, 0)).num_days();
+        assert!((40..=60).contains(&days), "next = {n}");
+        // End of the polar night: the first real (short) day on 01-15, not
+        // sun_times' first event on 01-16.
+        assert_sched(
+            utc(2027, 1, 14, 12, 0, 0),
+            TROMSO,
+            Theme::Dark,
+            utc(2027, 1, 15, 10, 34, 44),
+        );
+        assert_sched(
+            utc(2027, 1, 15, 10, 54, 0),
+            TROMSO,
+            Theme::Light,
+            utc(2027, 1, 15, 11, 12, 55),
+        );
+        assert_sched(
+            utc(2026, 12, 21, 12, 0, 0),
+            TROMSO,
+            Theme::Dark,
+            utc(2027, 1, 15, 10, 34, 44),
+        );
+    }
+
+    #[test]
+    fn polar_day_straddling_utc_midnight_is_consistent_pevek() {
+        // Pevek (UTC+12, east Siberia): the last short day before the polar
+        // night straddles 00:00 UTC. Mixing sun_times and the altitude model
+        // at that midnight once made a tick arm a `next` the other model
+        // disagreed with (a wake in the gap "preserved" Light for 50 days).
+        const PEVEK: (f64, f64) = (69.70, 170.31);
+        let at = utc(2026, 11, 26, 23, 59, 52);
+        let (theme, next) = schedule(at, PEVEK.0, PEVEK.1);
+        assert_eq!(theme, altitude_theme(at, PEVEK.0, PEVEK.1));
+        let horizon = next.min(at + mins(120));
+        for m in (1..)
+            .map(|k| at + chrono::Duration::seconds(30 * k))
+            .take_while(|w| *w < horizon)
+        {
+            assert_eq!(
+                schedule(m, PEVEK.0, PEVEK.1).0,
+                theme,
+                "theme changed at {m} before next = {next}"
+            );
+        }
+        assert_ne!(
+            schedule(next, PEVEK.0, PEVEK.1).0,
+            theme,
+            "next must be a real flip"
+        );
+    }
+
+    /// The `schedule` contract, swept around polar edges: for sampled t,
+    /// `next` is a real flip, and the theme stays schedule(t).0 at every
+    /// sampled w in (t, next) — no phantom transitions, no flicker.
+    fn sweep_contract(loc: (f64, f64), center: DateTime<Utc>) {
+        let mut t = center - mins(2 * 24 * 60);
+        while t < center + mins(2 * 24 * 60) {
+            let (theme, next) = schedule(t, loc.0, loc.1);
+            assert!(next > t, "next {next} not after {t}");
+            assert_ne!(
+                schedule(next, loc.0, loc.1).0,
+                theme,
+                "schedule({t}) = ({theme:?}, {next}) but {next} is not a flip"
+            );
+            let horizon = next.min(t + mins(36 * 60));
+            let mut w = t + mins(20);
+            while w < horizon {
+                assert_eq!(
+                    schedule(w, loc.0, loc.1).0,
+                    theme,
+                    "schedule({t}) = ({theme:?}, {next}) but theme differs at {w}"
+                );
+                w += mins(20);
+            }
+            t += mins(120);
+        }
+    }
+
+    #[test]
+    fn schedule_contract_holds_around_polar_edges() {
+        sweep_contract(TROMSO, utc(2026, 5, 19, 0, 0, 0));
+        sweep_contract(TROMSO, utc(2026, 7, 26, 0, 0, 0));
+        sweep_contract(TROMSO, utc(2026, 11, 28, 0, 0, 0));
+        sweep_contract(TROMSO, utc(2027, 1, 16, 0, 0, 0));
+        sweep_contract((69.70, 170.31), utc(2026, 11, 28, 0, 0, 0));
+        sweep_contract((-77.85, 166.67), utc(2026, 4, 25, 0, 0, 0));
+    }
+
+    #[test]
+    fn tromso_first_polar_day_noon_is_light() {
+        let now = utc(2026, 5, 19, 10, 45, 0);
+        let (theme, next) = schedule(now, TROMSO.0, TROMSO.1);
+        assert_eq!(theme, Theme::Light);
         assert!(next > now);
+    }
+
+    #[test]
+    fn altitude_crossing_lands_on_the_far_side() {
+        // Riyadh: an ordinary day has a crossing within 48 h, and the
+        // returned instant already shows the flipped theme (so a tick
+        // scheduled there can't hot-loop on the old one).
+        let now = utc(2026, 7, 4, 9, 0, 0);
+        let start = altitude_theme(now, RIYADH.0, RIYADH.1);
+        let t = next_altitude_crossing(now, RIYADH.0, RIYADH.1).expect("crossing");
+        assert!(t > now && t - now < mins(12 * 60), "t = {t}");
+        assert_ne!(altitude_theme(t, RIYADH.0, RIYADH.1), start);
+        assert_eq!(
+            altitude_theme(t - chrono::Duration::seconds(2), RIYADH.0, RIYADH.1),
+            start
+        );
+        // …and it agrees with sun_times' sunset to within a few minutes.
+        let (_, sched_next) = schedule(now, RIYADH.0, RIYADH.1);
+        assert!(
+            (t - sched_next).abs() < mins(5),
+            "t = {t}, schedule = {sched_next}"
+        );
+    }
+
+    #[test]
+    fn deep_polar_day_has_no_crossing_within_48h() {
+        let now = utc(2026, 6, 21, 12, 0, 0);
+        assert_eq!(next_altitude_crossing(now, TROMSO.0, TROMSO.1), None);
     }
 
     #[test]
@@ -1878,6 +2928,210 @@ mod tests {
     }
 
     #[test]
+    fn config_with_utf8_bom_parses_and_stays_untouched() {
+        // Notepad / PowerShell 5.1 Out-File can save UTF-8 with a BOM.
+        let json = "\u{feff}{\"latitude\": 24.753, \"longitude\": 46.765}";
+        let t = TempConfig::new("bom", Some(json));
+        let cfg = load_config_at(&t.0).expect("a BOM must not make valid JSON invalid");
+        assert_eq!(cfg.latitude, 24.753);
+        assert_eq!(fs::read_to_string(&t.0).unwrap(), json);
+    }
+
+    #[test]
+    fn config_nul_filled_file_is_healed_to_defaults() {
+        // A crash after the file was extended but before data was flushed
+        // can leave it full of NULs — as unpreservable as an empty file.
+        let t = TempConfig::new("nul", Some("\0\0\0\0\0\0\0\0"));
+        let cfg = load_config_at(&t.0).expect("NUL-filled file must heal to defaults");
+        assert!(!cfg.has_location());
+        let reparsed: Config = serde_json::from_str(&fs::read_to_string(&t.0).unwrap()).unwrap();
+        assert!(!reparsed.has_location());
+    }
+
+    #[test]
+    fn config_utf16_file_loads() {
+        // PowerShell 5.1's `>` / Out-File default is UTF-16LE with a BOM.
+        let text = "{\"latitude\": 24.753, \"longitude\": 46.765}";
+        let mut bytes = vec![0xFF, 0xFE];
+        for u in text.encode_utf16() {
+            bytes.extend_from_slice(&u.to_le_bytes());
+        }
+        let t = TempConfig::new("utf16", None);
+        fs::write(&t.0, &bytes).unwrap();
+        let cfg = load_config_at(&t.0).expect("UTF-16 config must load");
+        assert_eq!(cfg.longitude, 46.765);
+        assert_eq!(
+            fs::read(&t.0).unwrap(),
+            bytes,
+            "loading must not rewrite it"
+        );
+    }
+
+    #[test]
+    fn config_utf16_be_file_loads_and_truncated_utf16_is_an_error() {
+        let text = "{\"latitude\": 24.753, \"longitude\": 46.765}";
+        let mut be = vec![0xFE, 0xFF];
+        for u in text.encode_utf16() {
+            be.extend_from_slice(&u.to_be_bytes());
+        }
+        let t = TempConfig::new("utf16be", None);
+        fs::write(&t.0, &be).unwrap();
+        assert_eq!(
+            load_config_at(&t.0).expect("UTF-16 BE must load").latitude,
+            24.753
+        );
+        let mut odd = be.clone();
+        odd.push(0x00);
+        let t2 = TempConfig::new("utf16-odd", None);
+        fs::write(&t2.0, &odd).unwrap();
+        assert!(
+            load_config_at(&t2.0).is_err(),
+            "truncated UTF-16 is broken, not healed"
+        );
+        assert_eq!(fs::read(&t2.0).unwrap(), odd);
+    }
+
+    #[test]
+    fn save_config_at_writes_through_hard_links() {
+        // A package manager's "persisted" config may be a hard link; a
+        // rename-over save would silently detach it.
+        let t = TempConfig::new("hardlink", Some("{\"latitude\": 1.0, \"longitude\": 2.0}"));
+        let other = TempConfig::new("hardlink-other", None);
+        fs::hard_link(&t.0, &other.0).unwrap();
+        let cfg = Config {
+            latitude: 24.753,
+            longitude: 46.765,
+            ..Config::default()
+        };
+        save_config_at(&t.0, &cfg).unwrap();
+        assert_eq!(
+            load_config_at(&other.0).unwrap().latitude,
+            24.753,
+            "the other link must see the saved content"
+        );
+    }
+
+    #[test]
+    fn config_partial_json_with_nul_padding_is_an_error_not_a_heal() {
+        // The heal predicate must stay narrow: real content followed by NULs
+        // is a broken file to preserve, not an empty one to reset.
+        let mut bytes = b"{\"latitude\": 24.7".to_vec();
+        bytes.extend(std::iter::repeat_n(0u8, 64));
+        let t = TempConfig::new("nul-partial", None);
+        fs::write(&t.0, &bytes).unwrap();
+        assert!(load_config_at(&t.0).is_err());
+        assert_eq!(fs::read(&t.0).unwrap(), bytes);
+    }
+
+    #[test]
+    fn config_unknown_keys_survive_a_save() {
+        let json =
+            r#"{"latitude": 1.0, "longitude": 2.0, "my_note": "keep me", "future": {"a": 1}}"#;
+        let t = TempConfig::new("extra", Some(json));
+        let mut cfg = load_config_at(&t.0).unwrap();
+        cfg.latitude = 3.0;
+        save_config_at(&t.0, &cfg).unwrap();
+        let back: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&t.0).unwrap()).unwrap();
+        assert_eq!(back["latitude"], 3.0);
+        assert_eq!(back["my_note"], "keep me");
+        assert_eq!(back["future"]["a"], 1);
+    }
+
+    #[test]
+    fn load_config_ex_reports_heals_and_their_save_failures() {
+        let valid = TempConfig::new("heal-valid", Some("{\"latitude\": 1.0}"));
+        assert!(load_config_ex(&valid.0).unwrap().1.is_none());
+        let missing = TempConfig::new("heal-missing", None);
+        assert!(
+            load_config_ex(&missing.0).unwrap().1.is_none(),
+            "first run is not a heal"
+        );
+        let empty = TempConfig::new("heal-empty", Some("\0\0 \n"));
+        let h = load_config_ex(&empty.0).unwrap().1.expect("heal reported");
+        assert_eq!(h.reason, "empty");
+        assert!(h.save_err.is_none());
+        // Healing a file that can't be written: reported, file untouched.
+        let ro = TempConfig::new("heal-readonly", Some("  "));
+        let mut perms = fs::metadata(&ro.0).unwrap().permissions();
+        perms.set_readonly(true);
+        fs::set_permissions(&ro.0, perms.clone()).unwrap();
+        let result = load_config_ex(&ro.0);
+        #[allow(clippy::permissions_set_readonly_false)]
+        perms.set_readonly(false);
+        fs::set_permissions(&ro.0, perms).unwrap();
+        let h = result.unwrap().1.expect("heal reported");
+        assert!(
+            h.save_err.is_some(),
+            "the failed write-back must be reported"
+        );
+        assert_eq!(fs::read_to_string(&ro.0).unwrap(), "  ");
+    }
+
+    #[test]
+    fn save_config_at_fails_cleanly_on_a_read_only_target() {
+        let json = "{\"latitude\": 1.0, \"longitude\": 2.0}";
+        let t = TempConfig::new("readonly", Some(json));
+        let mut perms = fs::metadata(&t.0).unwrap().permissions();
+        perms.set_readonly(true);
+        fs::set_permissions(&t.0, perms.clone()).unwrap();
+        let result = save_config_at(&t.0, &Config::default());
+        #[allow(clippy::permissions_set_readonly_false)]
+        perms.set_readonly(false);
+        fs::set_permissions(&t.0, perms).unwrap();
+        assert!(result.is_err(), "replacing a read-only file must fail");
+        assert!(
+            !t.0.with_extension("json.tmp").exists(),
+            "no stray temp file"
+        );
+        assert_eq!(fs::read_to_string(&t.0).unwrap(), json, "target untouched");
+    }
+
+    #[test]
+    fn refresh_adopts_good_configs_and_gates_autostart() {
+        let good = |auto: bool| Config {
+            latitude: 1.0,
+            longitude: 2.0,
+            auto_start: auto,
+            ..Config::default()
+        };
+        // (a) Broken at startup, still broken on Refresh: keep the fallback,
+        // and never re-assert autostart from its auto_start=true default.
+        let mut cfg = Config::default();
+        let mut have = false;
+        let (assert_auto, err) = adopt_reloaded_config(Err("bad".into()), &mut cfg, &mut have);
+        assert!(!assert_auto && err.is_some() && !have);
+        // (b) Broken at startup, fixed before Refresh: adopt it, re-assert.
+        let (assert_auto, err) = adopt_reloaded_config(Ok(good(false)), &mut cfg, &mut have);
+        assert!(assert_auto && err.is_none() && have);
+        assert!(!cfg.auto_start);
+        // (c) Good earlier, broken now: keep last-known-good and re-assert
+        // from it (the documented AV-quarantine recovery).
+        let (assert_auto, err) = adopt_reloaded_config(Err("bad".into()), &mut cfg, &mut have);
+        assert!(assert_auto && err.is_some());
+        assert!(!cfg.auto_start, "last-known-good retained");
+    }
+
+    #[test]
+    fn save_config_at_replaces_atomically_and_leaves_no_temp() {
+        let t = TempConfig::new("atomic", Some("{\"latitude\": 1.0, \"longitude\": 2.0}"));
+        let cfg = Config {
+            latitude: 24.753,
+            longitude: 46.765,
+            auto_start: false,
+            ..Config::default()
+        };
+        save_config_at(&t.0, &cfg).expect("save must succeed");
+        let back = load_config_at(&t.0).expect("saved file must load");
+        assert_eq!(back.latitude, 24.753);
+        assert!(!back.auto_start);
+        assert!(
+            !t.0.with_extension("json.tmp").exists(),
+            "the temp file must be renamed away, not left behind"
+        );
+    }
+
+    #[test]
     fn solar_altitude_sanity() {
         // Riyadh at local solar noon in July: sun nearly overhead (~88°).
         assert!(solar_altitude_deg(utc(2026, 7, 4, 8, 53, 0), RIYADH.0, RIYADH.1) > 80.0);
@@ -1891,6 +3145,24 @@ mod tests {
     }
 
     // --- tick decision: manual-override preservation (v0.4.0) ---
+
+    /// decide_tick with a schedule `next` that doesn't invoke the
+    /// backward-step frame rule (it equals the recorded transition, as on any
+    /// tick with an unstepped clock). Frame-rule tests call decide_tick
+    /// directly.
+    fn dt(
+        kind: TickKind,
+        current: Option<Theme>,
+        target: Theme,
+        now: DateTime<Utc>,
+        s: &TickState,
+    ) -> TickAction {
+        let next = s
+            .reconciled_next
+            .filter(|&n| n > now)
+            .unwrap_or(now + chrono::Duration::hours(12));
+        decide_tick(kind, current, target, now, next, false, s)
+    }
 
     /// A reconciled state whose recorded next transition is at `next`.
     fn reconciled_at(next: DateTime<Utc>) -> TickState {
@@ -1906,7 +3178,7 @@ mod tests {
         let s = reconciled_at(utc(2026, 7, 4, 15, 46, 5));
         let now = utc(2026, 7, 4, 9, 0, 0);
         assert_eq!(
-            decide_tick(TickKind::Refresh, Some(Theme::Light), Theme::Light, now, &s),
+            dt(TickKind::Refresh, Some(Theme::Light), Theme::Light, now, &s),
             TickAction::Apply
         );
     }
@@ -1918,7 +3190,7 @@ mod tests {
         let s = reconciled_at(sunset);
         for kind in [TickKind::Init, TickKind::Scheduled, TickKind::Wake] {
             assert_eq!(
-                decide_tick(kind, Some(Theme::Light), Theme::Light, now, &s),
+                dt(kind, Some(Theme::Light), Theme::Light, now, &s),
                 TickAction::SkipInSync,
                 "kind {kind:?}"
             );
@@ -1932,7 +3204,7 @@ mod tests {
         let sunset = utc(2026, 7, 4, 15, 46, 5);
         let s = reconciled_at(sunset);
         assert_eq!(
-            decide_tick(
+            dt(
                 TickKind::Scheduled,
                 Some(Theme::Light),
                 Theme::Dark,
@@ -1952,7 +3224,7 @@ mod tests {
         let s = reconciled_at(sunset);
         let now = utc(2026, 7, 4, 12, 0, 0);
         assert_eq!(
-            decide_tick(TickKind::Wake, Some(Theme::Dark), Theme::Light, now, &s),
+            dt(TickKind::Wake, Some(Theme::Dark), Theme::Light, now, &s),
             TickAction::SkipOverride
         );
     }
@@ -1964,7 +3236,7 @@ mod tests {
         let s = reconciled_at(sunset);
         let now = utc(2026, 7, 4, 20, 0, 0);
         assert_eq!(
-            decide_tick(TickKind::Wake, Some(Theme::Light), Theme::Dark, now, &s),
+            dt(TickKind::Wake, Some(Theme::Light), Theme::Dark, now, &s),
             TickAction::Apply
         );
     }
@@ -1979,7 +3251,7 @@ mod tests {
         let s = reconciled_at(sunset);
         let next_morning = utc(2026, 7, 5, 4, 0, 0);
         assert_eq!(
-            decide_tick(
+            dt(
                 TickKind::Wake,
                 Some(Theme::Dark), // yesterday's override, still on screen
                 Theme::Light,
@@ -1997,7 +3269,7 @@ mod tests {
         let s = TickState::new();
         let now = utc(2026, 7, 4, 12, 0, 0);
         assert_eq!(
-            decide_tick(TickKind::Wake, Some(Theme::Dark), Theme::Light, now, &s),
+            dt(TickKind::Wake, Some(Theme::Dark), Theme::Light, now, &s),
             TickAction::Apply
         );
     }
@@ -2010,7 +3282,7 @@ mod tests {
         let s = reconciled_at(sunset);
         let now = utc(2026, 7, 4, 12, 0, 0);
         assert_eq!(
-            decide_tick(TickKind::Wake, None, Theme::Light, now, &s),
+            dt(TickKind::Wake, None, Theme::Light, now, &s),
             TickAction::SkipOverride
         );
     }
@@ -2061,7 +3333,7 @@ mod tests {
         let mut s = reconciled_at(sunset);
         let resume_at = utc(2026, 7, 4, 17, 0, 0);
         assert_eq!(
-            decide_tick(
+            dt(
                 TickKind::Wake,
                 Some(Theme::Light),
                 Theme::Dark,
@@ -2077,7 +3349,7 @@ mod tests {
         ));
         let unlock_at = utc(2026, 7, 4, 17, 0, 10);
         assert_eq!(
-            decide_tick(
+            dt(
                 TickKind::Wake,
                 Some(Theme::Light),
                 Theme::Dark,
@@ -2101,12 +3373,14 @@ mod tests {
             Some(Theme::Light),
             utc(2026, 7, 5, 2, 35, 0)
         ));
-        // User toggles to Dark (matches schedule — converged) or picks Light
-        // again in Settings; either way the observed theme moved off the
-        // failure baseline. Here: user picked Dark, so current == target.
+        // The user picks Dark (via Toggle or Settings), moving the screen off
+        // the failure baseline (Light). Note the gate can only see a MOVE:
+        // re-picking the stuck theme (Light) is indistinguishable from the
+        // failure itself, so that case retries — an inherent limit of
+        // observing current_theme().
         let retry_at = utc(2026, 7, 4, 16, 47, 5);
         assert_eq!(
-            decide_tick(
+            dt(
                 TickKind::Scheduled,
                 Some(Theme::Dark),
                 Theme::Dark,
@@ -2117,6 +3391,383 @@ mod tests {
         );
         note_reconciled(&mut s, utc(2026, 7, 5, 2, 35, 0));
         assert_eq!(s.retry_count, 0);
+    }
+
+    #[test]
+    fn unreadable_baseline_does_not_cancel_retry() {
+        // The apply failed while the registry was unreadable (baseline None);
+        // a later readable theme is not evidence the user did anything.
+        let sunset = utc(2026, 7, 4, 15, 46, 5);
+        let mut s = reconciled_at(sunset);
+        assert!(note_apply_failed(&mut s, None, utc(2026, 7, 5, 2, 35, 0)));
+        let retry_at = utc(2026, 7, 4, 16, 47, 5);
+        assert_eq!(
+            dt(
+                TickKind::Scheduled,
+                Some(Theme::Light),
+                Theme::Dark,
+                retry_at,
+                &s
+            ),
+            TickAction::Apply
+        );
+    }
+
+    #[test]
+    fn intervention_after_the_episode_window_reconciles_instead_of_cancelling() {
+        // Failed sunset apply → user fixes the theme by hand → the machine
+        // sleeps through sunrise. On wake the episode's window is over: the
+        // schedule outranks the stand-down.
+        let sunset = utc(2026, 7, 4, 15, 46, 5);
+        let sunrise = utc(2026, 7, 5, 2, 35, 0);
+        let mut s = reconciled_at(sunset);
+        assert!(note_apply_failed(&mut s, Some(Theme::Light), sunrise));
+        let next_morning = utc(2026, 7, 5, 6, 0, 0);
+        assert_eq!(
+            dt(
+                TickKind::Wake,
+                Some(Theme::Dark),
+                Theme::Light,
+                next_morning,
+                &s
+            ),
+            TickAction::Apply
+        );
+    }
+
+    #[test]
+    fn wake_during_retry_with_future_reconciled_next_still_retries() {
+        // A failed REFRESH mid-window leaves reconciled_next in the future;
+        // a wake inside the retry window must retry, not "preserve an
+        // override" that is really the failure.
+        let sunset = utc(2026, 7, 4, 15, 46, 5);
+        let mut s = reconciled_at(sunset);
+        assert!(note_apply_failed(&mut s, Some(Theme::Dark), sunset));
+        let unlock_at = utc(2026, 7, 4, 12, 0, 30);
+        assert_eq!(
+            dt(
+                TickKind::Wake,
+                Some(Theme::Dark),
+                Theme::Light,
+                unlock_at,
+                &s
+            ),
+            TickAction::Apply
+        );
+    }
+
+    #[test]
+    fn refresh_beats_the_pending_retry_gate() {
+        // Refresh must force-apply even mid-episode with the screen moved
+        // off the baseline (which would otherwise read as CancelRetry).
+        let sunset = utc(2026, 7, 4, 15, 46, 5);
+        let mut s = reconciled_at(sunset);
+        assert!(note_apply_failed(
+            &mut s,
+            Some(Theme::Light),
+            utc(2026, 7, 5, 2, 35, 0)
+        ));
+        let now = utc(2026, 7, 4, 16, 0, 0);
+        assert_eq!(
+            dt(TickKind::Refresh, Some(Theme::Dark), Theme::Light, now, &s),
+            TickAction::Apply
+        );
+    }
+
+    #[test]
+    fn early_scheduled_fire_preserves_override() {
+        // The timer fires 1 ms before the recorded transition (drift, or the
+        // wall clock stepped back after arming). The screen shows a manual
+        // Dark override; the schedule still says Light for 1 more ms. This
+        // must not re-apply the OUTGOING theme over the override.
+        let sunset = utc(2026, 7, 4, 15, 46, 5);
+        let s = reconciled_at(sunset);
+        let early = sunset - chrono::Duration::milliseconds(1);
+        assert_eq!(
+            dt(
+                TickKind::Scheduled,
+                Some(Theme::Dark),
+                Theme::Light,
+                early,
+                &s
+            ),
+            TickAction::SkipOverride
+        );
+        // On time, the same tick applies the new theme as always.
+        assert_eq!(
+            dt(
+                TickKind::Scheduled,
+                Some(Theme::Light),
+                Theme::Dark,
+                sunset,
+                &s
+            ),
+            TickAction::Apply
+        );
+    }
+
+    #[test]
+    fn early_scheduled_fire_does_not_block_a_pending_retry() {
+        let sunset = utc(2026, 7, 4, 15, 46, 5);
+        let mut s = reconciled_at(sunset);
+        assert!(note_apply_failed(&mut s, Some(Theme::Dark), sunset));
+        let retry_at = utc(2026, 7, 4, 12, 1, 0);
+        assert_eq!(
+            dt(
+                TickKind::Scheduled,
+                Some(Theme::Dark),
+                Theme::Light,
+                retry_at,
+                &s
+            ),
+            TickAction::Apply
+        );
+    }
+
+    // --- wall clock → monotonic deadline (v0.4.1) ---
+
+    #[test]
+    fn wall_to_instant_maps_future_and_clamps_past() {
+        let mono = Instant::now();
+        let now = utc(2026, 9, 27, 14, 21, 59);
+        assert_eq!(
+            wall_to_instant(now + mins(23), now, mono),
+            mono + Duration::from_secs(23 * 60)
+        );
+        // Already past: fire immediately (and repeated re-arms can't keep
+        // pushing it into the future).
+        assert_eq!(wall_to_instant(now - mins(180), now, mono), mono);
+    }
+
+    #[test]
+    fn plan_wake_before_deadline_sleeps_at_most_a_heartbeat() {
+        let mono = Instant::now();
+        let now = utc(2026, 9, 27, 17, 22, 0);
+        let mark = Some((now, mono));
+        // Far deadline: capped at the heartbeat.
+        assert_eq!(
+            plan_wake(Some(now + mins(12 * 60)), mark, now, mono),
+            WakePlan::Arm(mono + HEARTBEAT)
+        );
+        // Near deadline: the deadline itself.
+        assert_eq!(
+            plan_wake(Some(now + mins(3)), mark, now, mono),
+            WakePlan::Arm(mono + Duration::from_secs(180))
+        );
+        // A timer that fires 1 ms early re-arms for the remaining 1 ms
+        // instead of ticking early.
+        let early_wall = now + mins(3) - chrono::Duration::milliseconds(1);
+        let early_mono = mono + Duration::from_millis(180_000 - 1);
+        assert_eq!(
+            plan_wake(Some(now + mins(3)), mark, early_wall, early_mono),
+            WakePlan::Arm(early_mono + Duration::from_millis(1))
+        );
+        // Nothing armed (no location): idle.
+        assert_eq!(plan_wake(None, None, now, mono), WakePlan::Idle);
+    }
+
+    #[test]
+    fn plan_wake_ticks_when_due() {
+        let mono = Instant::now();
+        let t0 = utc(2026, 9, 27, 17, 22, 0);
+        let deadline = t0 + mins(23);
+        assert_eq!(
+            plan_wake(
+                Some(deadline),
+                Some((t0, mono)),
+                deadline,
+                mono + Duration::from_secs(23 * 60)
+            ),
+            WakePlan::Tick { step_ms: None }
+        );
+    }
+
+    #[test]
+    fn clock_step_forward_after_skewed_boot_ticks_immediately() {
+        // The 2026-09-27 incident: booted 3 h behind (wall 17:21 = real
+        // 20:21 local), Init armed next=17:44 wall. 19 s later w32time
+        // stepped the clock +3 h. The next wake of the loop — the
+        // WM_TIMECHANGE broadcast, or at worst the heartbeat — must detect
+        // the step and tick, instead of sleeping ~23 min (or, before
+        // v0.4.1, up to 3 h).
+        let mono = Instant::now();
+        let skewed = utc(2026, 9, 27, 14, 21, 59);
+        let deadline = utc(2026, 9, 27, 14, 44, 54);
+        let mark = Some((skewed, mono));
+        let later_mono = mono + Duration::from_secs(19);
+        let corrected = skewed + chrono::Duration::seconds(19) + mins(180);
+        assert_eq!(
+            plan_wake(Some(deadline), mark, corrected, later_mono),
+            WakePlan::Tick {
+                step_ms: Some(10_800_000)
+            }
+        );
+        // …and that Scheduled tick applies, because a transition passed.
+        let s = reconciled_at(deadline);
+        assert_eq!(
+            dt(
+                TickKind::Scheduled,
+                Some(Theme::Light),
+                Theme::Dark,
+                corrected,
+                &s
+            ),
+            TickAction::Apply
+        );
+    }
+
+    #[test]
+    fn clock_step_backward_is_detected_too() {
+        let mono = Instant::now();
+        let t0 = utc(2026, 9, 27, 17, 22, 0);
+        let plan = plan_wake(
+            Some(t0 + mins(60)),
+            Some((t0, mono)),
+            t0 - mins(120) + mins(5),
+            mono + Duration::from_secs(300),
+        );
+        assert_eq!(
+            plan,
+            WakePlan::Tick {
+                step_ms: Some(-7_200_000)
+            }
+        );
+    }
+
+    #[test]
+    fn small_drift_is_not_a_clock_step() {
+        let mono = Instant::now();
+        let t0 = utc(2026, 9, 27, 17, 22, 0);
+        let plan = plan_wake(
+            Some(t0 + mins(600)),
+            Some((t0, mono)),
+            t0 + mins(300) + chrono::Duration::seconds(5),
+            mono + Duration::from_secs(300 * 60),
+        );
+        assert!(matches!(plan, WakePlan::Arm(_)), "plan = {plan:?}");
+    }
+
+    #[test]
+    fn backward_step_across_a_transition_reapplies_not_preserves() {
+        // The clock ran 3 h ahead: at real 14:44 (wall 17:44) the app
+        // applied the sunset early and recorded next = tomorrow's sunrise.
+        // w32time steps the clock back; at real 14:50 the schedule's upcoming
+        // transition is TODAY's sunset (17:44) — earlier than the recorded
+        // one. The Dark screen is the app's own stale apply, not a user
+        // override: re-apply Light (and let the real sunset flip it).
+        let sunset = utc(2026, 9, 27, 14, 44, 0);
+        let tomorrow_sunrise = utc(2026, 9, 28, 2, 43, 0);
+        let s = reconciled_at(tomorrow_sunrise);
+        let real_now = utc(2026, 9, 27, 11, 50, 0);
+        assert_eq!(
+            decide_tick(
+                TickKind::Scheduled,
+                Some(Theme::Dark),
+                Theme::Light,
+                real_now,
+                sunset,
+                true,
+                &s
+            ),
+            TickAction::Apply
+        );
+        // With an unstepped clock, the same diverged screen before the
+        // recorded transition is an override and is preserved.
+        assert_eq!(
+            decide_tick(
+                TickKind::Wake,
+                Some(Theme::Dark),
+                Theme::Light,
+                real_now,
+                tomorrow_sunrise,
+                false,
+                &s
+            ),
+            TickAction::SkipOverride
+        );
+    }
+
+    #[test]
+    fn detected_clock_step_sign_and_threshold() {
+        let mono = Instant::now();
+        let t0 = utc(2026, 9, 27, 17, 22, 0);
+        let mark = Some((t0, mono));
+        let later = mono + Duration::from_secs(600);
+        // Forward +3 h, backward −2 h, and 30 s of drift (below threshold).
+        assert_eq!(
+            detected_clock_step(mark, t0 + mins(10 + 180), later),
+            Some(10_800_000)
+        );
+        assert_eq!(
+            detected_clock_step(mark, t0 + mins(10 - 120), later),
+            Some(-7_200_000)
+        );
+        assert_eq!(
+            detected_clock_step(mark, t0 + mins(10) + chrono::Duration::seconds(30), later),
+            None
+        );
+        assert_eq!(detected_clock_step(None, t0, later), None);
+    }
+
+    #[test]
+    fn backward_step_within_the_same_frame_preserves_override() {
+        // The clock steps back but doesn't cross the recorded transition:
+        // the schedule's next is still the same sunset (or only seconds
+        // off), so a diverged screen is still the user's override.
+        let sunset = utc(2026, 7, 4, 15, 46, 5);
+        let s = reconciled_at(sunset);
+        let now = sunset - mins(120);
+        for next in [sunset, sunset - chrono::Duration::seconds(30)] {
+            for kind in [TickKind::Wake, TickKind::Scheduled] {
+                assert_eq!(
+                    decide_tick(kind, Some(Theme::Dark), Theme::Light, now, next, true, &s),
+                    TickAction::SkipOverride,
+                    "kind {kind:?}, next {next}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn earlier_next_without_a_clock_step_still_preserves_override() {
+        // `next` can legitimately move earlier with no clock step (e.g. a
+        // polar-season altitude crossing coming within the 48 h search).
+        // Without an observed backward step that must not read as a new
+        // frame — the user's override stays.
+        let recorded = utc(2027, 1, 16, 10, 23, 39);
+        let s = reconciled_at(recorded);
+        let now = utc(2027, 1, 14, 12, 0, 0);
+        let earlier_next = utc(2027, 1, 15, 10, 34, 44);
+        assert_eq!(
+            decide_tick(
+                TickKind::Wake,
+                Some(Theme::Light),
+                Theme::Dark,
+                now,
+                earlier_next,
+                false,
+                &s
+            ),
+            TickAction::SkipOverride
+        );
+    }
+
+    #[test]
+    fn exhausted_refresh_episode_keeps_wakes_as_retries() {
+        // A failed Refresh at noon (reconciled_next still = the future
+        // sunset) that burns its whole retry budget must not leave the wrong
+        // screen looking like a manual override to later wakes.
+        let sunset = utc(2026, 7, 4, 15, 46, 5);
+        let mut s = reconciled_at(sunset);
+        for _ in 0..MAX_APPLY_RETRIES {
+            assert!(note_apply_failed(&mut s, Some(Theme::Dark), sunset));
+        }
+        assert!(!note_apply_failed(&mut s, Some(Theme::Dark), sunset));
+        let later = utc(2026, 7, 4, 10, 0, 0);
+        assert_eq!(
+            dt(TickKind::Wake, Some(Theme::Dark), Theme::Light, later, &s),
+            TickAction::Apply
+        );
     }
 
     #[test]
@@ -2131,7 +3782,7 @@ mod tests {
         ));
         let retry_at = utc(2026, 7, 4, 16, 47, 5);
         assert_eq!(
-            decide_tick(TickKind::Scheduled, None, Theme::Dark, retry_at, &s),
+            dt(TickKind::Scheduled, None, Theme::Dark, retry_at, &s),
             TickAction::Apply
         );
     }
@@ -2245,6 +3896,40 @@ mod tests {
     }
 
     #[test]
+    fn theme_display_name_key_is_case_insensitive() {
+        let t = TempTheme::new("key-case", b"[Theme]\r\ndisplayname = Lower Case Key\r\n");
+        assert_eq!(
+            resolve_theme_display_name(&t.0).as_deref(),
+            Some("Lower Case Key")
+        );
+    }
+
+    #[test]
+    fn theme_display_name_quotes_are_stripped() {
+        let t = TempTheme::new("quoted", b"[Theme]\r\nDisplayName=\"My Theme\"\r\n");
+        assert_eq!(
+            resolve_theme_display_name(&t.0).as_deref(),
+            Some("My Theme")
+        );
+    }
+
+    #[test]
+    fn theme_display_name_reads_utf16_files_with_non_ascii_names() {
+        // Windows reads a BOM'd UTF-16LE .theme as Unicode — so must we, or a
+        // non-English DisplayName never matches in tier 1.
+        let text = "[Theme]\r\nDisplayName=الوضع الليلي\r\n";
+        let mut bytes = vec![0xFF, 0xFE];
+        for u in text.encode_utf16() {
+            bytes.extend_from_slice(&u.to_le_bytes());
+        }
+        let t = TempTheme::new("utf16", &bytes);
+        assert_eq!(
+            resolve_theme_display_name(&t.0).as_deref(),
+            Some("الوضع الليلي")
+        );
+    }
+
+    #[test]
     fn theme_display_name_missing_file_or_key_is_none() {
         let missing =
             std::env::temp_dir().join(format!("wts-test-{}-nonexistent.theme", std::process::id()));
@@ -2262,10 +3947,11 @@ mod tests {
         let aero = PathBuf::from(&root).join("Resources\\Themes\\aero.theme");
         let dark = PathBuf::from(&root).join("Resources\\Themes\\dark.theme");
         if !aero.exists() || !dark.exists() {
-            // Rust has no test-skip; make the silent pass greppable so a
-            // runner without stock themes doesn't hide that this is the only
-            // coverage of resolve_indirect_string.
-            eprintln!("SKIP: system .theme files absent — indirect-string path not exercised");
+            // Rust has no test-skip. libtest captures this line unless run
+            // with --nocapture or --show-output, so it documents the skip
+            // rather than announcing it; this test is the only coverage of
+            // resolve_indirect_string.
+            eprintln!("SKIP: system .theme files absent - indirect-string path not exercised");
             return;
         }
         let a = resolve_theme_display_name(&aero).expect("aero.theme display name");

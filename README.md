@@ -2,28 +2,30 @@
 
 Automatically swap between two Windows 11 **themes** at local sunrise and sunset — macOS's auto-theme behavior, on Windows 11. Full theme swap (wallpaper + colors + light/dark mode), not just a DWORD toggle.
 
-> **Signed releases since v0.3.0.** All published binaries are Authenticode-signed with a self-signed publisher cert (`CN=WinThemeSwitcher Self-Signed`, thumbprint `40E0D1EB58DAC255EB37E9D64FF34448E3D33D12`). v0.4.0+ releases also carry an **RFC 3161 DigiCert timestamp countersignature** so the signature survives the cert's 2036 expiration. On first install you'll need to trust the cert — see [Verifying the signature](#verifying-the-signature). Architecture details and build/sign workflow are in [CLAUDE.md](CLAUDE.md).
+> **Signed releases since v0.3.0** (v0.1.0/v0.2.0 are unsigned). Binaries are Authenticode-signed with a self-signed publisher cert (`CN=WinThemeSwitcher Self-Signed`, thumbprint `40E0D1EB58DAC255EB37E9D64FF34448E3D33D12`), and every signed release carries an **RFC 3161 DigiCert timestamp** so the signature outlives the cert's 2036 expiration (v0.3.0/v0.3.1 were retro-timestamped on 2026-07-04). On first install you'll trust the cert — see [Install](#install) step 2. Architecture details and the build/sign workflow are in [CLAUDE.md](CLAUDE.md).
 
 ## Features
 
-- **Tiny binary** (~330 KB), zero CPU between transitions — event-driven, sleeps on a kernel timer until the next sunrise/sunset or a tray click.
+- **Tiny binary** (~395 KB, nothing else to install) and effectively idle between transitions — event-driven, sleeps on a kernel timer until the next sunrise/sunset, waking only briefly every 10 minutes to check that the system clock hasn't been changed.
 - **Reliable theme apply** via the `IThemeManager2` COM interface — the same API the Settings UWP wraps internally. Atomic, in-process, ~200 ms latency, no Settings flash. Two-tier fallback if it ever errors.
-- **Catches up after sleep / lock.** A scheduled sunrise that fires while you're suspended reconciles the moment you log back in.
+- **Catches up after sleep / lock.** A sunrise or sunset that passes while you're suspended or locked reconciles the moment you're back.
+- **Follows clock corrections.** If Windows corrects its clock (e.g. booting 3 hours off after another OS on a dual-boot machine), the schedule re-evaluates right away when Windows announces the change, and within 10 minutes at the latest — instead of switching hours late.
 - **Respects manual overrides** — changing theme in Settings (or via the tray's **Toggle Theme**) sticks until the next natural sunrise/sunset transition, surviving lock/unlock and sleep/resume. The app only steps in when a transition actually passed while you were away.
 - **Recovers from failed applies** — a transition whose apply errors is retried up to 3 times a minute apart (instead of silently waiting for the next transition), and stands down if you change the theme yourself in the meantime.
 - **Diagnostic log** at `events.log` next to the exe (rotated past 256 KB) — every transition recorded with cause, target, applied tier, and timing.
 
 ## Install
 
-1. Download `win-theme-switcher-vX.Y.Z-windows-x64.zip` from the [latest non-prerelease release](../../releases) — currently [v0.4.0](../../releases/tag/v0.4.0), because v0.4.0 is marked `prerelease: true` (this changes in v0.5.0 — see the [Roadmap](#roadmap) v0.5.0 row, sub-bullet 1d). Extract to e.g. `C:\Tools\WinThemeSwitcher\`.
-2. **Trust the publisher cert** (one-time, recommended — the zip includes `WinThemeSwitcher-publisher.cer`):
+1. Download `win-theme-switcher-vX.Y.Z-windows-x64.zip` from the [Releases page](../../releases) — newest first. (Every release so far is flagged *Pre-release* on GitHub, so the "latest release" link doesn't resolve yet; that changes in v0.5.0 — see [Release & distribution](#release--distribution-dependency-chain-in-order) item 1d.) Extract it to a folder only your account can write to, e.g. `%LOCALAPPDATA%\Programs\WinThemeSwitcher\` — the app registers itself to run at every login, so a shared folder like `C:\Tools\` would let any other local account swap the exe.
+2. **Trust the publisher cert** (one-time, recommended). First check the `.cer` in the zip is the real one — compare against the thumbprint on **this GitHub page**, not a copy inside the download:
    ```powershell
+   (Get-PfxCertificate .\WinThemeSwitcher-publisher.cer).Thumbprint   # must be 40E0D1EB58DAC255EB37E9D64FF34448E3D33D12
    Import-Certificate -FilePath .\WinThemeSwitcher-publisher.cer -CertStoreLocation Cert:\CurrentUser\Root
-   Import-Certificate -FilePath .\WinThemeSwitcher-publisher.cer -CertStoreLocation Cert:\CurrentUser\TrustedPublisher
    ```
-3. Run `win-theme-switcher.exe`. A half-orange / half-dark-blue circle appears in your notification area.
+   Windows shows a security warning when adding a root certificate — that's expected; confirm it.
+3. Run `win-theme-switcher.exe`. SmartScreen may say *"Windows protected your PC"* for a new self-signed app — choose **More info → Run anyway**. A half-orange / half-dark-blue circle appears in the notification area; on Windows 11 new icons often start in the overflow (**^**) menu — drag it onto the taskbar to keep it visible.
 
-On first launch the app reads your coordinates via Windows Location. If Location is off or denied, a dialog asks if you want to enable it (opens Settings) or fall back to manual entry (opens `config.json` in your editor). After editing config, right-click tray → **Refresh**.
+On first launch the app reads your coordinates via Windows Location. If Location is off or denied, a dialog asks if you want to enable it (opens Settings) or fall back to manual entry (opens `config.json` in an editor). After editing config, right-click tray → **Refresh**.
 
 ## Configuration
 
@@ -46,14 +48,14 @@ On first launch the app reads your coordinates via Windows Location. If Location
 | `theme_day` | `null` → `%SystemRoot%\Resources\Themes\aero.theme` | Path to the `.theme` applied after sunrise. |
 | `theme_night` | `null` → `%SystemRoot%\Resources\Themes\dark.theme` | Path to the `.theme` applied after sunset. |
 
-Custom `.theme` paths must use double backslashes in JSON: `"C:\\Users\\you\\AppData\\Local\\Microsoft\\Windows\\Themes\\Custom.theme"`. They also need to be already registered with Windows (i.e. installed once via Settings → Personalization → Themes) for the primary apply path to find them.
+Custom `.theme` paths must use double backslashes in JSON, e.g. `"C:\\Users\\you\\AppData\\Local\\Microsoft\\Windows\\Themes\\MyNight.theme"` — a theme you saved via Settings → Personalization → Themes → **Save** (don't point at `Custom.theme`: that's Windows' scratch file, rewritten whenever you change any personalization setting). The fast apply path finds themes by their display name, so a custom theme should be installed (applied once via Settings) and have a **unique name** — not "Windows (light)"/"Windows (dark)" — and its light/dark mode should match its slot (light for `theme_day`, dark for `theme_night`). If a configured path doesn't exist, the stock theme is used and `events.log` records a `theme_path_missing` line.
 
-After editing config, right-click tray → **Refresh**. No restart needed.
+The file may be saved as UTF-8 (with or without BOM) or UTF-16 with a BOM (LE or BE); keys the app doesn't recognize are kept (their order may change when the app rewrites the file). After editing config, right-click tray → **Refresh**. No restart needed.
 
 ## Tray menu
 
 - **Toggle Theme** — flips light/dark right now, as a manual override: it sticks (including across lock/unlock and sleep) until the next natural sunrise/sunset transition.
-- **Open Config** — opens `config.json` in your default editor.
+- **Open Config** — opens `config.json` with your `.json` editor, or Notepad if none is set up.
 - **Refresh** — re-reads config, retries Windows Location if needed, force-applies the correct theme.
 - **Quit** — exits. The auto-start entry persists; set `auto_start: false` and click Refresh (or relaunch) once to remove it.
 
@@ -65,49 +67,44 @@ If two copies are launched, the second shows a notice and exits (single-instance
 Get-AuthenticodeSignature .\win-theme-switcher.exe | Format-List Status, SignerCertificate
 ```
 
-Should return `Status: Valid` and `Signer: CN=WinThemeSwitcher Self-Signed`. The signature lets you verify the file was signed by this project's publisher key and hasn't been tampered with since signing. Self-signed certs can't suppress SmartScreen — a CA-signed cert reduces prompts over time as reputation accrues (v0.6.0 row in [Roadmap](#roadmap)).
+After [Install](#install) step 2 this shows `Status : Valid` with `SignerCertificate : [Subject] CN=WinThemeSwitcher Self-Signed`. (Before the cert is trusted, `Status` is `UnknownError` — the chain ends in a root Windows doesn't know yet.) A valid signature means the file was signed with this project's key and hasn't been modified since. Self-signed certs can't suppress SmartScreen — that's cloud reputation, which a CA-signed cert builds over time (v0.6.0 row in [Roadmap](#roadmap)).
 
 ## Antivirus false positives
 
-**Heads-up: only build with `scripts\build.ps1`.** Bare `cargo build --release` produces an unsigned fresh-hash PE that KSN flags on first execute — see [Building from source](#building-from-source) for the canonical flow. The rest of this section is for users running the **already-signed published binaries**, not for source-builders.
+With the publisher cert trusted, most AVs accept the signed binary without further action.
 
----
-
-The v0.4.0 release ships Authenticode-signed binaries (RSA + SHA256, self-signed publisher cert `CN=WinThemeSwitcher Self-Signed`, thumbprint `40E0D1EB58DAC255EB37E9D64FF34448E3D33D12`). On first install, import the included `WinThemeSwitcher-publisher.cer` into `Cert:\CurrentUser\Root` (and optionally `Cert:\CurrentUser\TrustedPublisher` for SmartScreen) — see [Verifying the signature](#verifying-the-signature). After that, **most AVs accept the binary without any further action**.
-
-**Kaspersky is the exception.** Its Behavior Detection scores cumulative signal — `HKCU\Run` writes, `HWND_BROADCAST` / `WM_SETTINGCHANGE` / `WM_THEMECHANGED` propagation, WinRT Geolocation, COM activation of `themeui.dll`. v0.4.0's tier-1 `IThemeManager2` apply removes the broadcast signals (the COM interface does its own broadcast from inside `themeui.dll`, where the heuristics trust it), but the persistence + Geolocation signals remain. For self-signed-cert releases (v0.4.0), Kaspersky still needs a **Trusted application** rule (Settings → Security → Threats and Exclusions → *Specify trusted applications* → tick all five checkboxes: Do not scan opened files, Do not monitor application activity, Do not inherit restrictions, Do not monitor child application activity, Allow interaction with Kaspersky interface). **The binary is not malicious** — full source is in this repo. A CA-signed cert (planned for v0.6.0, via SignPath Foundation's free OSS program) collapses this further and removes the need for the Trusted-app rule entirely.
-
-If your AV quarantines the published signed binary anyway, restore it and add the rule before re-running.
+**Kaspersky** scores cumulative behavior — `HKCU\Run` persistence, WinRT Geolocation, COM activation of `themeui.dll` — and may still flag a self-signed build. Since v0.3.0 the signed build has run without special handling on the maintainer's machine, but if Kaspersky flags or quarantines it for you: restore it and add a **Trusted application** rule (Settings → Security → Threats and Exclusions → *Specify trusted applications* → tick all five: Do not scan opened files, Do not monitor application activity, Do not inherit restrictions, Do not monitor child application activity, Allow interaction with Kaspersky interface). **The binary is not malicious** — full source is in this repo. CA signing (planned for v0.6.0 via SignPath Foundation's free OSS program) should make this section unnecessary.
 
 ## How it works
 
 `apply_theme` is a three-tier fallback:
 
-1. **`IThemeManager2`** (primary) — the undocumented-but-stable COM interface in `themeui.dll` that the Settings UWP wraps internally. Atomic, in-process apply. `SetCurrentTheme(idx)` does the `WM_THEMECHANGED` + `WM_SETTINGCHANGE` broadcasts itself.
+1. **`IThemeManager2`** (primary, since v0.3.0) — the undocumented-but-stable COM interface in `themeui.dll` that the Settings UWP wraps internally. Atomic, in-process apply. `SetCurrentTheme(idx)` does the `WM_THEMECHANGED` + `WM_SETTINGCHANGE` broadcasts itself.
 2. **`ShellExecuteW(.theme)` + commit watcher** — legacy backup if the COM interface ever errors. A 5 s watcher polls the registry to detect silent failures and promotes to tier 3.
 3. **Direct registry write** — last resort. Flips light/dark mode but not wallpaper.
 
-Sunrise/sunset times come from the [`sun-times`](https://crates.io/crates/sun-times) crate (no network). The event loop blocks on `winit`'s `WaitUntil(next_transition)` between transitions — zero CPU. A worker thread catches `WTSRegisterSessionNotification` (unlock) and `PowerRegisterSuspendResumeNotification` (resume from sleep) so transitions reconcile after long suspends.
+Sunrise/sunset times come from the [`sun-times`](https://crates.io/crates/sun-times) crate (no network); above 65.5° latitude, where a day can have no sunrise or sunset, the sun's computed altitude decides instead. The event loop sleeps on `winit`'s `WaitUntil` until the next transition (at most 10 minutes at a time, to notice system-clock corrections). At startup the app registers a resume-from-sleep callback (`PowerRegisterSuspendResumeNotification`), and a worker thread registers for session-unlock notifications (`WTSRegisterSessionNotification`), so the schedule reconciles when you're back.
 
 Full architecture, threading invariants, and the reasoning behind each tier are in [CLAUDE.md](CLAUDE.md).
 
 ## Building from source
 
-Requirements: Rust `stable-x86_64-pc-windows-msvc` + Visual Studio Build Tools with the C++ workload + Windows SDK (for `signtool.exe`).
+Requirements: Rust `stable-x86_64-pc-windows-msvc` + Visual Studio Build Tools with the C++ workload.
 
 ```powershell
 winget install Rustlang.Rustup
 winget install Microsoft.VisualStudio.2022.BuildTools --override "--add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"
 git clone https://github.com/atefalshehri/WinThemeSwitcher.git
 cd WinThemeSwitcher
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts\build.ps1            # build + sign + deploy to C:\Tools\
-# or, for verification only (does not overwrite the installed binary):
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts\build.ps1 -SkipCopy
+cargo build --release     # → target\release\win-theme-switcher.exe
+cargo test
 ```
 
-**Do not run `cargo build --release` directly.** It produces an unsigned fresh-hash PE that KSN flags as `VHO:Trojan.Win32.Convagent.gen` on this machine — that's the failure mode that delayed v0.4.0 by six weeks (see the v0.4.0 row in [Roadmap](#roadmap)). `scripts\build.ps1` signs the binary with the project's Authenticode cert + RFC 3161 DigiCert countersignature **before** anything executes it. The same caveat applies to `cargo test` — use `scripts\test.ps1`.
+Run cargo from the repo folder: `.cargo\config.toml` (picked up from the current directory) links the Visual C++ runtime statically, so the exe has no `VCRUNTIME140.dll` dependency. Some antivirus products flag freshly built *unsigned* executables; if yours does, exclude the `target\` folder or sign the output with your own code-signing cert.
 
-Release profile is tuned for size (`opt-level = "z"`, `lto = true`, `strip = true`, `panic = "abort"`). No `build.rs` — `windows-sys` and `windows` self-link. Output ~330 KB. Cert + signing details live in [CLAUDE.md → Sign every release build](CLAUDE.md#sign-every-release-build).
+**Maintainer release builds** use `scripts\build.ps1` (build → verify linker hardening → sign with the project cert + RFC 3161 timestamp → deploy) and `scripts\test.ps1` (signs the test binary before running it) — both need the project's private signing key, so they only work on the maintainer's machine. Details in [CLAUDE.md → Build](CLAUDE.md#build).
+
+Release profile is tuned for size (`opt-level = "z"`, `lto = true`, `strip = true`, `panic = "abort"`). No `build.rs` — `windows-sys` and `windows` self-link.
 
 ## Uninstall
 
@@ -117,49 +114,73 @@ Release profile is tuned for size (`opt-level = "z"`, `lto = true`, `strip = tru
    ```cmd
    reg delete "HKCU\Software\Microsoft\Windows\CurrentVersion\Run" /v WinThemeSwitcher /f
    ```
+4. Remove the publisher cert you trusted at install:
+   ```powershell
+   Remove-Item Cert:\CurrentUser\Root\40E0D1EB58DAC255EB37E9D64FF34448E3D33D12
+   Remove-Item Cert:\CurrentUser\TrustedPublisher\40E0D1EB58DAC255EB37E9D64FF34448E3D33D12 -ErrorAction SilentlyContinue   # older install instructions also added it here
+   ```
 
 No installer, no uninstaller — it's a single-exe tool by design.
 
 ## Roadmap
 
-Ordered by priority. The Aug–Sep 2026 audit's confirmed correctness bugs shipped as fixes in v0.3.x–v0.4.0; release/distribution work is next.
+Ordered by priority. The September 2026 whole-project audit's bug findings shipped in v0.4.1; its behavior-changing follow-ups are listed under [Foundation](#foundation). Release/distribution work is next.
 
 ### Release plan
 
-Versioning before 1.0: a **patch** (0.x.y → 0.x.y+1) is pure bug fixes; a **minor** (0.x → 0.x+1) is anything that adds surface (menu items, config fields) or changes behavior. v1.0 is a gate, not a feature drop. Numbers are assigned at ship time — the 0.6/0.7 order can swap if the SignPath approval wait stalls, and regression patches (e.g. 0.4.1) slot in anywhere.
+Versioning before 1.0: a **patch** (0.x.y → 0.x.y+1) is pure bug fixes; a **minor** (0.x → 0.x+1) is anything that adds surface (menu items, config fields) or changes behavior. v1.0 is a gate, not a feature drop. Numbers are assigned at ship time — the 0.6/0.7 order can swap if the SignPath approval wait stalls, and patch releases slot in anywhere.
 
 | Version | Type | Contents |
 |---|---|---|
-| **v0.3.2** | patch | **Shipped 2026-07-04.** Sunrise/sunset day-bracketing fix + scheduling tests + CI gate; `config.json` never overwritten on a parse error (error is logged + shown in a non-blocking dialog, empty file self-heals, autostart setting survives a broken file) |
-| **v0.4.0** | minor | **Shipped 2026-09-01.** Preserve manual overrides across lock/unlock/resume (time-based reconciliation — overrides survive any-length sleeps; missed transitions still reconcile); "Toggle Theme" tray item; fail-loudly bundle (panic hook, fatal-error MessageBox, wake-listener logging + WTS registration retry, single-instance mutex, bounded apply retry with user-intervention stand-down); `.theme`-name resolution + tick-decision unit tests (40 total); **`scripts\test.ps1` + new `scripts\build.ps1`** (signed test binary; signed release exe with **RFC 3161 DigiCert countersignature** before first execution — closes the KSN `VHO:Trojan.Win32.Convagent.gen` first-seen flag vector); **CLAUDE.md agent-facing rule** to keep LLM coding agents on the signing wrappers (the root cause of this release slipping six weeks past v0.3.2 was bare `cargo build` producing unsigned exes that KSN locked on first execute) |
-| **v0.4.1** | patch | **TBD — current state is clean (40/40 tests, 0 warnings). Slot reserved for the next audit.** If nothing surfaces, this row stays at "did not ship" — the table allows patch releases to slot in anywhere. |
-| **v0.5.0** | minor | **Automate the release pipeline.** `scripts\release.ps1` wraps `build.ps1` + `gh release upload --clobber` + `gh release edit --prerelease=false`; `release.yml` either calls the wrapper on a self-hosted runner or stops generating assets; a verify step (re-check `Get-AuthenticodeSignature` + countersignature post-upload) gates the upload. **First non-prerelease release** since v0.2.0 — fixes `/releases/latest` and unblocks winget automation. Also: investigate the recurring `wake_listener_err stage=power_register code=87` and either fix it (different `DEVICE_NOTIFY_*` flag? explicit unregister-before-register?) or add a CLAUDE.md note that it's benign. Candidate point to launch the personal Scoop bucket (`persist` mechanism fits the exe-relative config model better than winget's symlink layout — see §Release & distribution §4). |
-| **v0.6.0** | minor | SignPath Foundation CA signing in CI (ends the manual signed-asset swap); submit the first CA-signed binary to Microsoft Defender + Kaspersky for reputation seeding. **Removes the §Antivirus false positives section from README** — Kaspersky heuristics no longer fire on first sight for CA-signed binaries, so the user-facing allowlist flow becomes historical. Also unlocks the winget submission (§Release & distribution §3) — winget's validation pipeline runs its own AV scans, and a CA-signed + Defender-submitted binary is what gets through. |
+| **v0.3.2** | patch | **Shipped 2026-07-04.** Sunrise/sunset day-bracketing fix (wrong solar day in UTC+13/+14, missed post-midnight sunsets) + scheduling tests + CI gate; `config.json` never overwritten on a parse error (error is logged + shown in a non-blocking dialog, empty file self-heals, autostart setting survives a broken file); `auto_start: false` now actually removes the Run entry |
+| **v0.4.0** | minor | **Shipped 2026-09-01.** Preserve manual overrides across lock/unlock/resume (time-based reconciliation — overrides survive any-length sleeps; missed transitions still reconcile); "Toggle Theme" tray item; fail-loudly bundle (panic hook, fatal-error MessageBox, wake-listener logging + WTS registration retry, single-instance mutex, bounded apply retry with user-intervention stand-down); `.theme`-name resolution + tick-decision unit tests (40 total); `scripts\test.ps1` + `scripts\build.ps1` (sign test and release binaries before their first execution — unsigned fresh builds were being locked by Kaspersky's cloud scanner, which is what stalled this release for weeks) |
+| **v0.4.1** | patch | **Shipped 2026-09-27.** Fixes from a whole-project audit: follow system-clock corrections (dual-boot machines booted hours off and switched at the wrong time); resume-from-sleep notification actually registers (the `power_register code=87` log line — it had never worked since v0.2.0); no more `VCRUNTIME140.dll` dependency (the exe failed to start on PCs without the VC++ redistributable) plus DLL-search hardening; polar latitudes (polar-day onset stuck Dark for months; now one astronomy model above 65.5°, no phantom or flickering transitions); early timer fires can't undo an override; failed registry writes are detected and retried; Refresh in a broken-config session no longer re-enables autostart; Open Config falls back to Notepad; `config.json` saved atomically (hard links kept), UTF-16/BOM files accepted, unknown keys preserved; `.theme` DisplayName read with Windows' own INI reader (non-English/UTF-16 names match); tray-event memory leak; `scripts\test.ps1` never reported a failure (GUI-subsystem test binary) — fixed, and both scripts hardened; CI actions on Node 24 and a linker-hardening check; docs corrected (83 tests) |
+| **v0.5.0** | minor | **Automate the release pipeline.** `scripts\release.ps1` wraps `build.ps1` + `gh release upload --clobber` + `gh release edit --prerelease=false`; `release.yml` either calls the wrapper on a self-hosted runner or stops generating assets (today re-running it on a tag overwrites the manually signed assets); a verify step (re-check `Get-AuthenticodeSignature` + countersignature post-upload) gates the upload. **First non-prerelease release ever** — fixes `/releases/latest` and unblocks winget automation. Plus the behavior-changing audit follow-ups under [Foundation](#foundation). Candidate point to launch the personal Scoop bucket (`persist` mechanism fits the exe-relative config model better than winget's symlink layout — see §Release & distribution §4). |
+| **v0.6.0** | minor | SignPath Foundation CA signing in CI (ends the manual signed-asset swap); submit the first CA-signed binary to Microsoft Defender + Kaspersky for reputation seeding. **Retires the §Antivirus false positives section** if CA-signed builds pass without it. Also unlocks the winget submission (§Release & distribution §3) — winget's validation pipeline runs its own AV scans, and a CA-signed + Defender-submitted binary is what gets through. |
 | **v0.7.0** | minor | Live tray tooltip ("Dark until 06:12", "Location needed — click Refresh", or a degraded-apply warning); "Open Log" menu item; MessageBox when a user-initiated Refresh fails (scheduled ticks stay silent-to-log); first-run location retry without requiring Refresh; `offset_sunrise_min` / `offset_sunset_min` config fields (sun-anchored, so still compatible with "no custom times") |
-| **v1.0.0** | gate | Cut when **all** of: winget accepts the package, the §Correctness fixes and §Foundation sections below are empty, a full release cycle has shipped CA-signed with no AV flags, **§Antivirus false positives is deletable from README**, the recurring `wake_listener_err power_register code=87` is either fixed or explicitly documented as benign in CLAUDE.md, and the README's §Contributing moves from "Alpha / personal-use tool first" to "Stable for personal + distribution". Net effect: a stranger can install WinThemeSwitcher without reading the Kaspersky section. |
+| **v1.0.0** | gate | Cut when **all** of: winget accepts the package; §Foundation has no open items and there are no known unfixed correctness bugs; a full release cycle has shipped CA-signed with no AV flags; **§Antivirus false positives is deletable**; and §Contributing says "Stable for personal use and distribution". Net effect: a stranger can install WinThemeSwitcher without reading the Kaspersky section. |
 
 ### Correctness fixes
 
-Bugs that shipped in a named release. A reader auditing a version can scan this section to see what the version fixed; an empty section means "no known correctness work since the last audit".
+A history of bugs that shipped in a release and the version that fixed them.
 
-- **v0.4.0 — Override-fight regression.** Pre-v0.4.0, the event loop called `tick()` on every event — including the `WM_SETTINGCHANGE` broadcast that fires when the user changes theme in Settings. The override-aware `decide_tick` didn't exist yet; the old "screen-mismatches-target → apply" logic won and the user's manual selection was reverted on the next event. v0.4.0 scopes `tick()` to `Init` / `ResumeTimeReached` / `Refresh` / `Wake` only — Settings broadcasts don't fire on any of those. Coverage: `matching_current_skips_apply` + `wake_before_next_transition_preserves_override`.
-- **v0.4.0 — Stale-baseline risk on apply failure.** A failed apply (e.g. COM error from a transient themeui.dll state) used to look identical to a user override on the next wake tick: the wake saw `current != target`, the previous `reconciled_next` was recorded as a successful apply, and `decide_tick` returned `SkipOverride` — stranding the screen on the wrong theme until the next natural transition. v0.4.0's fix: `note_apply_failed` deliberately leaves `reconciled_next` stale on `Err`, so wakes re-apply instead of misreading the failure as an override. The `retry_baseline` field gates stand-down: if the user intervened mid-episode, the screen has moved off the failure snapshot and the retry cancels. Coverage: `failed_apply_then_wake_must_reapply_not_preserve`, `user_intervention_during_retry_window_stands_down`, `retry_budget_is_bounded_and_resets_per_episode`.
-- **v0.3.2 — Empty `config.json` crash-on-launch.** A crash mid-write (Rust's `fs::write` truncates before writing) leaves a 0-byte file; pre-v0.3.2, this errored on every launch and the user had to delete the file manually. v0.3.2 fix: empty/whitespace files self-heal to defaults (nothing to preserve, so first-run semantics apply). Coverage: `config_empty_file_is_healed_to_defaults`.
+- **v0.4.1 — Wrong theme after a system-clock correction.** The wait for the next transition was armed once from the wall clock and never re-derived, so when Windows stepped its clock (on a dual-boot machine: booting 3 h behind, then time sync) the decision made from the wrong time stood and the next switch fired up to hours late. Now every wake compares the wall clock against the monotonic clock and re-evaluates on a step; a 10-minute heartbeat guarantees a check even if no clock-change message arrives. Coverage: `clock_step_forward_after_skewed_boot_ticks_immediately`, `backward_step_across_a_transition_reapplies_not_preserves`.
+- **v0.4.1 — Resume-from-sleep hook never registered (since v0.2.0).** `PowerRegisterSuspendResumeNotification` only accepts callback registration; called with a window handle it failed with `ERROR_INVALID_PARAMETER` (87) on every launch. Unlock events masked it. Now registers a callback (`DEVICE_NOTIFY_CALLBACK`), as documented.
+- **v0.4.1 — Exe needed the VC++ redistributable.** Dynamically linked `VCRUNTIME140.dll` isn't part of Windows; on a clean PC the app didn't start at all. Now linked statically (Microsoft's hybrid-CRT pattern).
+- **v0.4.1 — Polar-day onset stuck on Dark.** After the last sunset before the midnight sun, `sun_times` reports no following sunrise, so the app stayed Dark for ~2 months. Above 65.5° latitude the schedule now follows the sun's computed altitude alone, so polar-day/night boundaries switch at the real sunrise/sunset and there are no phantom or flickering transitions. Coverage: `tromso_after_last_sunset_before_midnight_sun_is_not_dark_for_months`, `schedule_contract_holds_around_polar_edges`.
+- **v0.4.0 — Manual overrides reverted on unlock.** v0.2.0–v0.3.2 re-applied the schedule on every session unlock whenever the screen differed, reverting a theme picked in Settings. v0.4.0's time-based `decide_tick` preserves it until a transition actually passes. Coverage: `wake_before_next_transition_preserves_override`, `wake_after_even_number_of_missed_transitions_reconciles`.
+- **v0.4.0 — Failed applies were never retried.** A failed apply waited for the next transition, unlock, or Refresh (up to ~12 h). v0.4.0 adds a bounded 3 × 60 s retry that stands down if the user intervenes. Coverage: `failed_apply_then_wake_must_reapply_not_preserve`, `retry_budget_is_bounded_and_resets_per_episode`.
+- **v0.3.2 — `config.json` parse errors wiped settings.** A parse error (e.g. a single-backslash path) silently overwrote the file with defaults, losing coordinates and theme paths. Coverage: `config_parse_error_is_reported_and_file_kept`.
+- **v0.3.2 — Wrong solar day** in UTC+13/+14 (permanently dark) and missed post-midnight sunsets. Coverage: `apia_noon_is_light`, `reykjavik_june_sunset_crosses_midnight`.
 
 ### Foundation
 
-- **Remaining known gaps** (accepted for now, documented in CLAUDE.md): the bounded apply retry covers total apply failure only — a tier-2 `ShellExecute` silent-fail is still recovered by `commit_watcher`'s registry fallback, not the retry counter; and a Toggle within ~5 s of a tier-2 apply can be reverted by that apply's still-running commit watcher (unreachable while tier 1 is healthy).
-- **`wake_listener_err stage=power_register code=87` fires on every launch.** `PowerRegisterSuspendResumeNotification` returns `ERROR_INVALID_PARAMETER` (87) on a fresh STA thread for reasons that aren't pinned down (likely an undocumented requirement around the hwnd being a true message-only window, or a NULL pointer where a previous registration is expected). The source treats it as benign — the WTS notification still registers, so unlock events still fire; only the suspend/resume hook is degraded. But it logs every launch, clutters `events.log` rotation, and confuses anyone reading the log trying to diagnose real wake-listener failures. **Investigate in v0.5.0**: try an explicit unregister-before-register sequence, or test with `DEVICE_NOTIFY_CALLBACK` instead of `DEVICE_NOTIFY_WINDOW_HANDLE`. If no clean fix surfaces, document as benign in CLAUDE.md and add the code to a known-benign set in the test suite.
+- **Audit follow-ups (September 2026) that change behavior — planned for v0.5.0:**
+  - light/dark "in sync" check reads only the taskbar mode, so custom themes with mixed app/system modes can make a sunset look already-applied;
+  - tier 1 matches themes by display name only, so a custom theme copied from a stock one (same name) applies the stock theme;
+  - the tier-2 Settings-window closer can close a Settings window you had open (and never matches on non-English Windows) and closes before the theme commits;
+  - Windows Location lookup blocks startup/Refresh for up to a minute when slow;
+  - autostart is registered from wherever the exe runs (even a temp folder);
+  - coordinates aren't range-checked (a typo silently becomes 0.0);
+  - saved coordinates keep full sensor precision;
+  - `%VAR%` expansion / exe-relative custom theme paths;
+  - an application manifest (themed dialogs, DPI-aware) and a version resource;
+  - `tray-icon` upgrade (the pinned 0.19 exits if the taskbar isn't ready at login; fixed upstream);
+  - a `.theme` without a `DisplayName` isn't matched by its file name the way Windows names it (tier 1 fails → tier 2);
+  - custom theme paths aren't checked to be `.theme` files (a folder or other file would be opened at every transition);
+  - a double Toggle during a pending apply retry is reverted by the retry (the stand-down only sees an odd number of toggles);
+  - tier 2's settle sleep + taskbar poke and tier 3's system-wide broadcast run on the event-loop thread (the tray can freeze for seconds on legacy applies);
+  - first-run location dialogs block before the tray icon exists, and their text refers to it;
+  - pin third-party GitHub Actions to commit SHAs.
+- **Remaining known gaps** (accepted, documented in CLAUDE.md): the bounded apply retry covers total apply failure only — a tier-2 `ShellExecute` silent-fail is recovered by `commit_watcher`'s registry fallback instead; and a Toggle within ~5 s of a tier-2 apply can be reverted by that apply's still-running commit watcher (unreachable while tier 1 is healthy).
 
 ### Release & distribution (dependency chain, in order)
 
-The release-pipeline hardening items that used to live as a single bullet are now broken out so each maps cleanly to the release plan above.
-
-1. **Harden the release process (in progress — split across v0.4.0 + v0.5.0):**
-   - **1a. Done in v0.4.0**: timestamp countersignature on every signed build (`/tr http://timestamp.digicert.com /td SHA256` — without it, signatures die when the cert expires in 2036). `scripts\build.ps1` produces the signed exe and deploys to `C:\Tools\…`. See the v0.4.0 row above.
-   - **1b. v0.5.0**: `scripts\release.ps1` wraps `build.ps1` + `gh release upload --clobber` + `gh release edit --prerelease=false`. A verify step re-checks `Get-AuthenticodeSignature` post-upload and gates the workflow. Replaces the manual `cargo build` → manual `gh release upload` ritual that let the v0.3.0 "shipped unsigned for months" failure recur.
-   - **1c. v0.5.0**: investigate the recurring `wake_listener_err stage=power_register code=87` (see §Foundation). Either fix or document as benign in CLAUDE.md.
-   - **1d. v0.5.0**: stop marking releases `prerelease` — the v0.4.0 release is marked prerelease because GitHub's `release.yml` defaulted to `prerelease: true`; from v0.5.0 onward, the release script sets `prerelease: false` for stable versions. Fixes `/releases/latest` and unblocks winget automation.
+1. **Harden the release process:**
+   - **1a. Done (v0.3.x, automated in v0.4.0)**: RFC 3161 timestamp countersignature on every signed build (`/tr http://timestamp.digicert.com /td SHA256` — without it, signatures die when the cert expires in 2036), added 2026-07-04; `scripts\build.ps1` builds, signs, verifies, and deploys in one step.
+   - **1b. v0.5.0**: `scripts\release.ps1` wraps `build.ps1` + `gh release upload --clobber` + `gh release edit --prerelease=false`. A verify step re-checks `Get-AuthenticodeSignature` post-upload and gates the workflow. Replaces the manual build → `gh release upload` ritual that let the v0.3.0 "shipped unsigned for months" failure happen.
+   - **1c. Done in v0.4.1**: the recurring `wake_listener_err stage=power_register code=87` was a wrong API — fixed (see [Correctness fixes](#correctness-fixes)).
+   - **1d. v0.5.0**: stop marking releases `prerelease` — `release.yml` hardcodes `prerelease: true`; from v0.5.0 the release script sets `prerelease: false` for stable versions. Fixes `/releases/latest` and unblocks winget automation.
 2. **CA-signed releases** via [SignPath Foundation's free OSS program](https://signpath.org) — signing moves into CI, which also permanently eliminates the manual signed-asset swap. Reduces SmartScreen prompts over time via cert reputation (no cert eliminates them outright). Azure Trusted Signing is not an option: individual validation is US/Canada-only.
 3. **Submit the first CA-signed binary to Microsoft Defender** — this gates winget, whose validation pipeline runs AV scans — and to Kaspersky. Repeat only if a specific release gets flagged.
 4. **winget package** (`InstallerType: portable`), only after steps 1–2 make asset hashes final at publish time. A personal Scoop bucket may come earlier (v0.5.0 candidate): Scoop's `persist` mechanism fits the exe-relative config model better than winget's symlink layout.
@@ -172,13 +193,13 @@ The release-pipeline hardening items that used to live as a single bullet are no
 
 ### Maintenance notes (not scheduled)
 
-- **winit `ApplicationHandler` migration** — only when bumping to winit 0.31 (the pinned 0.30 merely deprecates `EventLoop::run`; nothing forces this today). Worth evaluating at that point: dropping winit for a plain Win32 message loop — the pattern already exists in the wake listener.
+- **winit `ApplicationHandler` migration** — only when bumping to winit 0.31 (the pinned 0.30 merely deprecates `EventLoop::run`, allowed at the call site; nothing forces this today). Worth evaluating at that point: dropping winit for a plain Win32 message loop — the pattern already exists in the wake listener.
 
-**Not planned**: GUI configuration (`config.json` + Refresh is the UX), custom wake times (sunrise/sunset is the whole point; offsets from them are fine), cross-platform (Windows only — macOS already has this natively), in-app update check (it would re-add the autorun+beacon AV-heuristic surface the `IThemeManager2` migration removed — winget/Scoop handle upgrades), pause/snooze toggle (a manual override already pauses until the next transition), and ADM-style scripting/hotkeys/battery rules (out of scope for a ~330 KB tray tool).
+**Not planned**: GUI configuration (`config.json` + Refresh is the UX), custom wake times (sunrise/sunset is the whole point; offsets from them are fine), cross-platform (Windows only — macOS already has this natively), in-app update check (it would re-add the autorun+beacon AV-heuristic surface the `IThemeManager2` migration removed — winget/Scoop handle upgrades), pause/snooze toggle (a manual override already pauses until the next transition), and ADM-style scripting/hotkeys/battery rules (out of scope for a small tray tool).
 
 ## Contributing
 
-**v0.4.0 status: stable for personal use.** The Tray/apply/scheduling core is mature (40 unit tests, 0 warnings, deployed binary verified daily for months). Working toward distribution polish — winget submission (gated on v0.6.0's CA-signed cert), Scoop bucket (candidate for v0.5.0), and the §Antivirus false positives section's eventual retirement (also v0.6.0). Issues and PRs welcome — please open an issue to discuss larger changes before sending a patch. Focus areas: see [Roadmap](#roadmap).
+**Status: stable for personal use.** The tray/apply/scheduling core is mature (83 unit tests, 0 compiler/clippy warnings, the deployed binary verified daily for months). Working toward distribution polish — winget submission (gated on v0.6.0's CA-signed cert), Scoop bucket (candidate for v0.5.0), and retiring the §Antivirus false positives section. Issues and PRs welcome — please open an issue to discuss larger changes before sending a patch. Focus areas: see [Roadmap](#roadmap).
 
 ## License
 

@@ -9,31 +9,40 @@ jobs:
   build:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: dtolnay/rust-toolchain@stable
+      - id: toolchain
+        uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
 
       - name: Cache cargo
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('**/Cargo.lock', '.cargo/config.toml') }}
 
       - name: Build (release)
-        run: cargo build --release
+        run: cargo build --release --locked
 
+      # The .cargo/config.toml linker hardening must reach the PE (no
+      # VCRUNTIME140 import, DependentLoadFlags 0x800) — fail if it's lost.
+      - name: Verify linker hardening
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File scripts/check-hardening.ps1 -Exe target/release/win-theme-switcher.exe
+
+      # Hard gate. The .cargo/config.toml linker flags apply here too.
       - name: Test
-        run: cargo test
+        run: cargo test --locked
 
+      # Advisory (continue-on-error): formatting and lint findings are
+      # reported but don't fail the build.
       - name: Format check
         run: cargo fmt --check
         continue-on-error: true
 
       - name: Clippy
-        run: cargo clippy --release -- -W clippy::all
+        run: cargo clippy --release --locked -- -W clippy::all
         continue-on-error: true

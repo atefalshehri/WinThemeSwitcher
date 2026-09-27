@@ -1,0 +1,21 @@
+# Applies to every build of this repo: scripts\build.ps1, scripts\test.ps1,
+# bare cargo, and both GitHub workflows.
+#
+# "Hybrid CRT": link the Visual C++ runtime (vcruntime140) statically but keep
+# the Universal CRT dynamic. vcruntime140.dll is NOT part of Windows — it comes
+# from the VC++ Redistributable — so a dynamically linked exe fails to start on
+# a clean PC with "VCRUNTIME140.dll was not found". The UCRT (api-ms-win-crt-*)
+# ships with Windows 10+, so linking it dynamically costs nothing and keeps the
+# binary ~100 KB smaller than full +crt-static.
+#
+# /DEPENDENTLOADFLAG:0x800 (LOAD_LIBRARY_SEARCH_SYSTEM32) makes the loader
+# resolve the exe's static DLL imports from System32 only, never from the
+# exe's own folder — a DLL planted next to the signed exe (which runs at every
+# login via HKCU\Run) can't hijack it.
+[target.x86_64-pc-windows-msvc]
+rustflags = [
+    "-C", "target-feature=+crt-static",
+    "-C", "link-arg=/NODEFAULTLIB:libucrt.lib",
+    "-C", "link-arg=/DEFAULTLIB:ucrt.lib",
+    "-C", "link-arg=/DEPENDENTLOADFLAG:0x800",
+]
