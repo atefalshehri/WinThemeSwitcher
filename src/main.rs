@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use sun_times::sun_times;
 use tray_icon::{
     menu::{Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem},
-    TrayIconBuilder, TrayIconEvent,
+    TrayIcon, TrayIconBuilder, TrayIconEvent,
 };
 use windows::Devices::Geolocation::{GeolocationAccessStatus, Geolocator};
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
@@ -27,6 +27,7 @@ use windows_sys::Win32::Storage::FileSystem::{
     GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
 };
 use windows_sys::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
+use windows_sys::Win32::System::Environment::ExpandEnvironmentStringsW;
 use windows_sys::Win32::System::LibraryLoader::{
     GetModuleHandleW, SetDefaultDllDirectories, LOAD_LIBRARY_SEARCH_SYSTEM32,
 };
@@ -49,10 +50,11 @@ use windows_sys::Win32::UI::Shell::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DispatchMessageW, FindWindowW, GetMessageW, MessageBoxW,
-    PostMessageW, RegisterClassW, SendMessageTimeoutW, TranslateMessage, DEVICE_NOTIFY_CALLBACK,
-    HWND_BROADCAST, HWND_MESSAGE, IDYES, MB_ICONINFORMATION, MB_ICONQUESTION, MB_ICONWARNING,
-    MB_OK, MB_YESNO, MSG, PBT_APMRESUMEAUTOMATIC, SMTO_ABORTIFHUNG, SW_HIDE, SW_SHOWNORMAL,
-    WM_CLOSE, WM_SETTINGCHANGE, WM_THEMECHANGED, WM_WTSSESSION_CHANGE, WNDCLASSW,
+    PostMessageW, RegisterClassW, RegisterWindowMessageW, SendMessageTimeoutW, SendMessageW,
+    TranslateMessage, DEVICE_NOTIFY_CALLBACK, HWND_BROADCAST, HWND_MESSAGE, IDYES,
+    MB_ICONINFORMATION, MB_ICONQUESTION, MB_ICONWARNING, MB_OK, MB_YESNO, MSG,
+    PBT_APMRESUMEAUTOMATIC, SMTO_ABORTIFHUNG, SW_HIDE, SW_SHOWNORMAL, WM_CLOSE, WM_SETTINGCHANGE,
+    WM_THEMECHANGED, WM_WTSSESSION_CHANGE, WNDCLASSW,
 };
 use winit::event::{Event, StartCause};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
@@ -281,6 +283,138 @@ impl Theme {
             Theme::Dark => Theme::Light,
         }
     }
+
+    /// The schedule slot's name in log lines (`slot=`).
+    fn slot_str(self) -> &'static str {
+        match self {
+            Theme::Light => "day",
+            Theme::Dark => "night",
+        }
+    }
+}
+
+/// The two Personalize values a theme sets — all the app can observe of
+/// which theme is on screen. A theme may set them differently (the
+/// `[VisualStyles]` keys `AppMode` / `SystemMode`), e.g. light apps with a
+/// dark taskbar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Modes {
+    /// AppsUseLightTheme.
+    apps_light: bool,
+    /// SystemUsesLightTheme (taskbar, Start).
+    system_light: bool,
+}
+
+impl From<Theme> for Modes {
+    fn from(theme: Theme) -> Self {
+        let light = theme == Theme::Light;
+        Modes {
+            apps_light: light,
+            system_light: light,
+        }
+    }
+}
+
+/// Log form of a Modes reading, used for every current=/target=/actual=
+/// field. No `=` or `,` inside, so key=value lines stay parseable.
+fn modes_str(m: Option<Modes>) -> &'static str {
+    match m {
+        None => "unknown",
+        Some(Modes {
+            apps_light: true,
+            system_light: true,
+        }) => "light",
+        Some(Modes {
+            apps_light: false,
+            system_light: false,
+        }) => "dark",
+        Some(Modes {
+            apps_light: true,
+            system_light: false,
+        }) => "apps-light/system-dark",
+        Some(Modes {
+            apps_light: false,
+            system_light: true,
+        }) => "apps-dark/system-light",
+    }
+}
+
+/// The modes a theme file declares, from its `[VisualStyles]` `SystemMode`
+/// and `AppMode` values ("Light"/"Dark", case-insensitive). A value that is
+/// absent, empty, or unrecognized falls back to the slot's default (day =
+/// light, night = dark) — and the second result is then false: what Windows
+/// does with a missing key is undocumented (high-contrast themes have none),
+/// so such a slot's modes are only a guess. Pure — unit-tested.
+fn modes_from(slot: Theme, system: Option<&str>, app: Option<&str>) -> (Modes, bool) {
+    let parse = |v: Option<&str>| match v.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
+        Some("light") => Some(true),
+        Some("dark") => Some(false),
+        _ => None,
+    };
+    let default = slot == Theme::Light;
+    let (system, app) = (parse(system), parse(app));
+    (
+        Modes {
+            apps_light: app.unwrap_or(default),
+            system_light: system.unwrap_or(default),
+        },
+        system.is_some() && app.is_some(),
+    )
+}
+
+/// One schedule slot (day = `Theme::Light`, night = `Theme::Dark`), resolved
+/// once per tick or toggle: the file that will actually be applied (after
+/// the path policy and stock fallback) and the modes THAT file sets.
+#[derive(Debug, Clone)]
+struct Slot {
+    theme: Theme,
+    file: PathBuf,
+    /// What the screen should read once this slot's theme is applied.
+    modes: Modes,
+    /// Both modes were read from the file rather than defaulted.
+    keyed: bool,
+    /// A configured path that was rejected in favor of the stock theme:
+    /// (as written, as expanded, why).
+    rejected: Option<(String, PathBuf, ThemePathIssue)>,
+}
+
+/// Whether the screen's modes can tell the two slots apart. When they can't
+/// — identical modes (two themes that differ only in wallpaper), or a slot
+/// whose modes are a guess — "the screen matches the schedule" is not
+/// observable, so ticks never skip as in-sync and Toggle alternates by what
+/// the app last applied instead of by the screen.
+fn sync_decidable(day: &Slot, night: &Slot) -> bool {
+    day.keyed && night.keyed && day.modes != night.modes
+}
+
+/// What the Toggle menu item should apply. Pure — unit-tested.
+///
+/// When the modes tell the slots apart: a screen matching the day slot goes
+/// to night and vice versa; a screen matching neither (some other theme)
+/// goes to whichever the apps mode is not. Otherwise — undecidable slots or
+/// an unreadable screen — it flips `last_applied` (the slot this process
+/// last applied successfully), else `fallback` (the slot the schedule says
+/// is current; day when there's no location).
+fn toggle_target(
+    screen: Option<Modes>,
+    day: Modes,
+    night: Modes,
+    decidable: bool,
+    last_applied: Option<Theme>,
+    fallback: Theme,
+) -> Theme {
+    match screen {
+        Some(m) if decidable && m == day => Theme::Dark,
+        Some(m) if decidable && m == night => Theme::Light,
+        Some(m) if decidable => {
+            if m.apps_light {
+                Theme::Dark
+            } else {
+                Theme::Light
+            }
+        }
+        _ => last_applied.unwrap_or(fallback).opposite(),
+    }
 }
 
 /// Why a tick is running — decides whether an apply is forced, state-aware, or
@@ -312,10 +446,13 @@ struct TickState {
     reconciled_next: Option<DateTime<Utc>>,
     /// Consecutive failed applies in the current failure episode.
     retry_count: u32,
-    /// current_theme() observed when the last apply failed. If the screen no
-    /// longer matches this, the user intervened during the retry window and
-    /// the retry must stand down rather than clobber their choice.
-    retry_baseline: Option<Theme>,
+    /// The modes read right AFTER the last apply failed — so any partial
+    /// effect of our own apply (e.g. a tier-3 write that flipped one value
+    /// before failing on the other) is part of the baseline, never mistaken
+    /// for a move. If the screen later no longer matches this, the user
+    /// intervened during the retry window and the retry must stand down
+    /// rather than clobber their choice.
+    retry_baseline: Option<Modes>,
     /// The next-transition instant computed at the tick whose apply failed —
     /// the failure episode's own window. An intervention only cancels the
     /// retry while `now < episode_next`; past it, a transition has passed
@@ -365,13 +502,20 @@ enum TickAction {
 /// sequences of ticks mutating one TickState via note_reconciled /
 /// note_apply_failed. IMPORTANT: called with the PRE-tick state; the state
 /// notes are recorded after the apply outcome is known.
+///
+/// `current` is the screen's modes (None = unreadable), `target` the modes
+/// of the scheduled slot's theme. `sync_decidable` false (see the fn of that
+/// name) only disables the in-sync skip — equal modes then prove nothing —
+/// while override preservation and the retry stand-down work as usual.
+#[allow(clippy::too_many_arguments)]
 fn decide_tick(
     kind: TickKind,
-    current: Option<Theme>,
-    target: Theme,
+    current: Option<Modes>,
+    target: Modes,
     now: DateTime<Utc>,
     next: DateTime<Utc>,
     clock_stepped_back: bool,
+    sync_decidable: bool,
     state: &TickState,
 ) -> TickAction {
     // Refresh is fresh user intent: always force-apply.
@@ -393,7 +537,7 @@ fn decide_tick(
     {
         return TickAction::CancelRetry;
     }
-    if current == Some(target) {
+    if sync_decidable && current == Some(target) {
         return TickAction::SkipInSync;
     }
     // A transition has passed since we were last in sync if now is at/after
@@ -436,14 +580,15 @@ fn note_reconciled(state: &mut TickState, next: DateTime<Utc>) {
     state.episode_next = None;
 }
 
-/// Record a failed apply. Returns true when a quick retry should be
+/// Record a failed apply. `observed` must be read AFTER the failure (see
+/// TickState::retry_baseline). Returns true when a quick retry should be
 /// scheduled (reconciled_next is left stale); false when the budget is
 /// exhausted (the episode resets so the NEXT transition window gets a fresh
 /// budget, and reconciled_next is cleared so later wakes remain free retry
 /// opportunities).
 fn note_apply_failed(
     state: &mut TickState,
-    observed: Option<Theme>,
+    observed: Option<Modes>,
     next_utc: DateTime<Utc>,
 ) -> bool {
     state.retry_count += 1;
@@ -462,13 +607,6 @@ fn note_apply_failed(
         state.episode_next = Some(next_utc);
         true
     }
-}
-
-/// What the Toggle menu item should apply. Pure — unit-tested. An unreadable
-/// current theme (registry read failure) defaults the base to Light, so the
-/// first toggle lands on Dark.
-fn toggle_target(current: Option<Theme>) -> Theme {
-    current.unwrap_or(Theme::Light).opposite()
 }
 
 /// Keep a message single-line and parseable inside a `msg="..."` log field
@@ -498,6 +636,9 @@ fn retry_deadline(now: DateTime<Local>, next: DateTime<Local>) -> DateTime<Local
 enum AppEvent {
     Menu(MenuId),
     Wake(WakeKind),
+    /// Re-check that the tray icon is registered (attempt number). Never
+    /// ticks.
+    TrayProbe(u32),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -562,14 +703,6 @@ fn write_log_line(line: &str) {
     {
         // One write per line, so concurrent lines can't interleave.
         let _ = f.write_all(format!("{line}\n").as_bytes());
-    }
-}
-
-fn theme_str(t: Option<Theme>) -> &'static str {
-    match t {
-        Some(Theme::Light) => "light",
-        Some(Theme::Dark) => "dark",
-        None => "unknown",
     }
 }
 
@@ -992,21 +1125,64 @@ fn report_config_error(err: &str) {
         // quoted-field convention parseable.
         sanitize_log_msg(err),
     ));
-    if CONFIG_ERROR_BOX_OPEN.swap(true, Ordering::SeqCst) {
-        return;
-    }
     let body = format!(
         "{err}\n\nThe file was left unchanged — your settings are still in it. \
          Fix the error (tray menu → Open Config), then choose Refresh.",
     );
+    show_warning_async(
+        &CONFIG_ERROR_BOX_OPEN,
+        "WinThemeSwitcher — Config error",
+        body,
+    );
+}
+
+/// A warning MessageBox on a detached thread (never blocks startup or the
+/// event loop); `open` keeps a second one of the same kind from stacking.
+fn show_warning_async(open: &'static AtomicBool, title: &'static str, body: String) {
+    if open.swap(true, Ordering::SeqCst) {
+        return;
+    }
     std::thread::spawn(move || {
-        show_message_box(
-            "WinThemeSwitcher — Config error",
-            &body,
-            MB_OK | MB_ICONWARNING,
-        );
-        CONFIG_ERROR_BOX_OPEN.store(false, Ordering::SeqCst);
+        show_message_box(title, &body, MB_OK | MB_ICONWARNING);
+        open.store(false, Ordering::SeqCst);
     });
+}
+
+/// A theme-path warning box is already on screen.
+static THEME_PATH_BOX_OPEN: AtomicBool = AtomicBool::new(false);
+
+/// Tell the user when theme_day / theme_night can't be used — once per
+/// config load (startup, Refresh), not per apply. Each apply still logs
+/// `theme_path_rejected`.
+fn report_theme_path_problems(cfg: &Config) {
+    let problems: Vec<String> = [Theme::Light, Theme::Dark]
+        .into_iter()
+        .filter_map(|theme| {
+            let (file, rejected) = resolve_theme_file_checked(theme, cfg);
+            let (raw, _, issue) = rejected?;
+            let key = match theme {
+                Theme::Light => "theme_day",
+                Theme::Dark => "theme_night",
+            };
+            Some(format!(
+                "{key} = \"{raw}\": {}.\nUsing {} instead.",
+                issue.describe(),
+                file.display()
+            ))
+        })
+        .collect();
+    if problems.is_empty() {
+        return;
+    }
+    let body = format!(
+        "{}\n\nFix config.json (tray menu → Open Config), then choose Refresh.",
+        problems.join("\n\n")
+    );
+    show_warning_async(
+        &THEME_PATH_BOX_OPEN,
+        "WinThemeSwitcher — Theme file not used",
+        body,
+    );
 }
 
 fn acquire_location(cfg: &mut Config) {
@@ -1024,25 +1200,57 @@ fn acquire_location(cfg: &mut Config) {
     }
 }
 
-fn current_theme() -> Option<Theme> {
+/// The Personalize light/dark values now in effect (registry only — safe
+/// from any thread, e.g. commit_watcher's). None if either value can't be
+/// read as a 4-byte REG_DWORD; the first such failure is logged once, so a
+/// permanently unreadable value shows up in events.log.
+fn read_modes() -> Option<Modes> {
+    static LOGGED: AtomicBool = AtomicBool::new(false);
+    let apps = read_personalize_dword("AppsUseLightTheme");
+    let system = read_personalize_dword("SystemUsesLightTheme");
+    match (apps, system) {
+        (Ok(a), Ok(s)) => Some(Modes {
+            apps_light: a != 0,
+            system_light: s != 0,
+        }),
+        (a, s) => {
+            if !LOGGED.swap(true, Ordering::Relaxed) {
+                let (name, err) = match a {
+                    Err(e) => ("AppsUseLightTheme", e),
+                    Ok(_) => ("SystemUsesLightTheme", s.err().unwrap_or_default()),
+                };
+                log_event(&format!(
+                    "{} modes_read_err value={} err={}",
+                    Local::now().to_rfc3339(),
+                    name,
+                    err,
+                ));
+            }
+            None
+        }
+    }
+}
+
+/// One HKCU Personalize DWORD. Err is a short `key=value` style reason.
+fn read_personalize_dword(name: &str) -> Result<u32, String> {
     let subkey = wide(THEME_KEY);
-    let value = wide("SystemUsesLightTheme");
+    let value = wide(name);
     unsafe {
         let mut hkey: HKEY = ptr::null_mut();
-        if RegOpenKeyExW(
+        let rc = RegOpenKeyExW(
             HKEY_CURRENT_USER,
             subkey.as_ptr(),
             0,
             KEY_QUERY_VALUE,
             &mut hkey,
-        ) != 0
-        {
-            return None;
+        );
+        if rc != 0 {
+            return Err(format!("open-rc-{rc}"));
         }
         let mut data: u32 = 0;
         let mut size: u32 = 4;
         let mut kind: u32 = 0;
-        let r = RegQueryValueExW(
+        let rc = RegQueryValueExW(
             hkey,
             value.as_ptr(),
             ptr::null_mut(),
@@ -1051,15 +1259,17 @@ fn current_theme() -> Option<Theme> {
             &mut size,
         );
         RegCloseKey(hkey);
-        if r != 0 {
-            return None;
+        if rc != 0 {
+            return Err(format!("query-rc-{rc}"));
         }
-        Some(if data == 0 { Theme::Dark } else { Theme::Light })
+        if kind != REG_DWORD || size != 4 {
+            return Err(format!("type-{kind}-size-{size}"));
+        }
+        Ok(data)
     }
 }
 
-fn write_theme_registry(theme: Theme) -> Result<(), Box<dyn Error>> {
-    let value: u32 = if theme == Theme::Light { 1 } else { 0 };
+fn write_theme_registry(modes: Modes) -> Result<(), Box<dyn Error>> {
     let subkey = wide(THEME_KEY);
     let apps = wide("AppsUseLightTheme");
     let sys = wide("SystemUsesLightTheme");
@@ -1077,15 +1287,16 @@ fn write_theme_registry(theme: Theme) -> Result<(), Box<dyn Error>> {
         }
         // Both results matter: a blocked write (AV/HIPS, ACL, hive error)
         // must surface as Err so tick's bounded retry runs, instead of being
-        // logged as applied=registry while nothing changed.
-        // Order matters: SystemUsesLightTheme — the value current_theme()
-        // reads — is written LAST and only if Apps succeeded, so the only
-        // possible half state ("Apps new, System old") reads as not-applied
-        // and gets retried. The reverse would read as the screen having
-        // moved, which the retry gate would take for a user intervention.
+        // logged as applied=registry while nothing changed. A half write
+        // (Apps flipped, System failed) is harmless to the retry gate: tick
+        // takes the failure baseline from a reading made AFTER this returns.
         let mut failed: Option<String> = None;
         let mut any_ok = false;
-        for (name, name_w) in [("AppsUseLightTheme", &apps), ("SystemUsesLightTheme", &sys)] {
+        for (name, name_w, light) in [
+            ("AppsUseLightTheme", &apps, modes.apps_light),
+            ("SystemUsesLightTheme", &sys, modes.system_light),
+        ] {
+            let value = u32::from(light);
             let rc = RegSetValueExW(
                 hkey,
                 name_w.as_ptr(),
@@ -1166,26 +1377,292 @@ fn poke_shell() {
     }
 }
 
-fn resolve_theme_file(theme: Theme, cfg: &Config) -> PathBuf {
-    let custom = match theme {
-        Theme::Light => cfg.theme_day.as_deref(),
-        Theme::Dark => cfg.theme_night.as_deref(),
-    };
-    if let Some(p) = custom {
-        let path = PathBuf::from(p);
-        if path.exists() {
-            return path;
+/// Why a configured theme_day/theme_night path isn't used.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ThemePathIssue {
+    Missing,
+    Directory,
+    /// .themepack / .deskthemepack: a CAB whose DisplayName can't be read,
+    /// and whose "open" re-installs the pack at every transition. Install it
+    /// once (double-click), then point the config at the installed .theme.
+    ThemePack,
+    /// Any other extension: tier 2 would ShellExecute("open") it, launching
+    /// whatever handler that file type has — at every transition.
+    NotATheme,
+    /// %LOCALAPPDATA%\Microsoft\Windows\Themes\Custom.theme — Windows'
+    /// "Unsaved Theme" scratch file, rewritten on every personalization change.
+    ScratchFile,
+    /// A `%NAME%` survived expansion: the variable isn't defined (the
+    /// environment is the one the app started with — changes need a restart).
+    UnexpandedVar,
+    /// Drive-relative (`C:x.theme`): would resolve against that drive's
+    /// current directory, which the app doesn't control.
+    NotAbsolute,
+}
+
+impl ThemePathIssue {
+    fn as_str(self) -> &'static str {
+        match self {
+            ThemePathIssue::Missing => "missing",
+            ThemePathIssue::Directory => "directory",
+            ThemePathIssue::ThemePack => "theme-pack",
+            ThemePathIssue::NotATheme => "not-a-theme",
+            ThemePathIssue::ScratchFile => "scratch-file",
+            ThemePathIssue::UnexpandedVar => "unexpanded-var",
+            ThemePathIssue::NotAbsolute => "not-absolute",
         }
     }
-    let win_dir = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_string());
+
+    /// For the warning box.
+    fn describe(self) -> &'static str {
+        match self {
+            ThemePathIssue::Missing => "the file doesn't exist",
+            ThemePathIssue::Directory => "it is a folder, not a .theme file",
+            ThemePathIssue::ThemePack => {
+                "theme packs can't be used directly - double-click the pack once to \
+                 install it, then point the config at the installed .theme file \
+                 (under %LOCALAPPDATA%\\Microsoft\\Windows\\Themes)"
+            }
+            ThemePathIssue::NotATheme => "only .theme files are supported",
+            ThemePathIssue::ScratchFile => {
+                "Custom.theme is Windows' unsaved-theme scratch file - save the theme \
+                 under a name in Settings > Personalization > Themes and use that file"
+            }
+            ThemePathIssue::UnexpandedVar => {
+                "it uses an environment variable that isn't defined (variables are \
+                 read when the app starts)"
+            }
+            ThemePathIssue::NotAbsolute => {
+                "a drive letter without a backslash (like C:x.theme) is not supported - \
+                 use a full path"
+            }
+        }
+    }
+}
+
+/// Whether an expanded path still contains a `%NAME%` token.
+fn has_unexpanded_var(s: &str) -> bool {
+    let mut parts = s.split('%');
+    parts.next();
+    // Every other segment sits between a pair of '%'.
+    let inner: Vec<&str> = parts.collect();
+    inner
+        .iter()
+        .step_by(2)
+        .take(inner.len() / 2)
+        .any(|name| !name.is_empty() && !name.contains(['\\', '/']))
+}
+
+/// Expand %VARS% in a configured path (ExpandEnvironmentStringsW; unknown
+/// variables stay as written) and resolve a relative result against `base`
+/// (the exe's folder — where config.json lives), never the process CWD.
+fn expand_theme_path(raw: &str, base: &Path) -> PathBuf {
+    let src = wide(raw);
+    let mut buf = vec![0u16; 1024];
+    let expanded = loop {
+        let n =
+            unsafe { ExpandEnvironmentStringsW(src.as_ptr(), buf.as_mut_ptr(), buf.len() as u32) }
+                as usize;
+        if n == 0 {
+            break raw.to_string();
+        }
+        if n <= buf.len() {
+            // n counts the terminating NUL.
+            break String::from_utf16_lossy(&buf[..n - 1]);
+        }
+        buf.resize(n, 0);
+    };
+    let path = PathBuf::from(expanded.trim());
+    if path.is_absolute() {
+        path
+    } else {
+        base.join(path)
+    }
+}
+
+/// Whether an (expanded) path may be used as a theme: an existing FILE with
+/// a `.theme` extension that isn't Windows' scratch Custom.theme.
+fn check_theme_path(path: &Path, scratch: &Path) -> Result<(), ThemePathIssue> {
+    let prefixed = matches!(
+        path.components().next(),
+        Some(std::path::Component::Prefix(_))
+    );
+    if prefixed && !path.has_root() {
+        return Err(ThemePathIssue::NotAbsolute);
+    }
+    if path.is_dir() {
+        return Err(ThemePathIssue::Directory);
+    }
+    if !path.is_file() {
+        // A %NAME% left after expansion means an undefined variable — said
+        // only when nothing exists there, since file names may contain '%'.
+        return Err(if has_unexpanded_var(&path.to_string_lossy()) {
+            ThemePathIssue::UnexpandedVar
+        } else {
+            ThemePathIssue::Missing
+        });
+    }
+    // The extension of the name as stored: canonicalizing expands 8.3 names
+    // (`NIGHTT~1.THE`) and drops the trailing dots/spaces Win32 ignores.
+    let real = fs::canonicalize(path).ok();
+    let name = real
+        .as_deref()
+        .unwrap_or(path)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let ext = name
+        .trim_end_matches(['.', ' '])
+        .rsplit_once('.')
+        .map(|(_, e)| e.to_ascii_lowercase())
+        .unwrap_or_default();
+    match ext.as_str() {
+        "theme" => {}
+        "themepack" | "deskthemepack" => return Err(ThemePathIssue::ThemePack),
+        _ => return Err(ThemePathIssue::NotATheme),
+    }
+    let same = match (real, fs::canonicalize(scratch)) {
+        (Some(a), Ok(b)) => a == b,
+        _ => false,
+    };
+    if same {
+        return Err(ThemePathIssue::ScratchFile);
+    }
+    Ok(())
+}
+
+fn stock_theme_file(theme: Theme) -> PathBuf {
     let leaf = match theme {
         Theme::Light => "aero.theme",
         Theme::Dark => "dark.theme",
     };
-    PathBuf::from(win_dir)
-        .join("Resources")
-        .join("Themes")
-        .join(leaf)
+    windows_resources_dir().join("Themes").join(leaf)
+}
+
+fn scratch_theme_file() -> PathBuf {
+    let local = std::env::var("LOCALAPPDATA").unwrap_or_default();
+    PathBuf::from(local).join("Microsoft\\Windows\\Themes\\Custom.theme")
+}
+
+/// The .theme file to apply for `theme`: the configured one if it passes
+/// `check_theme_path`, else the stock theme. The Err side of the second value
+/// reports a configured path that was rejected (and its expansion), for the
+/// caller to log.
+fn resolve_theme_file_checked(
+    theme: Theme,
+    cfg: &Config,
+) -> (PathBuf, Option<(String, PathBuf, ThemePathIssue)>) {
+    let configured = match theme {
+        Theme::Light => cfg.theme_day.as_deref(),
+        Theme::Dark => cfg.theme_night.as_deref(),
+    };
+    let Some(raw) = configured.filter(|s| !s.trim().is_empty()) else {
+        return (stock_theme_file(theme), None);
+    };
+    let base = config_path()
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let path = expand_theme_path(raw, &base);
+    match check_theme_path(&path, &scratch_theme_file()) {
+        Ok(()) => (path, None),
+        Err(issue) => (
+            stock_theme_file(theme),
+            Some((raw.to_string(), path, issue)),
+        ),
+    }
+}
+
+#[cfg(test)]
+fn resolve_theme_file(theme: Theme, cfg: &Config) -> PathBuf {
+    resolve_theme_file_checked(theme, cfg).0
+}
+
+/// Resolve a schedule slot: the file that will be applied (path policy +
+/// stock fallback) and the modes read from THAT file, so the target that
+/// ticks, Toggle and commit_watcher compare against is always the theme
+/// actually applied — never a rejected configured file's.
+fn resolve_slot(theme: Theme, cfg: &Config) -> Slot {
+    let (file, rejected) = resolve_theme_file_checked(theme, cfg);
+    let system = read_theme_ini(&file, "VisualStyles", "SystemMode").flatten();
+    let app = read_theme_ini(&file, "VisualStyles", "AppMode").flatten();
+    let (modes, keyed) = modes_from(theme, system.as_deref(), app.as_deref());
+    Slot {
+        theme,
+        file,
+        modes,
+        keyed,
+        rejected,
+    }
+}
+
+/// Last sync-decidability state logged (0 = not yet computed, 1 = decidable,
+/// 2 = undecidable), so `theme_sync` lines appear only on a change.
+static SYNC_STATE_LOGGED: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// `sync_decidable`, logging a `theme_sync` line whenever the answer changes
+/// (the first computation logs only if undecidable — the normal case is
+/// silent).
+fn sync_decidable_logged(day: &Slot, night: &Slot) -> bool {
+    let decidable = sync_decidable(day, night);
+    let state = if decidable { 1 } else { 2 };
+    let prev = SYNC_STATE_LOGGED.swap(state, Ordering::Relaxed);
+    if prev != state && !(prev == 0 && decidable) {
+        let why = if decidable {
+            "modes-differ"
+        } else if day.keyed && night.keyed {
+            "identical-modes"
+        } else {
+            "modes-not-in-theme-file"
+        };
+        log_event(&format!(
+            "{} theme_sync decidable={} reason={} day={}{} night={}{}",
+            Local::now().to_rfc3339(),
+            decidable,
+            why,
+            modes_str(Some(day.modes)),
+            if day.keyed { "" } else { "(guessed)" },
+            modes_str(Some(night.modes)),
+            if night.keyed { "" } else { "(guessed)" },
+        ));
+    }
+    decidable
+}
+
+/// The slot this process last applied successfully (0 = none, 1 = day,
+/// 2 = night) — Toggle's fallback when the screen's modes can't tell the
+/// slots apart. Deliberately NOT in TickState: Toggle must never touch that.
+static LAST_APPLIED_SLOT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+fn note_applied_slot(theme: Theme) {
+    let v = match theme {
+        Theme::Light => 1,
+        Theme::Dark => 2,
+    };
+    LAST_APPLIED_SLOT.store(v, Ordering::Relaxed);
+}
+
+fn last_applied_slot() -> Option<Theme> {
+    match LAST_APPLIED_SLOT.load(Ordering::Relaxed) {
+        1 => Some(Theme::Light),
+        2 => Some(Theme::Dark),
+        _ => None,
+    }
+}
+
+/// Extra fields for a tick/toggle log line: the slot name whenever the
+/// target modes alone don't identify it, and a note when sync is
+/// undecidable. Empty in the common case (stock-like themes).
+fn slot_note(slot: &Slot, decidable: bool) -> String {
+    let mut s = String::new();
+    if !decidable || slot.modes != Modes::from(slot.theme) {
+        s.push_str(" slot=");
+        s.push_str(slot.theme.slot_str());
+    }
+    if !decidable {
+        s.push_str(" sync=undecidable");
+    }
+    s
 }
 
 fn apply_theme_file(path: &std::path::Path) -> bool {
@@ -1238,16 +1715,36 @@ fn start_settings_closer() {
     });
 }
 
-fn start_commit_watcher(target: Theme) {
+/// Watch a tier-2 apply for its registry effect; on a silent fail, force the
+/// modes via tier 3. `pre` is the reading from before the apply: when the
+/// modes can't show whether the apply committed — the theme file doesn't
+/// declare them (forcing a guess over the theme would be wrong), or the
+/// screen already reads the target — it only logs `commit_unverifiable`.
+fn start_commit_watcher(slot: &Slot, pre: Option<Modes>) {
+    let target = slot.modes;
+    if !slot.keyed || pre == Some(target) {
+        log_event(&format!(
+            "{} commit_unverifiable target={} slot={} reason={}",
+            Local::now().to_rfc3339(),
+            modes_str(Some(target)),
+            slot.theme.slot_str(),
+            if slot.keyed {
+                "already-matching"
+            } else {
+                "modes-not-in-theme-file"
+            },
+        ));
+        return;
+    }
     let started = Instant::now();
     std::thread::spawn(move || {
         for _ in 0..25 {
             std::thread::sleep(Duration::from_millis(200));
-            if current_theme() == Some(target) {
+            if read_modes() == Some(target) {
                 log_event(&format!(
                     "{} commit_observed target={} after_ms={}",
                     Local::now().to_rfc3339(),
-                    theme_str(Some(target)),
+                    modes_str(Some(target)),
                     started.elapsed().as_millis(),
                 ));
                 return;
@@ -1256,15 +1753,16 @@ fn start_commit_watcher(target: Theme) {
         log_event(&format!(
             "{} commit_timeout target={} actual={} after_ms={}",
             Local::now().to_rfc3339(),
-            theme_str(Some(target)),
-            theme_str(current_theme()),
+            modes_str(Some(target)),
+            modes_str(read_modes()),
             started.elapsed().as_millis(),
         ));
         // ShellExecute(.theme) lied about success — Settings UWP didn't actually apply.
         // Observed when the schedule fires while the user isn't interactive (sunset while
         // away, immediately after WTS_SESSION_UNLOCK, immediately after PBT_APMRESUMEAUTOMATIC).
-        // Force the mode flip via direct registry write so at minimum light/dark is correct;
-        // wallpaper won't change on this path (would require IThemeManager2 — see CLAUDE.md).
+        // Force the mode flip via direct registry write so at minimum the
+        // theme's light/dark modes are correct; wallpaper won't change on
+        // this path (would require IThemeManager2 — see CLAUDE.md).
         let fb_started = Instant::now();
         match write_theme_registry(target) {
             Ok(()) => {
@@ -1273,7 +1771,7 @@ fn start_commit_watcher(target: Theme) {
                 let mut confirmed = false;
                 for _ in 0..10 {
                     std::thread::sleep(Duration::from_millis(100));
-                    if current_theme() == Some(target) {
+                    if read_modes() == Some(target) {
                         confirmed = true;
                         break;
                     }
@@ -1281,7 +1779,7 @@ fn start_commit_watcher(target: Theme) {
                 log_event(&format!(
                     "{} fallback_registry target={} confirmed={} after_ms={}",
                     Local::now().to_rfc3339(),
-                    theme_str(Some(target)),
+                    modes_str(Some(target)),
                     confirmed,
                     fb_started.elapsed().as_millis(),
                 ));
@@ -1290,7 +1788,7 @@ fn start_commit_watcher(target: Theme) {
                 log_event(&format!(
                     "{} fallback_registry_err target={} err=\"{}\"",
                     Local::now().to_rfc3339(),
-                    theme_str(Some(target)),
+                    modes_str(Some(target)),
                     sanitize_log_msg(&e.to_string()),
                 ));
             }
@@ -1298,26 +1796,28 @@ fn start_commit_watcher(target: Theme) {
     });
 }
 
-/// Reads `[Theme]\nDisplayName=...` from a `.theme` (INI) file.
-/// `DisplayName` may be a literal string, OR an SHLoadIndirectString resource
-/// reference of the form `@%SystemRoot%\System32\themeui.dll,-2060` (system themes
-/// use this — the actual user-visible name is in a localized string table).
-/// Returns the resolved literal string, or None if the file is unreadable / has no
-/// DisplayName / the indirect-string resolution fails.
+/// Reads one value from a `.theme` (INI) file with Windows' own INI reader
+/// (GetPrivateProfileStringW), not by hand, so what we see is exactly what
+/// Windows reads: section and key names case-insensitive, whitespace around
+/// `=` trimmed, enclosing quotes stripped, and the file decoded the way
+/// Windows decodes it (UTF-16 with a BOM, otherwise the system ANSI code page
+/// — system .theme files are Windows-1252, e.g. `aero.theme`'s raw `0xa9`
+/// copyright byte).
 ///
-/// Parsed with Windows' own INI reader (GetPrivateProfileStringW), not by hand,
-/// so the name we match in tier 1 is exactly the one Windows reads: section
-/// and key names case-insensitive, whitespace around `=` trimmed, enclosing
-/// quotes stripped, and the file decoded the way Windows decodes it (UTF-16
-/// with a BOM, otherwise the system ANSI code page — system .theme files are
-/// Windows-1252, e.g. `aero.theme`'s raw `0xa9` copyright byte).
-fn resolve_theme_display_name(theme_file: &Path) -> Option<String> {
-    if !theme_file.is_file() {
+/// None: `theme_file` isn't a readable file. Some(None): the key (or section)
+/// is absent. Some(Some(v)): present, trimmed (possibly empty).
+fn read_theme_ini(theme_file: &Path, section: &str, key: &str) -> Option<Option<String>> {
+    // A default that can't be a real value tells "absent" from "empty".
+    const ABSENT: &str = "\u{1}wts-absent\u{1}";
+    // GetPrivateProfileStringW also returns the default when it can't OPEN
+    // the file (sharing violation, ACL) — prove it's readable first, so a
+    // transient read failure is None, never "the key is absent".
+    if !theme_file.is_file() || fs::File::open(theme_file).is_err() {
         return None;
     }
-    let section = wide("Theme");
-    let key = wide("DisplayName");
-    let empty = wide("");
+    let section = wide(section);
+    let key = wide(key);
+    let default = wide(ABSENT);
     // Absolute: given a bare file name, GetPrivateProfileStringW looks in
     // %WINDIR%, not the directory is_file() just checked.
     let abs = std::path::absolute(theme_file).unwrap_or_else(|_| theme_file.to_path_buf());
@@ -1327,21 +1827,38 @@ fn resolve_theme_display_name(theme_file: &Path) -> Option<String> {
         GetPrivateProfileStringW(
             section.as_ptr(),
             key.as_ptr(),
-            empty.as_ptr(),
+            default.as_ptr(),
             buf.as_mut_ptr(),
             buf.len() as u32,
             file.as_ptr(),
         )
     } as usize;
-    if n == 0 {
-        return None;
-    }
     let raw = String::from_utf16_lossy(&buf[..n.min(buf.len())]);
-    let raw = raw.trim();
-    if raw.starts_with('@') {
-        return resolve_indirect_string(raw);
+    if raw == ABSENT {
+        return Some(None);
     }
-    Some(raw.to_string())
+    Some(Some(raw.trim().to_string()))
+}
+
+/// The name Windows lists a `.theme` under — what tier 1 matches against
+/// `ITheme::GetDisplayName`. `[Theme] DisplayName` may be a literal, OR an
+/// SHLoadIndirectString resource reference such as
+/// `@%SystemRoot%\System32\themeui.dll,-2060` (system themes use this — the
+/// user-visible name is in a localized string table). With no DisplayName at
+/// all, Windows uses the file name WITHOUT the `.theme` extension (MS Learn
+/// "Theme file format"; confirmed 2026-09-28 by enumerating IThemeManager2
+/// with a no-DisplayName theme in the user Themes folder, which was listed
+/// under its file stem). None if the file is unreadable, the value is empty,
+/// or indirect-string resolution fails.
+fn resolve_theme_display_name(theme_file: &Path) -> Option<String> {
+    match read_theme_ini(theme_file, "Theme", "DisplayName")? {
+        None => theme_file
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned()),
+        Some(v) if v.is_empty() => None,
+        Some(v) if v.starts_with('@') => resolve_indirect_string(&v),
+        Some(v) => Some(v),
+    }
 }
 
 /// Resolves `@dll,-id` resource string references using SHLoadIndirectString.
@@ -1379,10 +1896,21 @@ fn resolve_indirect_string(source: &str) -> Option<String> {
 /// AddAndSelectTheme — not implemented here; custom themes fall through to
 /// the legacy path).
 ///
+/// Matching is by name only (ITheme exposes no file path), so a name shared
+/// with another theme file is a hazard: tier 1 could apply THAT theme —
+/// e.g. a stale saved copy — and report success. For one of Windows' own
+/// themes (unique resource-string names) the first match is used. For any
+/// other file whose name another theme file also has, tier 1 declines (Err)
+/// and tier 2 applies the configured file by its exact path — see
+/// `pick_theme_index`.
+///
 /// Logs `theme_manager2_apply` on success; the caller logs the err string.
-fn apply_via_theme_manager2(theme: Theme, theme_file: &Path) -> Result<(), Box<dyn Error>> {
-    let target_name = resolve_theme_display_name(theme_file)
+fn apply_via_theme_manager2(slot: &Slot) -> Result<(), Box<dyn Error>> {
+    let target_name = resolve_theme_display_name(&slot.file)
         .ok_or("could not resolve DisplayName from .theme file")?;
+    let windows_theme = is_windows_theme(&slot.file);
+    let collides =
+        !windows_theme && name_taken_elsewhere(&slot.file, &target_name, &theme_search_dirs());
     let started = Instant::now();
     unsafe {
         let mgr =
@@ -1390,82 +1918,189 @@ fn apply_via_theme_manager2(theme: Theme, theme_file: &Path) -> Result<(), Box<d
         let n = mgr
             .count()
             .map_err(|hr| format!("GetThemeCount hr=0x{:08x}", hr))?;
+        let mut matches = Vec::new();
         for i in 0..n {
-            let name = match mgr.theme_display_name(i) {
-                Ok(n) => n,
-                Err(hr) => {
-                    log_event(&format!(
-                        "{} theme_manager2_enum_skip i={} hr=0x{:08x}",
-                        Local::now().to_rfc3339(),
-                        i,
-                        hr
-                    ));
-                    continue;
-                }
-            };
-            if name == target_name {
-                mgr.set_current(i, THEME_APPLY_FLAG_NO_HOURGLASS)
-                    .map_err(|hr| format!("SetCurrentTheme i={} hr=0x{:08x}", i, hr))?;
-                log_event(&format!(
-                    "{} theme_manager2_apply target={} display=\"{}\" idx={} after_ms={}",
+            match mgr.theme_display_name(i) {
+                Ok(name) if name == target_name => matches.push(i),
+                Ok(_) => {}
+                Err(hr) => log_event(&format!(
+                    "{} theme_manager2_enum_skip i={} hr=0x{:08x}",
                     Local::now().to_rfc3339(),
-                    theme_str(Some(theme)),
-                    sanitize_log_msg(&name),
                     i,
-                    started.elapsed().as_millis(),
-                ));
-                return Ok(());
+                    hr
+                )),
             }
         }
-        Err(format!("no installed theme matches DisplayName \"{}\"", target_name).into())
+        let i = pick_theme_index(&matches, windows_theme, collides, &target_name)?;
+        if matches.len() > 1 {
+            log_event(&format!(
+                "{} theme_manager2_ambiguous display=\"{}\" matches={:?} using_idx={}",
+                Local::now().to_rfc3339(),
+                sanitize_log_msg(&target_name),
+                matches,
+                i,
+            ));
+        }
+        mgr.set_current(i, THEME_APPLY_FLAG_NO_HOURGLASS)
+            .map_err(|hr| format!("SetCurrentTheme i={} hr=0x{:08x}", i, hr))?;
+        log_event(&format!(
+            "{} theme_manager2_apply target={} display=\"{}\" idx={} after_ms={}",
+            Local::now().to_rfc3339(),
+            modes_str(Some(slot.modes)),
+            sanitize_log_msg(&target_name),
+            i,
+            started.elapsed().as_millis(),
+        ));
+        Ok(())
     }
+}
+
+/// Which enumerated theme tier 1 applies, given every index whose
+/// DisplayName matched the configured file's. `taken_elsewhere`: another
+/// theme file in the folders Windows lists also has this name (ignored for
+/// Windows' own themes). Pure — unit-tested.
+fn pick_theme_index(
+    matches: &[i32],
+    windows_theme: bool,
+    taken_elsewhere: bool,
+    name: &str,
+) -> Result<i32, String> {
+    if taken_elsewhere && !windows_theme {
+        return Err(format!(
+            "another theme file is also named \"{name}\" - give the configured theme a \
+             unique name so tier 1 can't pick the wrong one"
+        ));
+    }
+    match matches {
+        [] => Err(format!("no installed theme matches DisplayName \"{name}\"")),
+        [only] => Ok(*only),
+        [first, ..] if windows_theme => Ok(*first),
+        _ => Err(format!(
+            "{} installed themes are named \"{name}\" - can't tell which is the configured file",
+            matches.len()
+        )),
+    }
+}
+
+/// Windows' own theme root, %SystemRoot%\Resources.
+fn windows_resources_dir() -> PathBuf {
+    let win_dir = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_string());
+    PathBuf::from(win_dir).join("Resources")
+}
+
+/// Whether `file` is one of Windows' own themes — directly inside a folder
+/// of %SystemRoot%\Resources (Themes, Ease of Access Themes, ...), the
+/// folders Windows lists.
+fn is_windows_theme(file: &Path) -> bool {
+    let Some(grandparent) = file.parent().and_then(Path::parent) else {
+        return false;
+    };
+    match (
+        fs::canonicalize(grandparent),
+        fs::canonicalize(windows_resources_dir()),
+    ) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
+/// Folders whose .theme files Windows lists in Settings (MS Learn "Theme
+/// file format"): each folder directly in %SystemRoot%\Resources, and the
+/// user's %LOCALAPPDATA%\Microsoft\Windows\Themes tree.
+fn theme_search_dirs() -> Vec<(PathBuf, bool)> {
+    let mut dirs = Vec::new();
+    if let Ok(entries) = fs::read_dir(windows_resources_dir()) {
+        dirs.extend(
+            entries
+                .filter_map(|e| e.ok().map(|e| e.path()))
+                .filter(|p| p.is_dir())
+                .map(|p| (p, false)),
+        );
+    }
+    if let Some(user) = scratch_theme_file().parent() {
+        dirs.push((user.to_path_buf(), true));
+    }
+    dirs
+}
+
+/// Whether a .theme file OTHER than `configured` in `dirs` (each
+/// `(dir, recursive)`) has the DisplayName `name` — the file-stem fallback
+/// included. Identity is by canonical path, so the configured file itself
+/// never counts, however it was spelled.
+fn name_taken_elsewhere(configured: &Path, name: &str, dirs: &[(PathBuf, bool)]) -> bool {
+    fn walk(dir: &Path, recursive: bool, depth: u32, out: &mut Vec<PathBuf>) {
+        let Ok(entries) = fs::read_dir(dir) else {
+            return;
+        };
+        for p in entries.filter_map(|e| e.ok().map(|e| e.path())) {
+            if p.is_dir() {
+                if recursive && depth < 4 {
+                    walk(&p, recursive, depth + 1, out);
+                }
+            } else if p
+                .extension()
+                .is_some_and(|x| x.eq_ignore_ascii_case("theme"))
+            {
+                out.push(p);
+            }
+        }
+    }
+    let me = fs::canonicalize(configured).ok();
+    let mut files = Vec::new();
+    for (dir, recursive) in dirs {
+        walk(dir, *recursive, 0, &mut files);
+    }
+    files.iter().any(|f| {
+        fs::canonicalize(f).ok() != me && resolve_theme_display_name(f).as_deref() == Some(name)
+    })
 }
 
 /// Three-tier apply, best-to-worst:
 ///   1. IThemeManager2  — atomic, reliable, no Settings UWP, no AV-tripping broadcast.
 ///   2. ShellExecuteW(.theme) + commit_watcher — legacy. Watcher promotes to (3) on silent fail.
 ///   3. Direct registry write — flips light/dark mode but not wallpaper. Last resort.
-fn apply_theme(theme: Theme, cfg: &Config) -> Result<&'static str, Box<dyn Error>> {
-    let theme_file = resolve_theme_file(theme, cfg);
-    let configured = match theme {
-        Theme::Light => cfg.theme_day.as_deref(),
-        Theme::Dark => cfg.theme_night.as_deref(),
-    };
-    if let Some(p) = configured {
-        if Path::new(p) != theme_file {
-            // resolve_theme_file fell back to the stock theme — say so, or a
-            // typo in theme_day/theme_night is invisible.
-            log_event(&format!(
-                "{} theme_path_missing target={} path=\"{}\" using=\"{}\"",
-                Local::now().to_rfc3339(),
-                theme_str(Some(theme)),
-                sanitize_log_msg(p),
-                sanitize_log_msg(&theme_file.to_string_lossy()),
-            ));
-        }
+///
+/// Takes the slot as resolved by the caller (`resolve_slot`), so the modes
+/// the caller decided against are the modes of the file applied here.
+fn apply_theme(slot: &Slot) -> Result<&'static str, Box<dyn Error>> {
+    let theme_file = &slot.file;
+    if let Some((raw, expanded, issue)) = &slot.rejected {
+        // Fell back to the stock theme — say so, or a typo / wrong file type
+        // in theme_day/theme_night is invisible.
+        log_event(&format!(
+            "{} theme_path_rejected slot={} reason={} path=\"{}\" expanded=\"{}\" using=\"{}\"",
+            Local::now().to_rfc3339(),
+            slot.theme.slot_str(),
+            issue.as_str(),
+            sanitize_log_msg(raw),
+            sanitize_log_msg(&expanded.to_string_lossy()),
+            sanitize_log_msg(&theme_file.to_string_lossy()),
+        ));
     }
 
     if theme_file.exists() {
-        match apply_via_theme_manager2(theme, &theme_file) {
+        match apply_via_theme_manager2(slot) {
             Ok(()) => return Ok("theme-manager2"),
             Err(e) => log_event(&format!(
-                "{} theme_manager2_err target={} msg=\"{}\"",
+                "{} theme_manager2_err target={} slot={} msg=\"{}\"",
                 Local::now().to_rfc3339(),
-                theme_str(Some(theme)),
+                modes_str(Some(slot.modes)),
+                slot.theme.slot_str(),
                 sanitize_log_msg(&e.to_string()),
             )),
         }
     }
 
-    if theme_file.exists() && apply_theme_file(&theme_file) {
-        start_commit_watcher(theme);
+    let pre = read_modes();
+    if theme_file.exists() && apply_theme_file(theme_file) {
+        start_commit_watcher(slot, pre);
         start_settings_closer();
         std::thread::sleep(Duration::from_millis(300));
         poke_shell();
         return Ok("theme-file");
     }
 
-    write_theme_registry(theme)?;
+    write_theme_registry(slot.modes)?;
     broadcast_setting_change();
     poke_shell();
     Ok("registry")
@@ -1873,6 +2508,76 @@ fn arm(
     )));
 }
 
+const TRAY_TOOLTIP: &str = "WinThemeSwitcher";
+/// Delay between tray-registration probes, and how many to make (~2 min).
+const TRAY_PROBE_DELAY: Duration = Duration::from_secs(20);
+const TRAY_PROBE_ATTEMPTS: u32 = 6;
+
+/// Whether the icon is registered with the taskbar: NIM_MODIFY (what
+/// set_tooltip sends) fails for an icon the taskbar doesn't have. Needed
+/// because tray-icon (0.21+) ignores a failed NIM_ADD in build() and waits
+/// for TaskbarCreated — fine when Explorer isn't up yet, but a taskbar that
+/// is up and rejects the add would otherwise leave the app running with no
+/// icon and no trace.
+fn tray_registered(tray: &TrayIcon) -> bool {
+    tray.set_tooltip(Some(TRAY_TOOLTIP)).is_ok()
+}
+
+fn schedule_tray_probe(attempt: u32) {
+    std::thread::spawn(move || {
+        std::thread::sleep(TRAY_PROBE_DELAY);
+        if let Some(proxy) = EVENT_PROXY.get() {
+            let _ = proxy.send_event(AppEvent::TrayProbe(attempt));
+        }
+    });
+}
+
+/// A tray-registration box is already on screen.
+static TRAY_BOX_OPEN: AtomicBool = AtomicBool::new(false);
+
+/// Runs on the main thread (TrayIcon is not Send). If the icon still isn't
+/// registered, has tray-icon redo its own remove + add — the same thing it
+/// does when Explorer restarts — and checks again; after the last attempt,
+/// says so in a box instead of running invisibly.
+fn handle_tray_probe(tray: &TrayIcon, attempt: u32) {
+    let now = || Local::now().to_rfc3339();
+    if tray_registered(tray) {
+        log_event(&format!("{} tray_registered attempt={}", now(), attempt));
+        return;
+    }
+    let msg = wide("TaskbarCreated");
+    unsafe {
+        let id = RegisterWindowMessageW(msg.as_ptr());
+        if id != 0 {
+            SendMessageW(tray.window_handle(), id, 0, 0);
+        }
+    }
+    let ok = tray_registered(tray);
+    log_event(&format!(
+        "{} tray_register_retry attempt={} ok={}",
+        now(),
+        attempt,
+        ok
+    ));
+    if ok {
+        return;
+    }
+    if attempt < TRAY_PROBE_ATTEMPTS {
+        schedule_tray_probe(attempt + 1);
+        return;
+    }
+    log_event(&format!("{} tray_register_failed", now()));
+    show_warning_async(
+        &TRAY_BOX_OPEN,
+        "WinThemeSwitcher — No tray icon",
+        "WinThemeSwitcher is running and still switches the theme at sunrise and \
+         sunset, but Windows didn't accept its notification-area icon, so its menu \
+         isn't reachable.\n\nThe icon is added automatically when the taskbar \
+         restarts: restart Windows Explorer (Task Manager), or sign out and back in."
+            .to_string(),
+    );
+}
+
 fn make_tray_icon() -> Option<tray_icon::Icon> {
     const SIZE: u32 = 32;
     let mut rgba = vec![0u8; (SIZE * SIZE * 4) as usize];
@@ -1917,7 +2622,11 @@ fn tick(cfg: &Config, elwt: &ActiveEventLoop, kind: TickKind, cause: &str, state
 
     let now_utc = now.with_timezone(&Utc);
     let (want, next_utc) = schedule(now_utc, cfg.latitude, cfg.longitude);
-    let current = current_theme();
+    let day = resolve_slot(Theme::Light, cfg);
+    let night = resolve_slot(Theme::Dark, cfg);
+    let decidable = sync_decidable_logged(&day, &night);
+    let slot = if want == Theme::Light { &day } else { &night };
+    let current = read_modes();
     let next = next_utc.with_timezone(&Local);
 
     // A clock step since the PRE-tick mark is consumed by THIS tick (the
@@ -1940,10 +2649,11 @@ fn tick(cfg: &Config, elwt: &ActiveEventLoop, kind: TickKind, cause: &str, state
     let action = decide_tick(
         kind,
         current,
-        want,
+        slot.modes,
         now_utc,
         next_utc,
         clock_stepped_back,
+        decidable,
         state,
     );
 
@@ -1958,9 +2668,10 @@ fn tick(cfg: &Config, elwt: &ActiveEventLoop, kind: TickKind, cause: &str, state
                 state.retry_baseline = None;
                 state.episode_next = None;
             }
-            match apply_theme(want, cfg) {
+            match apply_theme(slot) {
                 Ok(method) => {
                     note_reconciled(state, next_utc);
+                    note_applied_slot(want);
                     format!("applied={}", method)
                 }
                 Err(e) => {
@@ -1968,8 +2679,10 @@ fn tick(cfg: &Config, elwt: &ActiveEventLoop, kind: TickKind, cause: &str, state
                     // waiting up to ~12 h for the next transition. The retry
                     // arrives as a normal ResumeTimeReached tick; the
                     // pending-retry gate in decide_tick stands it down if
-                    // the user changes the theme in the meantime.
-                    if note_apply_failed(state, current, next_utc) {
+                    // the user changes the theme in the meantime. The
+                    // baseline is read NOW, after the failure, so a partial
+                    // effect of this apply never reads as the user's move.
+                    if note_apply_failed(state, read_modes(), next_utc) {
                         retry_note = format!(" retry={}", state.retry_count);
                         deadline = retry_deadline(Local::now(), next);
                     } else {
@@ -1997,11 +2710,12 @@ fn tick(cfg: &Config, elwt: &ActiveEventLoop, kind: TickKind, cause: &str, state
     // (theme_manager2_apply, theme_manager2_err) mid-tick, and reusing the
     // tick-start timestamp here made this summary line sort before them.
     log_event(&format!(
-        "{} cause={} current={} target={} {}{} next={}",
+        "{} cause={} current={} target={}{} {}{} next={}",
         Local::now().to_rfc3339(),
         cause,
-        theme_str(current),
-        theme_str(Some(want)),
+        modes_str(current),
+        modes_str(Some(slot.modes)),
+        slot_note(slot, decidable),
         outcome,
         retry_note,
         deadline.to_rfc3339(),
@@ -2034,7 +2748,9 @@ unsafe extern "system" fn wake_window_proc(
 /// PBT_APMRESUMEAUTOMATIC matters: the system sends it on EVERY resume
 /// (PBT_APMRESUMESUSPEND follows only after user input, and would just be a
 /// duplicate, idempotent wake). Note this wake can run while the session is
-/// still at the lock screen; the unlock that follows is then a SkipInSync.
+/// still at the lock screen; the unlock that follows is then a no-op
+/// (SkipInSync — or SkipOverride when sync is undecidable or an override is
+/// being preserved).
 unsafe extern "system" fn power_callback(
     _context: *const c_void,
     kind: u32,
@@ -2236,8 +2952,9 @@ fn main() {
         std::process::exit(0);
     }
     if let Err(e) = run() {
-        // Fail loudly: tray creation racing the taskbar at login, event-loop
-        // build errors, and event-loop death all used to be silent exits.
+        // Fail loudly: tray-window creation, event-loop build errors, and
+        // event-loop death all used to be silent exits. (A taskbar that isn't
+        // up yet no longer fails build() — see tray_registered.)
         let msg = sanitize_log_msg(&e.to_string());
         log_event(&format!(
             "{} fatal_error msg=\"{}\"",
@@ -2289,6 +3006,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             cfg
         }
     };
+    report_theme_path_problems(&cfg);
 
     let event_loop = EventLoop::<AppEvent>::with_user_event().build()?;
     let proxy = event_loop.create_proxy();
@@ -2310,11 +3028,20 @@ fn run() -> Result<(), Box<dyn Error>> {
 
     let mut tray_builder = TrayIconBuilder::new()
         .with_menu(Box::new(tray_menu))
-        .with_tooltip("WinThemeSwitcher");
+        .with_tooltip(TRAY_TOOLTIP);
     if let Some(icon) = make_tray_icon() {
         tray_builder = tray_builder.with_icon(icon);
     }
-    let _tray = tray_builder.build()?;
+    let tray = tray_builder.build()?;
+    if !tray_registered(&tray) {
+        // Expected at an early login (Explorer not up yet): tray-icon adds
+        // the icon itself when the taskbar broadcasts TaskbarCreated.
+        log_event(&format!(
+            "{} tray_register_pending attempt=0",
+            Local::now().to_rfc3339(),
+        ));
+        schedule_tray_probe(1);
+    }
 
     MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
         let _ = proxy.send_event(AppEvent::Menu(event.id));
@@ -2375,6 +3102,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             };
             tick(&cfg, elwt, TickKind::Wake, cause, &mut state);
         }
+        Event::UserEvent(AppEvent::TrayProbe(attempt)) => handle_tray_probe(&tray, attempt),
         Event::UserEvent(AppEvent::Menu(id)) => {
             if id == quit_id {
                 elwt.exit();
@@ -2392,17 +3120,37 @@ fn run() -> Result<(), Box<dyn Error>> {
                 // pending-retry gate stands the retry down; a SECOND toggle
                 // lands back on the baseline, which the gate can't tell from
                 // the original failure, so the retry proceeds (known gap).
-                let before = current_theme();
-                let target = toggle_target(before);
-                let outcome = match apply_theme(target, &cfg) {
-                    Ok(method) => format!("applied={}", method),
+                let day = resolve_slot(Theme::Light, &cfg);
+                let night = resolve_slot(Theme::Dark, &cfg);
+                let decidable = sync_decidable_logged(&day, &night);
+                let before = read_modes();
+                let fallback = if cfg.has_location() {
+                    schedule(Utc::now(), cfg.latitude, cfg.longitude).0
+                } else {
+                    Theme::Light
+                };
+                let target = toggle_target(
+                    before,
+                    day.modes,
+                    night.modes,
+                    decidable,
+                    last_applied_slot(),
+                    fallback,
+                );
+                let slot = if target == Theme::Light { &day } else { &night };
+                let outcome = match apply_theme(slot) {
+                    Ok(method) => {
+                        note_applied_slot(target);
+                        format!("applied={}", method)
+                    }
                     Err(e) => format!("err=\"{}\"", sanitize_log_msg(&e.to_string())),
                 };
                 log_event(&format!(
-                    "{} cause=toggle current={} target={} {}",
+                    "{} cause=toggle current={} target={}{} {}",
                     Local::now().to_rfc3339(),
-                    theme_str(before),
-                    theme_str(Some(target)),
+                    modes_str(before),
+                    modes_str(Some(slot.modes)),
+                    slot_note(slot, decidable),
                     outcome,
                 ));
             } else if id == refresh_id {
@@ -2418,6 +3166,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                                 persist_config(&cfg);
                             }
                         }
+                        report_theme_path_problems(&cfg);
                     }
                 }
                 // Refresh re-asserting the Run value from the (possibly
@@ -3146,10 +3895,11 @@ mod tests {
 
     // --- tick decision: manual-override preservation (v0.4.0) ---
 
-    /// decide_tick with a schedule `next` that doesn't invoke the
+    /// decide_tick for stock-like slots (plain light/dark modes that tell the
+    /// slots apart) with a schedule `next` that doesn't invoke the
     /// backward-step frame rule (it equals the recorded transition, as on any
-    /// tick with an unstepped clock). Frame-rule tests call decide_tick
-    /// directly.
+    /// tick with an unstepped clock). Frame-rule and mixed-modes tests call
+    /// decide_tick directly.
     fn dt(
         kind: TickKind,
         current: Option<Theme>,
@@ -3157,11 +3907,42 @@ mod tests {
         now: DateTime<Utc>,
         s: &TickState,
     ) -> TickAction {
+        dtm(kind, current.map(Modes::from), target.into(), now, true, s)
+    }
+
+    /// dt with explicit modes and decidability.
+    fn dtm(
+        kind: TickKind,
+        current: Option<Modes>,
+        target: Modes,
+        now: DateTime<Utc>,
+        decidable: bool,
+        s: &TickState,
+    ) -> TickAction {
         let next = s
             .reconciled_next
             .filter(|&n| n > now)
             .unwrap_or(now + chrono::Duration::hours(12));
-        decide_tick(kind, current, target, now, next, false, s)
+        decide_tick(kind, current, target, now, next, false, decidable, s)
+    }
+
+    /// Shorthand for a Modes value.
+    fn md(apps_light: bool, system_light: bool) -> Modes {
+        Modes {
+            apps_light,
+            system_light,
+        }
+    }
+
+    /// A resolved slot with the given modes (the file is never read).
+    fn slot(theme: Theme, modes: Modes, keyed: bool) -> Slot {
+        Slot {
+            theme,
+            file: PathBuf::from("unused.theme"),
+            modes,
+            keyed,
+            rejected: None,
+        }
     }
 
     /// A reconciled state whose recorded next transition is at `next`.
@@ -3295,10 +4076,121 @@ mod tests {
 
     #[test]
     fn toggle_target_flips_current_and_defaults_dark() {
-        assert_eq!(toggle_target(Some(Theme::Light)), Theme::Dark);
-        assert_eq!(toggle_target(Some(Theme::Dark)), Theme::Light);
-        // Unreadable current: base defaults to Light → toggle lands on Dark.
-        assert_eq!(toggle_target(None), Theme::Dark);
+        let (l, d) = (Modes::from(Theme::Light), Modes::from(Theme::Dark));
+        let tt = |screen| toggle_target(screen, l, d, true, None, Theme::Light);
+        assert_eq!(tt(Some(l)), Theme::Dark);
+        assert_eq!(tt(Some(d)), Theme::Light);
+        // Unreadable screen, nothing applied yet, no location (fallback day):
+        // lands on Dark, as before v0.5.0.
+        assert_eq!(tt(None), Theme::Dark);
+    }
+
+    #[test]
+    fn toggle_target_table_with_mixed_and_undecidable_slots() {
+        // Day theme = light apps + dark taskbar; night = all dark.
+        let day = md(true, false);
+        let night = md(false, false);
+        let tt = |screen, last| toggle_target(screen, day, night, true, last, Theme::Light);
+        assert_eq!(tt(Some(day), None), Theme::Dark);
+        assert_eq!(tt(Some(night), None), Theme::Light);
+        // Neither slot on screen (some other theme): the apps mode decides.
+        assert_eq!(tt(Some(md(true, true)), None), Theme::Dark);
+        assert_eq!(tt(Some(md(false, true)), None), Theme::Light);
+        // Decidable slots still ignore last_applied when the screen reads.
+        assert_eq!(tt(Some(day), Some(Theme::Dark)), Theme::Dark);
+        // Unreadable screen: flip what was last applied, else the fallback.
+        assert_eq!(tt(None, Some(Theme::Dark)), Theme::Light);
+        assert_eq!(
+            toggle_target(None, day, night, true, None, Theme::Dark),
+            Theme::Light
+        );
+    }
+
+    #[test]
+    fn toggle_alternates_when_the_slots_share_modes() {
+        // Two light-mode themes differing only in wallpaper: the screen can't
+        // say which is on, so two presses must go A → B → A, not B → B.
+        let l = Modes::from(Theme::Light);
+        let mut last = Some(Theme::Light);
+        let mut seen = Vec::new();
+        for _ in 0..3 {
+            let t = toggle_target(Some(l), l, l, false, last, Theme::Light);
+            seen.push(t);
+            last = Some(t);
+        }
+        assert_eq!(seen, [Theme::Dark, Theme::Light, Theme::Dark]);
+        // Nothing applied yet: flip the schedule's current slot.
+        assert_eq!(
+            toggle_target(Some(l), l, l, false, None, Theme::Dark),
+            Theme::Light
+        );
+    }
+
+    #[test]
+    fn sync_is_decidable_only_for_keyed_distinct_slots() {
+        let (l, d) = (Modes::from(Theme::Light), Modes::from(Theme::Dark));
+        let day = |m, k| slot(Theme::Light, m, k);
+        let night = |m, k| slot(Theme::Dark, m, k);
+        assert!(sync_decidable(&day(l, true), &night(d, true)));
+        assert!(sync_decidable(
+            &day(md(true, false), true),
+            &night(md(false, false), true)
+        ));
+        // Identical modes (wallpaper-only difference).
+        assert!(!sync_decidable(&day(l, true), &night(l, true)));
+        // A slot whose file doesn't declare its modes (high contrast).
+        assert!(!sync_decidable(&day(l, true), &night(d, false)));
+        assert!(!sync_decidable(&day(l, false), &night(d, true)));
+    }
+
+    #[test]
+    fn modes_from_parses_both_keys_and_defaults_per_value() {
+        let (l, d) = (Theme::Light, Theme::Dark);
+        assert_eq!(
+            modes_from(l, Some("Light"), Some("Light")),
+            (md(true, true), true)
+        );
+        assert_eq!(
+            modes_from(d, Some(" dark "), Some("LIGHT")),
+            (md(true, false), true)
+        );
+        // Absent / empty / unknown values take the SLOT's default, each
+        // value independently, and mark the slot as guessed.
+        assert_eq!(modes_from(l, None, None), (md(true, true), false));
+        assert_eq!(modes_from(d, None, None), (md(false, false), false));
+        assert_eq!(modes_from(d, Some("Light"), None), (md(false, true), false));
+        assert_eq!(
+            modes_from(l, Some(""), Some("Dark")),
+            (md(false, true), false)
+        );
+        assert_eq!(
+            modes_from(d, Some("Dim"), Some("Dark")),
+            (md(false, false), false)
+        );
+    }
+
+    #[test]
+    fn modes_log_form_has_no_separators_inside() {
+        assert_eq!(modes_str(None), "unknown");
+        assert_eq!(modes_str(Some(md(true, true))), "light");
+        assert_eq!(modes_str(Some(md(false, false))), "dark");
+        assert_eq!(modes_str(Some(md(true, false))), "apps-light/system-dark");
+        assert_eq!(modes_str(Some(md(false, true))), "apps-dark/system-light");
+    }
+
+    #[test]
+    fn slot_note_only_speaks_up_when_modes_dont_name_the_slot() {
+        let (l, d) = (Modes::from(Theme::Light), Modes::from(Theme::Dark));
+        assert_eq!(slot_note(&slot(Theme::Light, l, true), true), "");
+        assert_eq!(slot_note(&slot(Theme::Dark, d, true), true), "");
+        assert_eq!(
+            slot_note(&slot(Theme::Light, md(true, false), true), true),
+            " slot=day"
+        );
+        assert_eq!(
+            slot_note(&slot(Theme::Dark, l, true), false),
+            " slot=night sync=undecidable"
+        );
     }
 
     #[test]
@@ -3344,7 +4236,7 @@ mod tests {
         );
         assert!(note_apply_failed(
             &mut s,
-            Some(Theme::Light),
+            Some(Theme::Light.into()),
             utc(2026, 7, 5, 2, 35, 0)
         ));
         let unlock_at = utc(2026, 7, 4, 17, 0, 10);
@@ -3370,7 +4262,7 @@ mod tests {
         let mut s = reconciled_at(sunset);
         assert!(note_apply_failed(
             &mut s,
-            Some(Theme::Light),
+            Some(Theme::Light.into()),
             utc(2026, 7, 5, 2, 35, 0)
         ));
         // The user picks Dark (via Toggle or Settings), moving the screen off
@@ -3421,7 +4313,11 @@ mod tests {
         let sunset = utc(2026, 7, 4, 15, 46, 5);
         let sunrise = utc(2026, 7, 5, 2, 35, 0);
         let mut s = reconciled_at(sunset);
-        assert!(note_apply_failed(&mut s, Some(Theme::Light), sunrise));
+        assert!(note_apply_failed(
+            &mut s,
+            Some(Theme::Light.into()),
+            sunrise
+        ));
         let next_morning = utc(2026, 7, 5, 6, 0, 0);
         assert_eq!(
             dt(
@@ -3442,7 +4338,7 @@ mod tests {
         // override" that is really the failure.
         let sunset = utc(2026, 7, 4, 15, 46, 5);
         let mut s = reconciled_at(sunset);
-        assert!(note_apply_failed(&mut s, Some(Theme::Dark), sunset));
+        assert!(note_apply_failed(&mut s, Some(Theme::Dark.into()), sunset));
         let unlock_at = utc(2026, 7, 4, 12, 0, 30);
         assert_eq!(
             dt(
@@ -3464,7 +4360,7 @@ mod tests {
         let mut s = reconciled_at(sunset);
         assert!(note_apply_failed(
             &mut s,
-            Some(Theme::Light),
+            Some(Theme::Light.into()),
             utc(2026, 7, 5, 2, 35, 0)
         ));
         let now = utc(2026, 7, 4, 16, 0, 0);
@@ -3510,7 +4406,7 @@ mod tests {
     fn early_scheduled_fire_does_not_block_a_pending_retry() {
         let sunset = utc(2026, 7, 4, 15, 46, 5);
         let mut s = reconciled_at(sunset);
-        assert!(note_apply_failed(&mut s, Some(Theme::Dark), sunset));
+        assert!(note_apply_failed(&mut s, Some(Theme::Dark.into()), sunset));
         let retry_at = utc(2026, 7, 4, 12, 1, 0);
         assert_eq!(
             dt(
@@ -3662,10 +4558,11 @@ mod tests {
         assert_eq!(
             decide_tick(
                 TickKind::Scheduled,
-                Some(Theme::Dark),
-                Theme::Light,
+                Some(Theme::Dark.into()),
+                Theme::Light.into(),
                 real_now,
                 sunset,
+                true,
                 true,
                 &s
             ),
@@ -3676,11 +4573,12 @@ mod tests {
         assert_eq!(
             decide_tick(
                 TickKind::Wake,
-                Some(Theme::Dark),
-                Theme::Light,
+                Some(Theme::Dark.into()),
+                Theme::Light.into(),
                 real_now,
                 tomorrow_sunrise,
                 false,
+                true,
                 &s
             ),
             TickAction::SkipOverride
@@ -3720,7 +4618,16 @@ mod tests {
         for next in [sunset, sunset - chrono::Duration::seconds(30)] {
             for kind in [TickKind::Wake, TickKind::Scheduled] {
                 assert_eq!(
-                    decide_tick(kind, Some(Theme::Dark), Theme::Light, now, next, true, &s),
+                    decide_tick(
+                        kind,
+                        Some(Theme::Dark.into()),
+                        Theme::Light.into(),
+                        now,
+                        next,
+                        true,
+                        true,
+                        &s
+                    ),
                     TickAction::SkipOverride,
                     "kind {kind:?}, next {next}"
                 );
@@ -3741,11 +4648,12 @@ mod tests {
         assert_eq!(
             decide_tick(
                 TickKind::Wake,
-                Some(Theme::Light),
-                Theme::Dark,
+                Some(Theme::Light.into()),
+                Theme::Dark.into(),
                 now,
                 earlier_next,
                 false,
+                true,
                 &s
             ),
             TickAction::SkipOverride
@@ -3760,9 +4668,9 @@ mod tests {
         let sunset = utc(2026, 7, 4, 15, 46, 5);
         let mut s = reconciled_at(sunset);
         for _ in 0..MAX_APPLY_RETRIES {
-            assert!(note_apply_failed(&mut s, Some(Theme::Dark), sunset));
+            assert!(note_apply_failed(&mut s, Some(Theme::Dark.into()), sunset));
         }
-        assert!(!note_apply_failed(&mut s, Some(Theme::Dark), sunset));
+        assert!(!note_apply_failed(&mut s, Some(Theme::Dark.into()), sunset));
         let later = utc(2026, 7, 4, 10, 0, 0);
         assert_eq!(
             dt(TickKind::Wake, Some(Theme::Dark), Theme::Light, later, &s),
@@ -3777,7 +4685,7 @@ mod tests {
         let mut s = reconciled_at(sunset);
         assert!(note_apply_failed(
             &mut s,
-            Some(Theme::Light),
+            Some(Theme::Light.into()),
             utc(2026, 7, 5, 2, 35, 0)
         ));
         let retry_at = utc(2026, 7, 4, 16, 47, 5);
@@ -3795,29 +4703,29 @@ mod tests {
         // inheriting a permanently burned one.
         assert!(note_apply_failed(
             &mut s,
-            Some(Theme::Light),
+            Some(Theme::Light.into()),
             utc(2026, 7, 5, 2, 35, 0)
         ));
         assert!(note_apply_failed(
             &mut s,
-            Some(Theme::Light),
+            Some(Theme::Light.into()),
             utc(2026, 7, 5, 2, 35, 0)
         ));
         assert!(note_apply_failed(
             &mut s,
-            Some(Theme::Light),
+            Some(Theme::Light.into()),
             utc(2026, 7, 5, 2, 35, 0)
         ));
         assert!(!note_apply_failed(
             &mut s,
-            Some(Theme::Light),
+            Some(Theme::Light.into()),
             utc(2026, 7, 5, 2, 35, 0)
         ));
         assert_eq!(s.retry_count, 0);
         assert_eq!(s.retry_baseline, None);
         assert!(note_apply_failed(
             &mut s,
-            Some(Theme::Light),
+            Some(Theme::Light.into()),
             utc(2026, 7, 5, 2, 35, 0)
         ));
     }
@@ -3826,11 +4734,317 @@ mod tests {
     fn reconcile_clears_retry_episode() {
         let next = utc(2026, 7, 5, 2, 35, 0);
         let mut s = TickState::new();
-        assert!(note_apply_failed(&mut s, Some(Theme::Light), next));
+        assert!(note_apply_failed(&mut s, Some(Theme::Light.into()), next));
         note_reconciled(&mut s, next);
         assert_eq!(s.retry_count, 0);
         assert_eq!(s.retry_baseline, None);
         assert_eq!(s.reconciled_next, Some(next));
+    }
+
+    // --- two-value modes (v0.5.0) ---
+
+    #[test]
+    fn partial_registry_write_is_retried_not_mistaken_for_the_user() {
+        // THE v0.5.0 design-review blocker. Sunset, target dark/dark from
+        // light/light: tiers 1-2 fail, tier 3 flips Apps then fails on
+        // System. The baseline is read AFTER the failure (apps dark, system
+        // light), so the retry sees no move and re-applies.
+        let sunset = utc(2026, 7, 4, 15, 46, 5);
+        let sunrise = utc(2026, 7, 5, 2, 35, 0);
+        let mut s = reconciled_at(sunset);
+        let target = md(false, false);
+        let half = md(false, true);
+        assert!(note_apply_failed(&mut s, Some(half), sunrise));
+        let retry_at = utc(2026, 7, 4, 15, 47, 5);
+        assert_eq!(
+            dtm(TickKind::Scheduled, Some(half), target, retry_at, true, &s),
+            TickAction::Apply
+        );
+        // A mixed target reached by the partial write (only Apps had to
+        // change, System's write "failed" re-writing the same value): the
+        // retry finds the screen in sync.
+        let mixed = md(false, true);
+        let mut s = reconciled_at(sunset);
+        assert!(note_apply_failed(&mut s, Some(mixed), sunrise));
+        assert_eq!(
+            dtm(TickKind::Scheduled, Some(mixed), mixed, retry_at, true, &s),
+            TickAction::SkipInSync
+        );
+    }
+
+    #[test]
+    fn a_one_value_move_during_a_retry_is_an_intervention() {
+        let sunset = utc(2026, 7, 4, 15, 46, 5);
+        let mut s = reconciled_at(sunset);
+        assert!(note_apply_failed(
+            &mut s,
+            Some(md(true, true)),
+            utc(2026, 7, 5, 2, 35, 0)
+        ));
+        // The user switched only the apps mode in Settings.
+        assert_eq!(
+            dtm(
+                TickKind::Scheduled,
+                Some(md(false, true)),
+                md(false, false),
+                utc(2026, 7, 4, 15, 47, 5),
+                true,
+                &s
+            ),
+            TickAction::CancelRetry
+        );
+    }
+
+    #[test]
+    fn mixed_target_needs_both_values_to_match() {
+        // Day theme = light apps, dark taskbar.
+        let day = md(true, false);
+        let sunset = utc(2026, 7, 4, 15, 46, 5);
+        let s = reconciled_at(sunset);
+        let noon = utc(2026, 7, 4, 9, 0, 0);
+        assert_eq!(
+            dtm(TickKind::Wake, Some(day), day, noon, true, &s),
+            TickAction::SkipInSync
+        );
+        // One value off inside the window: an override, preserved...
+        assert_eq!(
+            dtm(TickKind::Wake, Some(md(true, true)), day, noon, true, &s),
+            TickAction::SkipOverride
+        );
+        // ...and reconciled once a transition has passed.
+        assert_eq!(
+            dtm(
+                TickKind::Scheduled,
+                Some(md(true, true)),
+                md(false, false),
+                sunset,
+                true,
+                &s
+            ),
+            TickAction::Apply
+        );
+    }
+
+    #[test]
+    fn undecidable_sync_never_skips_as_in_sync_but_still_preserves_and_stands_down() {
+        // Two light-mode themes (wallpaper-only difference): matching modes
+        // prove nothing, so Init re-applies; everything else works as usual.
+        let l = md(true, true);
+        let sunset = utc(2026, 7, 4, 15, 46, 5);
+        let sunrise = utc(2026, 7, 5, 2, 35, 0);
+        let noon = utc(2026, 7, 4, 9, 0, 0);
+        let mut s = TickState::new();
+        assert_eq!(
+            dtm(TickKind::Init, Some(l), l, noon, false, &s),
+            TickAction::Apply
+        );
+        note_reconciled(&mut s, sunset);
+        // A wake inside the window is left alone (no transition passed).
+        assert_eq!(
+            dtm(TickKind::Wake, Some(l), l, noon, false, &s),
+            TickAction::SkipOverride
+        );
+        // The transition applies.
+        assert_eq!(
+            dtm(TickKind::Scheduled, Some(l), l, sunset, false, &s),
+            TickAction::Apply
+        );
+        // A failed apply, then the user visibly picks a dark theme: the
+        // retry stands down — the evidence is real even though sync isn't
+        // decidable.
+        assert!(note_apply_failed(&mut s, Some(l), sunrise));
+        assert_eq!(
+            dtm(
+                TickKind::Scheduled,
+                Some(md(false, false)),
+                l,
+                sunset + mins(1),
+                false,
+                &s
+            ),
+            TickAction::CancelRetry
+        );
+    }
+
+    #[test]
+    fn slot_modes_come_from_the_visualstyles_section_of_the_applied_file() {
+        let t = TempTheme::new(
+            "modes-mixed",
+            b"[Theme]\r\nSystemMode=Light\r\n[VisualStyles]\r\nsystemmode = Dark\r\nAppMode=Light\r\n",
+        );
+        let cfg = Config {
+            theme_day: Some(t.0.to_string_lossy().into_owned()),
+            ..Config::default()
+        };
+        let slot = resolve_slot(Theme::Light, &cfg);
+        assert_eq!(slot.file, t.0);
+        assert_eq!(slot.modes, md(true, false));
+        assert!(slot.keyed);
+        assert!(slot.rejected.is_none());
+    }
+
+    #[test]
+    fn slot_modes_read_utf16_files_and_default_when_keys_are_missing() {
+        let text = "[VisualStyles]\r\nSystemMode=Dark\r\nAppMode=Dark\r\n";
+        let mut bytes = vec![0xFF, 0xFE];
+        for u in text.encode_utf16() {
+            bytes.extend_from_slice(&u.to_le_bytes());
+        }
+        let t16 = TempTheme::new("modes-utf16", &bytes);
+        let keyless = TempTheme::new("modes-keyless", b"[Theme]\r\nDisplayName=HC-like\r\n");
+        let cfg = Config {
+            theme_day: Some(t16.0.to_string_lossy().into_owned()),
+            theme_night: Some(keyless.0.to_string_lossy().into_owned()),
+            ..Config::default()
+        };
+        let day = resolve_slot(Theme::Light, &cfg);
+        assert_eq!((day.modes, day.keyed), (md(false, false), true));
+        let night = resolve_slot(Theme::Dark, &cfg);
+        assert_eq!((night.modes, night.keyed), (md(false, false), false));
+        assert!(!sync_decidable(&day, &night));
+    }
+
+    #[test]
+    fn a_rejected_path_takes_the_stock_files_modes_not_the_configured_ones() {
+        // The configured file declares light/light but is a .themepack, so
+        // the stock night theme is applied — the target must be ITS modes.
+        let pack =
+            std::env::temp_dir().join(format!("wts-test-{}-modes.themepack", std::process::id()));
+        fs::write(
+            &pack,
+            b"[VisualStyles]\r\nSystemMode=Light\r\nAppMode=Light\r\n",
+        )
+        .unwrap();
+        let cfg = Config {
+            theme_night: Some(pack.to_string_lossy().into_owned()),
+            ..Config::default()
+        };
+        let slot = resolve_slot(Theme::Dark, &cfg);
+        let _ = fs::remove_file(&pack);
+        assert_eq!(slot.file, stock_theme_file(Theme::Dark));
+        assert!(slot.rejected.is_some());
+        let stock = read_theme_ini(&slot.file, "VisualStyles", "SystemMode").flatten();
+        let app = read_theme_ini(&slot.file, "VisualStyles", "AppMode").flatten();
+        assert_eq!(
+            (slot.modes, slot.keyed),
+            modes_from(Theme::Dark, stock.as_deref(), app.as_deref())
+        );
+    }
+
+    #[test]
+    fn stock_themes_declare_their_modes() {
+        // Guarded like the indirect-string test. Values are not asserted:
+        // Windows 10's default theme is mixed (dark taskbar, light apps).
+        for theme in [Theme::Light, Theme::Dark] {
+            let f = stock_theme_file(theme);
+            if !f.exists() {
+                eprintln!("SKIP: {} absent", f.display());
+                continue;
+            }
+            let slot = resolve_slot(theme, &Config::default());
+            assert!(slot.keyed, "{} lacks SystemMode/AppMode", f.display());
+        }
+    }
+
+    // --- tier-1 name matching (v0.5.0) ---
+
+    #[test]
+    fn pick_theme_index_table() {
+        let n = "Night";
+        // Windows' own theme: first match, even with duplicates or a
+        // same-named custom file elsewhere.
+        assert_eq!(pick_theme_index(&[3], true, false, n), Ok(3));
+        assert_eq!(pick_theme_index(&[3, 9], true, true, n), Ok(3));
+        assert!(pick_theme_index(&[], true, false, n).is_err());
+        // Custom theme: exactly one match and a unique name, or decline.
+        assert_eq!(pick_theme_index(&[4], false, false, n), Ok(4));
+        assert!(pick_theme_index(&[], false, false, n).is_err());
+        assert!(pick_theme_index(&[4, 7], false, false, n).is_err());
+        assert!(pick_theme_index(&[4], false, true, n).is_err());
+    }
+
+    /// A temp folder of .theme files, removed on drop.
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(name: &str) -> Self {
+            let p = std::env::temp_dir().join(format!("wts-test-{}-{name}", std::process::id()));
+            let _ = fs::remove_dir_all(&p);
+            fs::create_dir_all(&p).unwrap();
+            Self(p)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn name_taken_elsewhere_ignores_the_configured_file_itself() {
+        let d = TempDir::new("names");
+        fs::create_dir_all(d.0.join("pack")).unwrap();
+        let mine = d.0.join("Mine.theme");
+        fs::write(&mine, b"[Theme]\r\nDisplayName=Night\r\n").unwrap();
+        fs::write(d.0.join("Other.theme"), b"[Theme]\r\nDisplayName=Day\r\n").unwrap();
+        let dirs = [(d.0.clone(), true)];
+        // Only the configured file has the name — spelled differently too.
+        assert!(!name_taken_elsewhere(&mine, "Night", &dirs));
+        let spelled = PathBuf::from(format!("{}\\.\\MINE.THEME", d.0.display()));
+        assert!(!name_taken_elsewhere(&spelled, "Night", &dirs));
+        // A saved copy in a subfolder with the same name counts...
+        fs::write(
+            d.0.join("pack\\Copy.theme"),
+            b"[Theme]\r\nDisplayName=Night\r\n",
+        )
+        .unwrap();
+        assert!(name_taken_elsewhere(&mine, "Night", &dirs));
+        // ...but not when subfolders aren't searched.
+        assert!(!name_taken_elsewhere(
+            &mine,
+            "Night",
+            &[(d.0.clone(), false)]
+        ));
+        // A no-DisplayName file is named by its stem.
+        fs::write(d.0.join("Glow.theme"), b"[Theme]\r\n").unwrap();
+        assert!(name_taken_elsewhere(&mine, "Glow", &dirs));
+    }
+
+    #[test]
+    fn windows_theme_folders_are_recognized() {
+        let root = windows_resources_dir();
+        let aero = root.join("Themes\\aero.theme");
+        if aero.exists() {
+            assert!(is_windows_theme(&aero));
+            let spelled = PathBuf::from(
+                aero.to_string_lossy()
+                    .to_ascii_uppercase()
+                    .replace("\\THEMES\\", "\\Themes\\.\\"),
+            );
+            assert!(is_windows_theme(&spelled), "{spelled:?}");
+        }
+        let hc = root.join("Ease of Access Themes\\hcblack.theme");
+        if hc.exists() {
+            assert!(is_windows_theme(&hc));
+        }
+        let t = TempTheme::new("not-windows", b"[Theme]\r\n");
+        assert!(!is_windows_theme(&t.0));
+    }
+
+    #[test]
+    fn unreadable_theme_file_is_none_not_absent() {
+        // GetPrivateProfileStringW returns the default when it can't open the
+        // file; that must not read as "DisplayName absent" (→ file stem).
+        use std::os::windows::fs::OpenOptionsExt;
+        let t = TempTheme::new("locked", b"[Theme]\r\nDisplayName=Locked\r\n");
+        let _lock = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&t.0)
+            .unwrap();
+        assert_eq!(read_theme_ini(&t.0, "Theme", "DisplayName"), None);
+        assert_eq!(resolve_theme_display_name(&t.0), None);
     }
 
     // --- .theme DisplayName resolution (v0.4.0) ---
@@ -3871,11 +5085,14 @@ mod tests {
 
     #[test]
     fn theme_display_name_only_read_from_theme_section() {
+        // A DisplayName outside [Theme] doesn't count — so the theme has no
+        // name of its own and Windows lists it under its file stem.
         let t = TempTheme::new(
             "wrong-section",
             b"[Control Panel\\Desktop]\r\nDisplayName=Nope\r\n[Slideshow]\r\nInterval=1\r\n",
         );
-        assert_eq!(resolve_theme_display_name(&t.0), None);
+        let stem = t.0.file_stem().unwrap().to_string_lossy().into_owned();
+        assert_eq!(resolve_theme_display_name(&t.0), Some(stem));
     }
 
     #[test]
@@ -3930,11 +5147,22 @@ mod tests {
     }
 
     #[test]
-    fn theme_display_name_missing_file_or_key_is_none() {
+    fn theme_display_name_missing_key_falls_back_to_the_file_stem() {
+        // What Windows does (verified by enumerating IThemeManager2 with a
+        // no-DisplayName theme installed): the name is the file stem, without
+        // ".theme". A missing file still has no name.
         let missing =
             std::env::temp_dir().join(format!("wts-test-{}-nonexistent.theme", std::process::id()));
         assert_eq!(resolve_theme_display_name(&missing), None);
         let t = TempTheme::new("no-name", b"[Theme]\r\nColor=1\r\n");
+        let stem = t.0.file_stem().unwrap().to_string_lossy().into_owned();
+        assert!(!stem.ends_with(".theme"));
+        assert_eq!(resolve_theme_display_name(&t.0), Some(stem));
+    }
+
+    #[test]
+    fn theme_display_name_present_but_empty_is_none() {
+        let t = TempTheme::new("empty-name", b"[Theme]\r\nDisplayName=\r\n");
         assert_eq!(resolve_theme_display_name(&t.0), None);
     }
 
@@ -3987,5 +5215,137 @@ mod tests {
         let cfg = Config::default();
         assert!(resolve_theme_file(Theme::Light, &cfg).ends_with("aero.theme"));
         assert!(resolve_theme_file(Theme::Dark, &cfg).ends_with("dark.theme"));
+    }
+
+    // --- theme path policy (v0.5.0) ---
+
+    #[test]
+    fn theme_paths_expand_env_vars_and_resolve_relative_to_the_exe_folder() {
+        let base = PathBuf::from("C:\\Apps\\WTS");
+        let windir = std::env::var("SystemRoot").unwrap();
+        assert_eq!(
+            expand_theme_path("%SystemRoot%\\Resources\\Themes\\dark.theme", &base),
+            PathBuf::from(&windir).join("Resources\\Themes\\dark.theme")
+        );
+        assert_eq!(
+            expand_theme_path("themes\\night.theme", &base),
+            PathBuf::from("C:\\Apps\\WTS\\themes\\night.theme")
+        );
+        // An unknown variable is left as written (and then fails as missing).
+        assert_eq!(
+            expand_theme_path("%WTS_NO_SUCH_VAR%\\x.theme", &base),
+            PathBuf::from("C:\\Apps\\WTS\\%WTS_NO_SUCH_VAR%\\x.theme")
+        );
+        assert_eq!(
+            expand_theme_path("C:\\Themes\\day.theme", &base),
+            PathBuf::from("C:\\Themes\\day.theme")
+        );
+    }
+
+    #[test]
+    fn theme_path_policy_accepts_only_theme_files() {
+        let scratch = std::env::temp_dir().join("wts-test-no-scratch.theme");
+        let ok = TempTheme::new("policy-ok", b"[Theme]\r\nDisplayName=Ok\r\n");
+        assert_eq!(check_theme_path(&ok.0, &scratch), Ok(()));
+        // Extension match is case-insensitive.
+        let upper =
+            std::env::temp_dir().join(format!("wts-test-{}-upper.THEME", std::process::id()));
+        fs::write(&upper, b"[Theme]\r\n").unwrap();
+        assert_eq!(check_theme_path(&upper, &scratch), Ok(()));
+        let _ = fs::remove_file(&upper);
+
+        let missing =
+            std::env::temp_dir().join(format!("wts-test-{}-nope.theme", std::process::id()));
+        assert_eq!(
+            check_theme_path(&missing, &scratch),
+            Err(ThemePathIssue::Missing)
+        );
+        assert_eq!(
+            check_theme_path(&std::env::temp_dir(), &scratch),
+            Err(ThemePathIssue::Directory)
+        );
+        for (ext, issue) in [
+            ("themepack", ThemePathIssue::ThemePack),
+            ("deskthemepack", ThemePathIssue::ThemePack),
+            ("exe", ThemePathIssue::NotATheme),
+            ("jpg", ThemePathIssue::NotATheme),
+        ] {
+            let p =
+                std::env::temp_dir().join(format!("wts-test-{}-policy.{ext}", std::process::id()));
+            fs::write(&p, b"x").unwrap();
+            assert_eq!(check_theme_path(&p, &scratch), Err(issue), "{ext}");
+            let _ = fs::remove_file(&p);
+        }
+        // Windows' scratch Custom.theme is refused even though it's a .theme
+        // — however the path is spelled.
+        assert_eq!(
+            check_theme_path(&ok.0, &ok.0),
+            Err(ThemePathIssue::ScratchFile)
+        );
+        let respelled = PathBuf::from(
+            ok.0.to_string_lossy()
+                .to_ascii_uppercase()
+                .replacen('\\', "\\.\\", 1),
+        );
+        assert_eq!(
+            check_theme_path(&respelled, &ok.0),
+            Err(ThemePathIssue::ScratchFile)
+        );
+        // A folder named like a theme is still a folder; the pack check is
+        // case-insensitive.
+        let d = TempDir::new("dir.theme");
+        assert_eq!(
+            check_theme_path(&d.0, &scratch),
+            Err(ThemePathIssue::Directory)
+        );
+        let pack =
+            std::env::temp_dir().join(format!("wts-test-{}-x.DeskThemePack", std::process::id()));
+        fs::write(&pack, b"x").unwrap();
+        assert_eq!(
+            check_theme_path(&pack, &scratch),
+            Err(ThemePathIssue::ThemePack)
+        );
+        let _ = fs::remove_file(&pack);
+        // Undefined variables and drive-relative paths are named as such.
+        assert_eq!(
+            check_theme_path(Path::new("C:\\Apps\\%WTS_NO_SUCH_VAR%\\x.theme"), &scratch),
+            Err(ThemePathIssue::UnexpandedVar)
+        );
+        assert_eq!(
+            check_theme_path(Path::new("C:x.theme"), &scratch),
+            Err(ThemePathIssue::NotAbsolute)
+        );
+        // ...but an existing file whose name has a %...% pair is just a file.
+        let pct = TempTheme::new("50% Dark 50%", b"[Theme]\r\n");
+        assert_eq!(check_theme_path(&pct.0, &scratch), Ok(()));
+        // Win32 ignores trailing dots: "x.theme." is the file x.theme.
+        let dotted = PathBuf::from(format!("{}.", ok.0.display()));
+        assert_eq!(check_theme_path(&dotted, &scratch), Ok(()));
+    }
+
+    #[test]
+    fn unexpanded_var_detection() {
+        assert!(has_unexpanded_var("C:\\%FOO%\\x.theme"));
+        assert!(has_unexpanded_var("%A%"));
+        assert!(!has_unexpanded_var("C:\\100%\\x.theme"));
+        assert!(!has_unexpanded_var("C:\\a%b\\c%d.theme"));
+        assert!(!has_unexpanded_var("C:\\plain\\x.theme"));
+        assert!(!has_unexpanded_var("%%"));
+    }
+
+    #[test]
+    fn rejected_theme_paths_fall_back_to_the_stock_theme_and_say_why() {
+        let pack =
+            std::env::temp_dir().join(format!("wts-test-{}-night.themepack", std::process::id()));
+        fs::write(&pack, b"MSCF").unwrap();
+        let cfg = Config {
+            theme_night: Some(pack.to_string_lossy().into_owned()),
+            ..Config::default()
+        };
+        let (file, rejected) = resolve_theme_file_checked(Theme::Dark, &cfg);
+        let _ = fs::remove_file(&pack);
+        assert!(file.ends_with("dark.theme"), "got {file:?}");
+        let (_, _, issue) = rejected.expect("rejection reported");
+        assert_eq!(issue, ThemePathIssue::ThemePack);
     }
 }

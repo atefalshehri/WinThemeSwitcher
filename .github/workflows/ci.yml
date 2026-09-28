@@ -5,19 +5,32 @@ on:
     branches: [main, master]
   pull_request:
 
+# Read-only: no workflow in this repo writes releases or pushes anything.
+# Releases are created only by scripts/release.ps1 on the maintainer's
+# machine (the signing key is local), gated on this workflow passing.
+permissions:
+  contents: read
+
 jobs:
   build:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v7
-
-      - id: toolchain
-        uses: dtolnay/rust-toolchain@stable
+      # Third-party actions are pinned by commit SHA (tags are mutable).
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
+
+      # dtolnay/rust-toolchain has no version tags; pin a commit on its
+      # master branch (the README requires master history — other branches'
+      # commits get garbage-collected) and select the toolchain by input.
+      - id: toolchain
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-09-12
+        with:
+          toolchain: stable
           components: rustfmt, clippy
 
       - name: Cache cargo
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
