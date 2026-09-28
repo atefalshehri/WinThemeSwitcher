@@ -420,7 +420,15 @@ if (-not $reuse) {
         # is not created until the draft is published.
         $out = Run gh release create $tag --repo $ownerRepo --draft --target $sha --title $tag --notes-file $header --generate-notes --notes-start-tag $NotesStartTag
         if ($rc -ne 0) { Fail 25 "gh release create failed: $errText" }
-        if ((Get-ReleaseCount 25) -ne 1) { Fail 25 "after creating the draft, $tag does not have exactly one release" }
+        # The release list lags a create by a few seconds: poll until the new
+        # draft shows up; more than one release at any point is a duplicate.
+        $n = 0
+        for ($i = 0; $i -lt 8 -and $n -ne 1; $i++) {
+            if ($i -gt 0) { Start-Sleep -Seconds 5 }
+            $n = Get-ReleaseCount 25
+            if ($n -gt 1) { Fail 25 "after creating the draft, $n releases use $tag - delete the extra drafts on GitHub" }
+        }
+        if ($n -ne 1) { Fail 25 "the new draft of $tag never appeared in the release list" }
         Write-Output "   draft created"
     }
 
