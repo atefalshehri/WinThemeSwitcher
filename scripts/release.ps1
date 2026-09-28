@@ -23,7 +23,7 @@
 # The repo has IMMUTABLE RELEASES on (required here): publishing locks the
 # assets and the tag for good and burns the version number even if the
 # release is later deleted, so a bad release is fixed by a new version only.
-#   0 preflight  gh authenticated; immutable releases enabled; clean tree;
+#   0 preflight  gh >= 2.93 and authenticated; immutable releases enabled; clean tree;
 #                Cargo.toml version; the commit's workflows are exactly
 #                ci.yml and it can neither run on a tag nor write; an
 #                existing tag must point at HEAD (and be on origin/main),
@@ -48,7 +48,7 @@
 #
 # Exit codes (disjoint from build.ps1's 1-8):
 #   20 preflight failed               25 creating/uploading the draft failed
-#   21 gh missing/unauthenticated     26 verification of the release failed
+#   21 gh missing/too old/signed out  26 verification of the release failed
 #   22 CI gate failed                 27 publishing / post-publish check failed
 #   23 release state forbids going on 28 tag creation / push failed
 #   24 build.ps1 / local assets bad   29 the commit's workflows fail the guard
@@ -258,6 +258,12 @@ $expectedAssets = @($zipName, $exeName, $cerName | Sort-Object)
 if ($NotesFile -and -not (Test-Path -LiteralPath $NotesFile -PathType Leaf)) { Fail 20 "-NotesFile $NotesFile not found" }
 
 if (-not (Get-Command gh -ErrorAction SilentlyContinue)) { Fail 21 "GitHub CLI (gh) not found" }
+# gh <= 2.92 sends the github.com token to tuf-repo.github.com during
+# `gh release verify` / `verify-asset` (GHSA-8xvp-7hj6-mcj9), which this
+# script runs after publishing.
+$ghVer = Out1 (Run gh --version)
+if ($ghVer -notmatch 'gh version (\d+\.\d+\.\d+)') { Fail 21 "cannot read the gh version ('$ghVer')" }
+if ([version]$Matches[1] -lt [version]"2.93.0") { Fail 21 "gh $($Matches[1]) is too old - upgrade to 2.93.0 or later (GHSA-8xvp-7hj6-mcj9: older versions leak the login token during release verification)" }
 $null = Run gh auth status
 if ($rc -ne 0) { Fail 21 "gh is not authenticated (run: gh auth login -h github.com -w)" }
 # 200 {"enabled":true} when on; 404 when off (or without admin access).
