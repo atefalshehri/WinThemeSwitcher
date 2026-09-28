@@ -20,10 +20,14 @@
 # A draft release is private (only collaborators see it), and the git tag is
 # created and pushed only in the publish step - so a failure before publish
 # never leaves a public tag behind that a fix-up commit could not move past.
-#   0 preflight  gh authenticated; clean tree; Cargo.toml version; the
-#                commit's workflows are exactly ci.yml and it can neither run
-#                on a tag nor write; an existing tag must point at HEAD (and
-#                be on origin/main), else HEAD must be origin/main
+# The repo has IMMUTABLE RELEASES on (required here): publishing locks the
+# assets and the tag for good and burns the version number even if the
+# release is later deleted, so a bad release is fixed by a new version only.
+#   0 preflight  gh authenticated; immutable releases enabled; clean tree;
+#                Cargo.toml version; the commit's workflows are exactly
+#                ci.yml and it can neither run on a tag nor write; an
+#                existing tag must point at HEAD (and be on origin/main),
+#                else HEAD must be origin/main
 #   1 CI gate    ci.yml passed on this exact commit (full SHA)
 #   2 state      never modify a PUBLISHED release (re-verify it read-only
 #                instead); at most one release per tag; a draft whose assets
@@ -36,7 +40,9 @@
 #                download, zip contents, zip's exe == bare exe, signatures),
 #                and only THEN point a stale draft at HEAD
 #   6 publish    only with -Publish: tag + push, publish as a normal release,
-#                mark latest, confirm /releases/latest serves it
+#                mark latest; confirm it came out immutable, that GitHub's
+#                release attestation verifies (release + exe), and that
+#                /releases/latest serves it
 # -DryRun runs 0-3 for real (all read-only checks, plus the local build and
 # local verification) and prints what 4-6 would do.
 #
@@ -128,6 +134,15 @@ function Test-ZipContents([string]$zipPath, [string]$exePath) {
     if (($entries -join "|") -ne ($want -join "|")) { return "zip contains [$($entries -join ', ')], expected [$($want -join ', ')]" }
     $inner = Join-Path $unz $exeName
     if ((Sha256 $inner) -ne (Sha256 $exePath)) { return "the exe inside the zip is not the same file as the bare exe" }
+    # The other files must be this commit's (the tree is verified clean). The
+    # text files may differ only in line endings (git autocrlf, and editors,
+    # decide those in the working tree); -cne because -ne ignores case.
+    if ((Sha256 (Join-Path $unz $cerName)) -ne (Sha256 (Join-Path $repo $cerName))) { return "$cerName inside the zip differs from the repo's at $sha" }
+    foreach ($f in @("README.md", "LICENSE")) {
+        $a = [IO.File]::ReadAllText((Join-Path $unz $f)) -replace "`r`n", "`n"
+        $b = [IO.File]::ReadAllText((Join-Path $repo $f)) -replace "`r`n", "`n"
+        if ($a -cne $b) { return "$f inside the zip differs from the repo's at $sha (ignoring line endings)" }
+    }
     foreach ($p in @($exePath, $inner)) {
         if (-not (Test-SignedExe $p)) { return "$p is not Valid + timestamped + signed by $thumbprint" }
     }
@@ -161,6 +176,7 @@ function Test-RemoteAssets($localHash) {
         if (-not (Test-Path -LiteralPath $p)) { return "download is missing $n" }
         if ((Sha256 $p) -ne $digest[$n]) { return "downloaded $n does not match its server digest" }
     }
+    if ((Sha256 (Join-Path $dl $cerName)) -ne (Sha256 (Join-Path $repo $cerName))) { return "$cerName differs from the repo's at $sha" }
     $why = Test-ZipContents (Join-Path $dl $zipName) (Join-Path $dl $exeName)
     if ($why) { return "downloaded assets: $why" }
     return ""
@@ -168,10 +184,13 @@ function Test-RemoteAssets($localHash) {
 # The release notes header: -NotesFile, or the standard one.
 function Get-HeaderText {
     if ($NotesFile) { return [IO.File]::ReadAllText((Resolve-Path -LiteralPath $NotesFile).Path) }
+    $readme = "https://github.com/$ownerRepo/blob/$tag/README.md"
     return "## WinThemeSwitcher $tag`n`n" +
-    "The exe - standalone and inside the zip - is Authenticode-signed with the project's publisher certificate " +
+    "The exe - standalone and inside the zip - is Authenticode-signed with the project's **self-signed** publisher certificate " +
     "(``CN=WinThemeSwitcher Self-Signed``, thumbprint ``$thumbprint``) and carries an RFC 3161 timestamp. " +
-    "Install and verification steps: [README](https://github.com/$ownerRepo/blob/$tag/README.md#install).`n"
+    "Importing the included ``.cer`` ([README: Install]($readme#install), step 2) makes Windows report the signature as valid; " +
+    "SmartScreen may still warn about a new self-signed app (step 3), and so may some antivirus products. " +
+    "To check the signature: [README: Verifying the signature]($readme#verifying-the-signature).`n"
 }
 # The notes must be intact; with $header (a draft created by THIS run) they
 # must also contain its first line. A reused draft's header came from the run
@@ -189,15 +208,28 @@ function Test-Body([string]$header) {
 }
 # Helpers take the exit code of the phase they are called from.
 function Get-ReleaseState([int]$code = 23) {
-    # Returns $null (no release) or @{ draft; prerelease; target; url }.
-    $l = Run gh release view $tag --repo $ownerRepo --json "isDraft,isPrerelease,targetCommitish,url" --jq "[.isDraft,.isPrerelease,.targetCommitish,.url] | @tsv"
+    # Returns $null (no release) or @{ draft; prerelease; immutable; target; url }.
+    $l = Run gh release view $tag --repo $ownerRepo --json "isDraft,isPrerelease,isImmutable,targetCommitish,url" --jq "[.isDraft,.isPrerelease,.isImmutable,.targetCommitish,.url] | @tsv"
     if ($rc -ne 0) {
         if ($errText.Trim() -eq "release not found") { return $null }
         Fail $code "gh release view failed: $errText"
     }
     $f = (Out1 $l) -split "`t"
-    if ($f.Count -ne 4) { Fail $code "unexpected gh release view output [$(Out1 $l)]" }
-    return @{ draft = ($f[0] -eq "true"); prerelease = ($f[1] -eq "true"); target = $f[2]; url = $f[3] }
+    if ($f.Count -ne 5) { Fail $code "unexpected gh release view output [$(Out1 $l)]" }
+    return @{ draft = ($f[0] -eq "true"); prerelease = ($f[1] -eq "true"); immutable = ($f[2] -eq "true"); target = $f[3]; url = $f[4] }
+}
+# GitHub's release attestation (created when an immutable release is
+# published) must verify for the release and for the exe as served.
+# Returns "" or a reason.
+function Test-Attestation {
+    $null = Run gh release verify $tag --repo $ownerRepo
+    if ($rc -ne 0) { return "gh release verify failed: $errText" }
+    $dl = New-TempDir "attest"
+    $null = Run gh release download $tag --repo $ownerRepo --pattern $exeName --dir $dl
+    if ($rc -ne 0) { return "downloading $exeName failed: $errText" }
+    $null = Run gh release verify-asset $tag (Join-Path $dl $exeName) --repo $ownerRepo
+    if ($rc -ne 0) { return "gh release verify-asset $exeName failed: $errText" }
+    return ""
 }
 function Get-ReleaseCount([int]$code = 23) {
     $l = Run gh api "repos/$ownerRepo/releases?per_page=100" --paginate --jq ".[].tag_name"
@@ -228,6 +260,12 @@ if ($NotesFile -and -not (Test-Path -LiteralPath $NotesFile -PathType Leaf)) { F
 if (-not (Get-Command gh -ErrorAction SilentlyContinue)) { Fail 21 "GitHub CLI (gh) not found" }
 $null = Run gh auth status
 if ($rc -ne 0) { Fail 21 "gh is not authenticated (run: gh auth login -h github.com -w)" }
+# 200 {"enabled":true} when on; 404 when off (or without admin access).
+$immutableOn = Out1 (Run gh api "repos/$ownerRepo/immutable-releases" --jq .enabled)
+if ($rc -ne 0 -and $errText -notmatch 'HTTP 404') { Fail 20 "cannot read the immutable-releases setting: $errText" }
+if ($rc -ne 0 -or $immutableOn -ne "true") {
+    Fail 20 "immutable releases are not enabled on $ownerRepo (Settings > General > Releases) - required, so a published release can never be altered"
+}
 
 $null = Run git fetch origin main --tags --force
 if ($rc -ne 0) { Fail 20 "git fetch failed: $errText" }
@@ -318,6 +356,12 @@ if ($state -and -not $state.draft) {
     # Published: never modified. Re-verify what is being served, read-only.
     $why = Test-RemoteAssets $null
     if ($why) { Fail 23 "$tag is PUBLISHED ($($state.url)) and its assets FAIL verification: $why - ship a new patch version" }
+    if ($state.immutable) {
+        $why = Test-Attestation
+        if ($why) { Fail 23 "$tag is published and immutable, but its attestation does not verify: $why" }
+    } else {
+        Write-Output "   WARNING: $tag is published but MUTABLE (published before immutable releases were enabled); its assets could still be replaced. Any edit freezes it, e.g.: gh release edit $tag --notes-file <current notes>"
+    }
     $latest = Out1 (Run gh api "repos/$ownerRepo/releases/latest" --jq .tag_name)
     if ($state.prerelease) { Fail 23 "$tag is published and verified, but marked prerelease - fix by hand: gh release edit $tag --prerelease=false" }
     if ($latest -ne $tag) {
@@ -479,16 +523,36 @@ Write-Output "   tag $tag is on origin at $sha"
 
 $s = Get-ReleaseState 27
 if (-not $s -or -not $s.draft -or $s.target -ne $sha) { Fail 27 "$tag is no longer a draft targeting $sha - not publishing" }
+# Last look right before the point of no return: publishing locks the tag.
+if ((Get-RemoteTagCommit 28) -ne $sha) { Fail 28 "$tag on origin no longer points at $sha - not publishing" }
 $null = Run gh release edit $tag --repo $ownerRepo --draft=false --prerelease=false --latest
 if ($rc -ne 0) { Fail 27 "gh release edit failed: $errText" }
+# From here on the release is public and (normally) immutable: the assets
+# and tag can't be changed and the version number can't be reused. A check
+# failing here may be transient: re-running this command re-verifies the
+# published release read-only. Only a failure that persists means shipping
+# the next patch version.
+$burned = "$tag is PUBLISHED and can't be changed - re-run this command to re-verify it read-only; if it still fails, release the next patch version"
 $s = Get-ReleaseState 27
-if (-not $s -or $s.draft -or $s.prerelease) { Fail 27 "after publishing: draft=$($s.draft) prerelease=$($s.prerelease)" }
-if ((Get-RemoteTagCommit 27) -ne $sha) { Fail 27 "after publishing, $tag no longer points at $sha" }
+if (-not $s -or $s.draft -or $s.prerelease) { Fail 27 "after publishing: draft=$($s.draft) prerelease=$($s.prerelease) - check the release page ($burned)" }
+if ((Get-RemoteTagCommit 27) -ne $sha) { Fail 27 "after publishing, $tag does not point at $sha ($burned)" }
+for ($i = 0; $i -lt 12 -and -not $s.immutable; $i++) {
+    Start-Sleep -Seconds 5
+    $s = Get-ReleaseState 27
+}
+if (-not $s.immutable) { Fail 27 "$tag was published but is NOT immutable - check the repo setting (Settings > General > Releases); $burned" }
+$why = "not checked"
+for ($i = 0; $i -lt 3 -and $why; $i++) {
+    if ($i -gt 0) { Start-Sleep -Seconds 5 }
+    $why = Test-Attestation
+}
+if ($why) { Fail 27 "$tag is published and immutable, but its attestation does not verify: $why ($burned)" }
+Write-Output "   immutable; release attestation verified (release + $exeName)"
 $latest = ""
 for ($i = 0; $i -lt 6 -and $latest -ne $tag; $i++) {
     if ($i -gt 0) { Start-Sleep -Seconds 5 }
     $latest = Out1 (Run gh api "repos/$ownerRepo/releases/latest" --jq .tag_name)
 }
-if ($latest -ne $tag) { Fail 27 "/releases/latest serves '$latest', not $tag" }
-Write-Output "== published: $($s.url) (latest)"
+if ($latest -ne $tag) { Fail 27 "/releases/latest serves '$latest', not $tag (fixable: gh release edit $tag --latest)" }
+Write-Output "== published: $($s.url) (latest, immutable)"
 Quit 0
