@@ -6,7 +6,7 @@ Automatically swap between two Windows 11 **themes** at local sunrise and sunset
 
 ## Features
 
-- **Tiny binary** (~395 KB, nothing else to install) and effectively idle between transitions — event-driven, sleeps on a kernel timer until the next sunrise/sunset, waking only briefly every 10 minutes to check that the system clock hasn't been changed.
+- **Tiny binary** (~465 KB, nothing else to install) and effectively idle between transitions — event-driven, sleeps on a kernel timer until the next sunrise/sunset, waking only briefly every 10 minutes to check that the system clock hasn't been changed.
 - **Reliable theme apply** via the `IThemeManager2` COM interface — the same API the Settings UWP wraps internally. Atomic, in-process, ~200 ms latency, no Settings flash. Two-tier fallback if it ever errors.
 - **Catches up after sleep / lock.** A sunrise or sunset that passes while you're suspended or locked reconciles the moment you're back.
 - **Follows clock corrections.** If Windows corrects its clock (e.g. booting 3 hours off after another OS on a dual-boot machine), the schedule re-evaluates right away when Windows announces the change, and within 10 minutes at the latest — instead of switching hours late.

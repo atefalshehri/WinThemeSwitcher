@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-Windows tray app (Rust) that swaps the full Windows **theme** (wallpaper + colors + light/dark mode) at local sunrise/sunset — macOS's auto-theme behavior, on Win11. Primary apply path is the `IThemeManager2` COM interface (the same one the Settings UWP wraps internally) for atomic, in-process theme apply; a two-tier fallback (legacy `ShellExecute(.theme)` → registry-only DWORD toggle) handles the case where the COM interface errors. ~395 KB single-exe (no VC++ redistributable needed — only the OS-provided UCRT), signed Authenticode, no installer.
+Windows tray app (Rust) that swaps the full Windows **theme** (wallpaper + colors + light/dark mode) at local sunrise/sunset — macOS's auto-theme behavior, on Win11. Primary apply path is the `IThemeManager2` COM interface (the same one the Settings UWP wraps internally) for atomic, in-process theme apply; a two-tier fallback (legacy `ShellExecute(.theme)` → registry-only DWORD toggle) handles the case where the COM interface errors. ~465 KB single-exe (no VC++ redistributable needed — only the OS-provided UCRT), signed Authenticode, no installer.
 
 Roadmap, per-version release plan, and the patch-vs-minor versioning rules live in README.md → Roadmap. v0.5.0 (release pipeline via `scripts\release.ps1`, first non-prerelease release, custom-theme fixes, tray-icon 0.25) shipped 2026-09-28; next up is **v0.6.0**: SignPath CA signing plus the remaining audit follow-ups listed in README → Roadmap → Foundation. Tag `v0.4.0` = `0c63d0e` (release commit `5f88d4e` + `scripts\build.ps1`).
 
@@ -69,7 +69,7 @@ For raw cargo (debugging a compile error only — never produces a deployable ex
     --manifest-path "C:\Users\atef\Documents\Projects\WinThemeSwitcher\Cargo.toml"
 ```
 
-Default toolchain is `stable-x86_64-pc-windows-msvc` (MSVC Build Tools required; the GNU toolchain's bundled linker/dlltool was broken on this machine). Release profile: `opt-level = "z"`, `lto = true`, `codegen-units = 1`, `panic = "abort"`, `strip = true`. Output ~395 KB. No `build.rs` — `windows-sys` and `windows` self-link.
+Default toolchain is `stable-x86_64-pc-windows-msvc` (MSVC Build Tools required; the GNU toolchain's bundled linker/dlltool was broken on this machine). Release profile: `opt-level = "z"`, `lto = true`, `codegen-units = 1`, `panic = "abort"`, `strip = true`. Output ~465 KB (v0.5.0; ~395 KB before the tray-icon 0.25 upgrade). No `build.rs` — `windows-sys` and `windows` self-link.
 
 > **For Claude Code / Fable 5 / any LLM coding agent working in this repo**: do not invoke `cargo build` or `cargo test` directly (`cargo check` / `cargo clippy` / `cargo fmt` are fine — they don't build the app or test executables; the dependency build scripts they compile and run live under the Kaspersky-excluded `target\` like everything else). Always call `scripts\build.ps1` (for a release) or `scripts\test.ps1` (for tests). The wrappers exist *because* agents forget to sign.
 
