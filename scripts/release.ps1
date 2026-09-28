@@ -246,7 +246,7 @@ if ($Matches[1] -ne $Version) { Fail 20 "Cargo.toml version is $($Matches[1]), n
 # (comments stripped) must be branch-filtered, with no tag filter, no
 # release/create/workflow_run trigger and no write permission. A new
 # workflow means reviewing it and extending this list.
-$wf = @(Run git -c core.quotePath=false ls-tree -r --name-only $sha -- .github/workflows)
+$wf = Run git -c core.quotePath=false ls-tree -r --name-only $sha -- .github/workflows
 if ($rc -ne 0) { Fail 29 "git ls-tree failed: $errText" }
 if (($wf -join "|") -ne ".github/workflows/ci.yml") {
     Fail 29 "the workflows at $sha are [$($wf -join ', ')], expected exactly .github/workflows/ci.yml - review any new workflow, then extend the allowlist in release.ps1"
