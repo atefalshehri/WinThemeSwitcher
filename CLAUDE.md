@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Windows tray app (Rust) that swaps the full Windows **theme** (wallpaper + colors + light/dark mode) at local sunrise/sunset — macOS's auto-theme behavior, on Win11. Primary apply path is the `IThemeManager2` COM interface (the same one the Settings UWP wraps internally) for atomic, in-process theme apply; a two-tier fallback (legacy `ShellExecute(.theme)` → registry-only DWORD toggle) handles the case where the COM interface errors. ~465 KB single-exe (no VC++ redistributable needed — only the OS-provided UCRT), signed Authenticode, no installer.
 
-Roadmap, per-version release plan, and the patch-vs-minor versioning rules live in README.md → Roadmap. v0.5.0 (release pipeline via `scripts\release.ps1`, first non-prerelease release, custom-theme fixes, tray-icon 0.25) shipped 2026-09-28; next up is **v0.6.0**: SignPath CA signing plus the remaining audit follow-ups listed in README → Roadmap → Foundation. Tag `v0.4.0` = `0c63d0e` (release commit `5f88d4e` + `scripts\build.ps1`).
+Roadmap, per-version release plan, and the patch-vs-minor versioning rules live in README.md → Roadmap. v0.5.0 (release pipeline via `scripts\release.ps1`, first non-prerelease release, custom-theme fixes, tray-icon 0.25) shipped 2026-09-28; next up is **v0.6.0**: SignPath CA signing plus the remaining audit follow-ups listed in README → Roadmap → Foundation. Tag `v0.5.0` = `f4ea48e` (release commit `2f8d1b1` + two release-script fixes found on its first real run + a docs size fix); tag `v0.4.0` = `0c63d0e` (release commit `5f88d4e` + `scripts\build.ps1`).
 
 ## Source tree vs deployed binary — read first
 
