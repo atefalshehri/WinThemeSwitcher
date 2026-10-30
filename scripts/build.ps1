@@ -12,11 +12,23 @@
 # Usage:
 #   powershell -NoProfile -ExecutionPolicy Bypass -File scripts\build.ps1
 #   powershell -NoProfile -ExecutionPolicy Bypass -File scripts\build.ps1 -SkipCopy
+#   powershell -NoProfile -ExecutionPolicy Bypass -File scripts\build.ps1 -DeployDir <folder>
 #
 # Parameters:
-#   -SkipCopy   build + sign in place, don't overwrite the deployed exe at
-#               C:\Tools\WinThemeSwitcher\win-theme-switcher.exe (useful when
-#               verifying a build without disturbing the running install).
+#   -SkipCopy   build + sign in place, don't overwrite the deployed exe
+#               (useful when verifying a build without disturbing the
+#               running install).
+#   -DeployDir  install folder, default %LOCALAPPDATA%\Programs\WinThemeSwitcher:
+#               the per-user folder README recommends, since other standard
+#               accounts can't replace the exe that HKCU\Run starts at login (a
+#               folder like C:\Tools inherits Modify for every local account
+#               from C:\). It must already exist -- for a first install, create
+#               it once from a normal (unpackaged) shell. Deploying to a
+#               different folder MOVES the install: every running instance is
+#               stopped, and the copy started there (no config.json, so
+#               defaults with auto_start on) points HKCU\Run at itself. Copy
+#               config.json across when moving; to try a build, use -SkipCopy,
+#               not a scratch -DeployDir.
 #
 # Exit codes:
 #   0  build + sign + (optional) deploy + relaunch all succeeded
@@ -26,14 +38,23 @@
 #   4  signing failed: signtool never succeeded (AV holding the file, cert
 #      missing, timestamp server unreachable), or the result is not a Valid,
 #      timestamped signature
-#   5  deploy directory missing (install previous version first)
-#   6  deploy copy failed or the deployed file differs from the signed build
-#      (the previously deployed exe is relaunched first)
+#   5  deploy directory missing (create it once for a first install)
+#   6  deploy copy failed or the copy differs from the signed build (the
+#      stopped instance is relaunched if its exe is still validly signed)
 #   7  linker hardening missing: RUSTFLAGS/CARGO_ENCODED_RUSTFLAGS overrides
 #      .cargo\config.toml, or the exe still imports VCRUNTIME140 or lacks
 #      DependentLoadFlags 0x800 (see scripts\check-hardening.ps1)
 #   8  deployed, but the relaunched app was not seen running
-param([switch]$SkipCopy)
+#   9  refused to deploy into AppData: this shell has a package identity (an
+#      MSIX app's container), or that couldn't be checked
+# 5 and 9 are checked before building, so a deploy that can't happen fails fast.
+param(
+    [switch]$SkipCopy,
+    # Never empty: an empty path would resolve to the current directory. The
+    # default comes from the known folder, so it needs no environment variable.
+    [ValidateNotNullOrEmpty()]
+    [string]$DeployDir = (Join-Path ([Environment]::GetFolderPath("LocalApplicationData")) "Programs\WinThemeSwitcher")
+)
 
 # PowerShell 5.1 wraps native stderr in ErrorRecords when redirected; check
 # $LASTEXITCODE explicitly instead of using Stop on $ErrorActionPreference.
@@ -41,6 +62,9 @@ $ErrorActionPreference = "Continue"
 $repo = Split-Path -Parent $PSScriptRoot
 $cargo = "$env:USERPROFILE\.cargo\bin\cargo.exe"
 $manifest = Join-Path $repo "Cargo.toml"
+# A relative -DeployDir means relative to the caller's location: resolve it
+# before the Push-Location below.
+$DeployDir = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($DeployDir)
 
 # Cargo finds .cargo\config.toml by walking up from the CURRENT directory,
 # not from --manifest-path - run from the repo so the linker flags apply no
@@ -60,6 +84,46 @@ if (-not (Test-Path $cargo)) {
 if ($env:RUSTFLAGS -or $env:CARGO_ENCODED_RUSTFLAGS) {
     Write-Error "RUSTFLAGS / CARGO_ENCODED_RUSTFLAGS is set and would override .cargo\config.toml -- unset it"
     Quit 7
+}
+
+# Deploy preconditions, checked before the build so a deploy that can't
+# happen fails fast instead of after it.
+if (-not $SkipCopy) {
+    $deployExe = Join-Path $DeployDir "win-theme-switcher.exe"
+
+    # A packaged (MSIX) host app -- an agent's terminal, say -- may run this
+    # shell with AppData writes virtualized: files and folders it creates there
+    # (and any private copy that already exists) can live in the package's
+    # private store, visible only from inside it. The copy below could then
+    # "succeed" and hash-match from in here while the real folder never gets
+    # it. So deploying into AppData needs proof that this process has no
+    # package identity.
+    $inAppData = @([Environment]::GetFolderPath("LocalApplicationData"), [Environment]::GetFolderPath("ApplicationData")) |
+        Where-Object { $_ } |
+        Where-Object { ($DeployDir.TrimEnd('\') + '\').StartsWith($_.TrimEnd('\') + '\', [StringComparison]::OrdinalIgnoreCase) }
+    if ($inAppData) {
+        $pkgRc = $null
+        try {
+            if (-not ('WtsBuild.Package' -as [type])) {
+                Add-Type -Namespace WtsBuild -Name Package -MemberDefinition '
+                    [DllImport("kernel32.dll")]
+                    public static extern int GetCurrentPackageFullName(ref int length, System.IntPtr name);'
+            }
+            $len = 0
+            $pkgRc = [WtsBuild.Package]::GetCurrentPackageFullName([ref]$len, [IntPtr]::Zero)
+        } catch { }
+        # 15700 = APPMODEL_ERROR_NO_PACKAGE: no identity, so no virtualization.
+        if ($pkgRc -ne 15700) {
+            $why = if ($null -eq $pkgRc) { "the package-identity check failed" } else { "this shell runs inside a packaged app's container (code $pkgRc)" }
+            Write-Error "refusing to deploy into $DeployDir -- $why, and AppData writes may be virtualized there; run this from a normal PowerShell window"
+            Quit 9
+        }
+    }
+
+    if (-not (Test-Path -LiteralPath $DeployDir -PathType Container)) {
+        Write-Error "deploy directory $DeployDir doesn't exist or isn't a folder -- for a first install, create it from a normal (unpackaged) PowerShell window and re-run"
+        Quit 5
+    }
 }
 
 # Locate signtool (any Windows Kits version).
@@ -129,17 +193,13 @@ if ($sig.Status -ne "Valid" -or -not $sig.TimeStamperCertificate) {
 Write-Output "signed: $exe (Valid, timestamped)"
 
 if ($SkipCopy) {
-    Write-Output "SkipCopy set -- leaving deployed binary at C:\Tools\WinThemeSwitcher\ untouched"
+    Write-Output "SkipCopy set -- leaving the deployed binary in $DeployDir untouched"
     Quit 0
 }
 
 # --- Deploy -------------------------------------------------------------------
-$deployDir = "C:\Tools\WinThemeSwitcher"
-$deployExe = Join-Path $deployDir "win-theme-switcher.exe"
-if (-not (Test-Path $deployDir)) {
-    Write-Error "deploy directory $deployDir does not exist -- install the previous version first"
-    Quit 5
-}
+# (-DeployDir was checked before the build: it exists, and an AppData target
+# was proven safe to write.)
 
 # Relaunch through explorer.exe, NOT as a child of this shell: the tray app
 # must run in the user's normal desktop context (the same one the HKCU\Run
@@ -148,18 +208,24 @@ if (-not (Test-Path $deployDir)) {
 # are virtualized into a private hive and the Run value / theme registry
 # writes would never reach the real registry). explorer.exe hands the launch
 # to the running shell and returns immediately.
-function Start-Deployed {
-    Start-Process -FilePath "$env:WINDIR\explorer.exe" -ArgumentList "`"$deployExe`""
-    for ($i = 0; $i -lt 20; $i++) {
+function Start-Deployed([string]$path) {
+    Start-Process -FilePath "$env:WINDIR\explorer.exe" -ArgumentList "`"$path`""
+    # A fresh build's first start can take several seconds while antivirus and
+    # reputation checks inspect the new hash (~10 s seen), so allow 20 s.
+    for ($i = 0; $i -lt 80; $i++) {
         Start-Sleep -Milliseconds 250
         $p = Get-Process -Name win-theme-switcher -ErrorAction SilentlyContinue |
-            Where-Object { $_.Path -eq $deployExe }
+            Where-Object { $_.Path -eq $path }
         if ($p) { return $true }
     }
     return $false
 }
 
 $running = Get-Process -Name win-theme-switcher -ErrorAction SilentlyContinue
+# Remember where the stopped instance ran from: if the copy fails, that's the
+# exe to bring back, and it needn't live in -DeployDir.
+$prevExe = @($running | ForEach-Object { $_.Path } | Where-Object { $_ }) | Select-Object -First 1
+if (-not $prevExe) { $prevExe = $deployExe }
 if ($running) {
     $running | Stop-Process -Force
     # Wait for the processes to actually exit (and release the file) rather
@@ -168,24 +234,26 @@ if ($running) {
 }
 
 $copyErr = $null
-Copy-Item -Path $exe -Destination $deployExe -Force -ErrorVariable copyErr
-$srcHash = (Get-FileHash -Path $exe -Algorithm SHA256).Hash
-$dstHash = (Get-FileHash -Path $deployExe -Algorithm SHA256 -ErrorAction SilentlyContinue).Hash
+Copy-Item -LiteralPath $exe -Destination $deployExe -Force -ErrorVariable copyErr
+$srcHash = (Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash
+$dstHash = (Get-FileHash -LiteralPath $deployExe -Algorithm SHA256 -ErrorAction SilentlyContinue).Hash
 if ($copyErr -or $srcHash -ne $dstHash) {
     Write-Warning "deploy failed: copy error='$copyErr' src=$srcHash dst=$dstHash"
-    # Don't leave the app down: relaunch whatever is deployed, if it's still
-    # a validly signed exe.
-    if ((Test-Path $deployExe) -and (Get-AuthenticodeSignature -FilePath $deployExe).Status -eq "Valid") {
-        if (Start-Deployed) { Write-Warning "relaunched the previously deployed exe" }
-        else { Write-Warning "could not relaunch the previously deployed exe" }
+    # Don't leave the app down: relaunch the stopped instance's exe, if it's
+    # still a validly signed exe.
+    if ((Test-Path -LiteralPath $prevExe) -and (Get-AuthenticodeSignature -LiteralPath $prevExe).Status -eq "Valid") {
+        if (Start-Deployed $prevExe) { Write-Warning "relaunched the previous exe: $prevExe" }
+        else { Write-Warning "could not relaunch $prevExe" }
+    } else {
+        Write-Warning "no validly signed previous exe to relaunch -- start the app yourself"
     }
     Quit 6
 }
 Write-Output "deployed: $deployExe ($dstHash)"
 
-if (Start-Deployed) {
+if (Start-Deployed $deployExe) {
     Write-Output "relaunched: $deployExe"
     Quit 0
 }
-Write-Warning "deployed, but the relaunched process was not seen within 5 s -- start it manually or sign out/in"
+Write-Warning "deployed, but the relaunched process was not seen within 20 s -- Smart App Control blocks this self-signed exe when it's On; otherwise start it manually or sign out/in"
 Quit 8

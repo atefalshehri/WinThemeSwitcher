@@ -1,8 +1,9 @@
 # Runs the unit tests with every test binary Authenticode-signed BEFORE its
 # first execution. Unsigned fresh-hash binaries in target\debug\deps trip
-# Kaspersky File AV / KSN on this machine (the Trusted Applications rules
-# only cover the two release paths); signing collapses the heuristic signal
-# the same way it does for release builds. Usage:
+# Kaspersky File AV / KSN on this machine (no Trusted Applications rule covers
+# them; the AV exclusion on target\ is the other layer); signing collapses the
+# heuristic signal the same way it does for release builds. Smart App Control,
+# when On, blocks them anyway: a self-signed root doesn't count for it. Usage:
 #   powershell -NoProfile -ExecutionPolicy Bypass -File scripts\test.ps1 [testname-filter]
 #   powershell -NoProfile -ExecutionPolicy Bypass -File scripts\test.ps1 -Filter "--harness-flag"
 #

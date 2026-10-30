@@ -46,7 +46,7 @@
 # -DryRun runs 0-3 for real (all read-only checks, plus the local build and
 # local verification) and prints what 4-6 would do.
 #
-# Exit codes (disjoint from build.ps1's 1-8):
+# Exit codes (disjoint from build.ps1's 1-9):
 #   20 preflight failed               25 creating/uploading the draft failed
 #   21 gh missing/too old/signed out  26 verification of the release failed
 #   22 CI gate failed                 27 publishing / post-publish check failed
