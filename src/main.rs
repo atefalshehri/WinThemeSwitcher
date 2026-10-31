@@ -24,7 +24,7 @@ use windows_sys::Win32::Foundation::{
 };
 use windows_sys::Win32::Graphics::Dwm::DwmFlush;
 use windows_sys::Win32::Storage::FileSystem::{
-    GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+    GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, FILE_SHARE_READ,
 };
 use windows_sys::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
 use windows_sys::Win32::System::Environment::ExpandEnvironmentStringsW;
@@ -730,63 +730,152 @@ fn load_config_at(path: &Path) -> Result<Config, String> {
 /// heal resets settings, and must not be silent). Logging stays out of here
 /// because tests call this directly and log_path() is exe-relative.
 fn load_config_ex(path: &Path) -> Result<(Config, Option<Healed>), String> {
-    match read_config_text(path) {
-        Ok(content) if config_content_is_empty(&content) => {
-            // A crash mid-write can leave a 0-byte or NUL-filled file (the
-            // latter when the size was extended but the data never flushed).
-            // Nothing in it to preserve — self-heal like first run instead
-            // of erroring on every launch.
-            let cfg = Config::default();
-            let save_err = save_config_at(path, &cfg).err().map(|e| e.to_string());
-            Ok((
-                cfg,
-                Some(Healed {
-                    reason: "empty",
-                    save_err,
-                }),
-            ))
-        }
-        Ok(content) => serde_json::from_str::<Config>(&content)
-            .map(|cfg| (cfg, None))
-            .map_err(|e| format!("config.json is not valid JSON: {e}")),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            let cfg = Config::default();
-            if let Ok(json) = serde_json::to_string_pretty(&cfg) {
-                // create_new, not a replace: if the file appears between our
-                // read and this write (an editor saving via delete-then-
-                // rename), the user's file wins and the defaults are dropped.
-                use std::io::Write;
-                if let Ok(mut f) = fs::OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(path)
-                {
-                    let _ = f.write_all(json.as_bytes());
+    load_config_via(path, read_config_text)
+}
+
+/// `load_config_ex` with its read step passed in, so tests can make the file
+/// change between a read and the write that follows it.
+///
+/// Defaults are only written into a file that is still missing, or still
+/// empty, at the moment of writing. When it isn't — an editor saved it in
+/// between (e.g. via delete-then-rename) — the file is read again: the
+/// user's file wins, and is never answered with defaults that a later
+/// persist_config would write over it.
+fn load_config_via(
+    path: &Path,
+    mut read: impl FnMut(&Path) -> std::io::Result<String>,
+) -> Result<(Config, Option<Healed>), String> {
+    for _ in 0..3 {
+        match read(path) {
+            Ok(content) if config_content_is_empty(&content) => {
+                // A crash mid-write can leave a 0-byte or NUL-filled file
+                // (the latter when the size was extended but the data never
+                // flushed). Nothing in it to preserve — self-heal like first
+                // run instead of erroring on every launch.
+                let cfg = Config::default();
+                let save_err = match heal_empty_config(path, &cfg) {
+                    Ok(true) => None,
+                    Ok(false) => continue,
+                    // Another program has it open to write it (or locked):
+                    // what it will hold is unknown, so it's a file that
+                    // can't be read, not an empty one — defaults returned
+                    // now would later be persisted over that program's save.
+                    Err(e) if matches!(e.raw_os_error(), Some(32 | 33)) => {
+                        return Err(format!("config.json could not be read: {e}"));
+                    }
+                    Err(e) => Some(e.to_string()),
+                };
+                return Ok((
+                    cfg,
+                    Some(Healed {
+                        reason: "empty",
+                        save_err,
+                    }),
+                ));
+            }
+            Ok(content) => {
+                return serde_json::from_str::<Config>(&content)
+                    .map(|cfg| (cfg, None))
+                    .map_err(|e| format!("config.json is not valid JSON: {e}"));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let cfg = Config::default();
+                match create_config(path, &cfg) {
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    // Written — or the folder isn't writable, and every run
+                    // starts from the defaults.
+                    _ => return Ok((cfg, None)),
                 }
             }
-            Ok((cfg, None))
+            Err(e) => return Err(format!("config.json could not be read: {e}")),
         }
-        Err(e) => Err(format!("config.json could not be read: {e}")),
     }
+    // Missing when read but there when created, every time: in practice a
+    // link to a file that can't be opened (create_new refuses even a
+    // dangling link) — else a file that kept changing.
+    if fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
+        return Err("config.json is a link to a file that can't be opened".to_string());
+    }
+    Err("config.json kept changing while it was being read".to_string())
+}
+
+/// First run: write `cfg` as a new config.json. create_new, not a replace:
+/// a file that appeared since the read (AlreadyExists) is the user's.
+fn create_config(path: &Path, cfg: &Config) -> std::io::Result<()> {
+    use std::io::Write;
+    let json = serde_json::to_string_pretty(cfg)?;
+    let mut f = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    f.write_all(json.as_bytes())
+}
+
+/// Write `cfg` into a config.json that read as empty — if it still is. The
+/// check and the write share one handle that lets other programs read the
+/// file but not write, replace or delete it, so an editor's save can't land
+/// between them and be overwritten. Written in place: there's nothing in the
+/// file to lose. Ok(false): it has content now, or is gone — read it again.
+/// Err with ERROR_SHARING_VIOLATION: another program still has it open to
+/// write it.
+fn heal_empty_config(path: &Path, cfg: &Config) -> std::io::Result<bool> {
+    use std::io::{Read, Seek, Write};
+    use std::os::windows::fs::OpenOptionsExt;
+    let json = serde_json::to_string_pretty(cfg)?;
+    let mut attempt = 0;
+    let mut f = loop {
+        match fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .share_mode(FILE_SHARE_READ)
+            .open(path)
+        {
+            Ok(f) => break f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            // Open elsewhere (ERROR_SHARING_VIOLATION) — an on-access AV
+            // scan, or an editor mid-save: wait a moment, as save_config_at
+            // does.
+            Err(e) if e.raw_os_error() == Some(32) && attempt < 4 => {
+                attempt += 1;
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(e) => return Err(e),
+        }
+    };
+    let mut bytes = Vec::new();
+    f.read_to_end(&mut bytes)?;
+    if !decode_config_text(&bytes).is_ok_and(|s| config_content_is_empty(&s)) {
+        return Ok(false);
+    }
+    f.set_len(0)?;
+    f.rewind()?;
+    f.write_all(json.as_bytes())?;
+    f.sync_all()?;
+    Ok(true)
 }
 
 /// config.json as text, whatever encoding a Windows editor saved it in:
 /// UTF-8 with or without a BOM (Notepad), or UTF-16 LE/BE with a BOM
 /// (PowerShell 5.1's `>` / Out-File default is LE; Notepad offers both).
 fn read_config_text(path: &Path) -> std::io::Result<String> {
+    decode_config_text(&fs::read(path)?)
+}
+
+/// read_config_text's decoding, for bytes already read.
+fn decode_config_text(bytes: &[u8]) -> std::io::Result<String> {
     use std::io::{Error, ErrorKind};
-    let bytes = fs::read(path)?;
     let utf16 = |rest: &[u8], le: bool| -> std::io::Result<String> {
-        if !rest.len().is_multiple_of(2) {
+        let (pairs, odd) = rest.as_chunks::<2>();
+        if !odd.is_empty() {
             return Err(Error::new(ErrorKind::InvalidData, "truncated UTF-16 text"));
         }
-        let units: Vec<u16> = rest
-            .chunks_exact(2)
-            .map(|c| {
+        let units: Vec<u16> = pairs
+            .iter()
+            .map(|&pair| {
                 if le {
-                    u16::from_le_bytes([c[0], c[1]])
+                    u16::from_le_bytes(pair)
                 } else {
-                    u16::from_be_bytes([c[0], c[1]])
+                    u16::from_be_bytes(pair)
                 }
             })
             .collect();
@@ -799,7 +888,7 @@ fn read_config_text(path: &Path) -> std::io::Result<String> {
     if let Some(rest) = bytes.strip_prefix(&[0xFE, 0xFF]) {
         return utf16(rest, false);
     }
-    let rest = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(&bytes);
+    let rest = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(bytes);
     String::from_utf8(rest.to_vec()).map_err(|_| {
         Error::new(
             ErrorKind::InvalidData,
@@ -1481,8 +1570,10 @@ fn expand_theme_path(raw: &str, base: &Path) -> PathBuf {
 }
 
 /// Whether an (expanded) path may be used as a theme: an existing FILE with
-/// a `.theme` extension that isn't Windows' scratch Custom.theme.
-fn check_theme_path(path: &Path, scratch: &Path) -> Result<(), ThemePathIssue> {
+/// a `.theme` extension that isn't Windows' scratch Custom.theme. Ok is the
+/// path to use: as written, with the file name as stored on disk
+/// (`with_stored_name`).
+fn check_theme_path(path: &Path, scratch: &Path) -> Result<PathBuf, ThemePathIssue> {
     let prefixed = matches!(
         path.components().next(),
         Some(std::path::Component::Prefix(_))
@@ -1521,14 +1612,30 @@ fn check_theme_path(path: &Path, scratch: &Path) -> Result<(), ThemePathIssue> {
         "themepack" | "deskthemepack" => return Err(ThemePathIssue::ThemePack),
         _ => return Err(ThemePathIssue::NotATheme),
     }
-    let same = match (real, fs::canonicalize(scratch)) {
-        (Some(a), Ok(b)) => a == b,
+    let same = match (&real, fs::canonicalize(scratch)) {
+        (Some(a), Ok(b)) => *a == b,
         _ => false,
     };
     if same {
         return Err(ThemePathIssue::ScratchFile);
     }
-    Ok(())
+    Ok(with_stored_name(path, real.as_deref()))
+}
+
+/// `path` with its file name as stored on disk, taken from `real` (its
+/// canonical form). An 8.3 (`NIGHTT~1.THE`), trailing-dot or differently
+/// cased spelling opens the same file, but a theme without a DisplayName is
+/// named after its file, and tier 1 matches that name exactly. Kept as
+/// written when the stored name, in the folder as written, isn't the same
+/// file — a symlink to a file named differently.
+fn with_stored_name(path: &Path, real: Option<&Path>) -> PathBuf {
+    if let Some(name) = real.and_then(Path::file_name) {
+        let respelled = path.with_file_name(name);
+        if respelled.as_path() != path && fs::canonicalize(&respelled).ok().as_deref() == real {
+            return respelled;
+        }
+    }
+    path.to_path_buf()
 }
 
 fn stock_theme_file(theme: Theme) -> PathBuf {
@@ -1565,7 +1672,7 @@ fn resolve_theme_file_checked(
         .unwrap_or_else(|| PathBuf::from("."));
     let path = expand_theme_path(raw, &base);
     match check_theme_path(&path, &scratch_theme_file()) {
-        Ok(()) => (path, None),
+        Ok(file) => (file, None),
         Err(issue) => (
             stock_theme_file(theme),
             Some((raw.to_string(), path, issue)),
@@ -1715,24 +1822,35 @@ fn start_settings_closer() {
     });
 }
 
+/// Why the Personalize modes can't show whether applying `slot` took effect,
+/// if they can't: the theme file doesn't declare them (the slot's modes are
+/// a guess — forcing them over the theme would be wrong), or `pre`, the
+/// screen just before the apply, already reads them. The reason is the log
+/// value. Shared by tier 1's read-back and tier 2's commit watcher. Pure —
+/// unit-tested.
+fn unverifiable_reason(slot: &Slot, pre: Option<Modes>) -> Option<&'static str> {
+    if !slot.keyed {
+        Some("modes-not-in-theme-file")
+    } else if pre == Some(slot.modes) {
+        Some("already-matching")
+    } else {
+        None
+    }
+}
+
 /// Watch a tier-2 apply for its registry effect; on a silent fail, force the
 /// modes via tier 3. `pre` is the reading from before the apply: when the
-/// modes can't show whether the apply committed — the theme file doesn't
-/// declare them (forcing a guess over the theme would be wrong), or the
-/// screen already reads the target — it only logs `commit_unverifiable`.
+/// modes can't show whether the apply committed (`unverifiable_reason`), it
+/// only logs `commit_unverifiable`.
 fn start_commit_watcher(slot: &Slot, pre: Option<Modes>) {
     let target = slot.modes;
-    if !slot.keyed || pre == Some(target) {
+    if let Some(reason) = unverifiable_reason(slot, pre) {
         log_event(&format!(
             "{} commit_unverifiable target={} slot={} reason={}",
             Local::now().to_rfc3339(),
             modes_str(Some(target)),
             slot.theme.slot_str(),
-            if slot.keyed {
-                "already-matching"
-            } else {
-                "modes-not-in-theme-file"
-            },
+            reason,
         ));
         return;
     }
@@ -1819,9 +1937,12 @@ fn read_theme_ini(theme_file: &Path, section: &str, key: &str) -> Option<Option<
     let key = wide(key);
     let default = wide(ABSENT);
     // Absolute: given a bare file name, GetPrivateProfileStringW looks in
-    // %WINDIR%, not the directory is_file() just checked.
+    // %WINDIR%, not the directory is_file() just checked. And in the form
+    // that opens at any length — std's is_file()/open() above add the
+    // `\\?\` prefix themselves; without it the API can't open a long path
+    // and returns the default, which would read as "absent".
     let abs = std::path::absolute(theme_file).unwrap_or_else(|_| theme_file.to_path_buf());
-    let file = wide(&abs.to_string_lossy());
+    let file = wide(&win32_path_arg(&abs.to_string_lossy()));
     let mut buf = vec![0u16; 1024];
     let n = unsafe {
         GetPrivateProfileStringW(
@@ -1838,6 +1959,29 @@ fn read_theme_ini(theme_file: &Path, section: &str, key: &str) -> Option<Option<
         return Some(None);
     }
     Some(Some(raw.trim().to_string()))
+}
+
+/// An absolute path as a Win32 file API should get it from this exe, which
+/// has no longPathAware manifest: from 247 UTF-16 units (std's own
+/// threshold, a little under MAX_PATH) in the `\\?\` form —
+/// `\\?\UNC\server\share\...` for a share — which opens at any length;
+/// shorter paths as they are. The prefix turns off Win32's own path
+/// normalization (`/`, `.`, `..`, trailing dots), so `abs` must already be
+/// normalized (std::path::absolute). Pure — unit-tested.
+fn win32_path_arg(abs: &str) -> String {
+    // std's limit counts the terminating NUL.
+    const LEGACY_MAX_PATH: usize = 248;
+    if abs.encode_utf16().count() + 1 < LEGACY_MAX_PATH
+        || !Path::new(abs).is_absolute()
+        || abs.starts_with(r"\\?\")
+        || abs.starts_with(r"\\.\")
+    {
+        return abs.to_string();
+    }
+    match abs.strip_prefix(r"\\") {
+        Some(share) => format!(r"\\?\UNC\{share}"),
+        None => format!(r"\\?\{abs}"),
+    }
 }
 
 /// The name Windows lists a `.theme` under — what tier 1 matches against
@@ -1904,15 +2048,22 @@ fn resolve_indirect_string(source: &str) -> Option<String> {
 /// and tier 2 applies the configured file by its exact path — see
 /// `pick_theme_index`.
 ///
-/// Logs `theme_manager2_apply` on success; the caller logs the err string.
-fn apply_via_theme_manager2(slot: &Slot) -> Result<(), Box<dyn Error>> {
+/// SetCurrentTheme's success is then checked against the registry
+/// (`tier1_readback`): a Windows build where it reports success without
+/// applying would otherwise be logged as applied, recorded as in sync, and
+/// kept by later wakes as if it were the user's override. Logs
+/// `theme_manager2_apply` (with the read-back verdict), or
+/// `theme_manager2_noop` when the modes never reached the slot's — the
+/// caller then falls through to tier 2 as on an error, and logs the err
+/// string of an Err.
+fn apply_via_theme_manager2(slot: &Slot) -> Result<ReadBack, Box<dyn Error>> {
     let target_name = resolve_theme_display_name(&slot.file)
         .ok_or("could not resolve DisplayName from .theme file")?;
     let windows_theme = is_windows_theme(&slot.file);
     let collides =
         !windows_theme && name_taken_elsewhere(&slot.file, &target_name, &theme_search_dirs());
     let started = Instant::now();
-    unsafe {
+    let (i, pre) = unsafe {
         let mgr =
             ThemeMgr::create().map_err(|hr| format!("CoCreateInstance/Init hr=0x{:08x}", hr))?;
         let n = mgr
@@ -1941,18 +2092,113 @@ fn apply_via_theme_manager2(slot: &Slot) -> Result<(), Box<dyn Error>> {
                 i,
             ));
         }
+        // The screen right before the apply: the read-back can only tell
+        // from a change.
+        let pre = read_modes();
         mgr.set_current(i, THEME_APPLY_FLAG_NO_HOURGLASS)
             .map_err(|hr| format!("SetCurrentTheme i={} hr=0x{:08x}", i, hr))?;
+        // mgr is released at the end of this block — right after
+        // SetCurrentTheme, as before; the read-back needs no COM.
+        (i, pre)
+    };
+    let applied_ms = started.elapsed().as_millis();
+    let (verdict, readback_ms) = tier1_readback(slot, pre);
+    if let ReadBack::NoOp(actual) = verdict {
         log_event(&format!(
-            "{} theme_manager2_apply target={} display=\"{}\" idx={} after_ms={}",
+            "{} theme_manager2_noop target={} actual={} display=\"{}\" idx={} after_ms={} readback_ms={}",
+            Local::now().to_rfc3339(),
+            modes_str(Some(slot.modes)),
+            modes_str(Some(actual)),
+            sanitize_log_msg(&target_name),
+            i,
+            applied_ms,
+            readback_ms,
+        ));
+    } else {
+        log_event(&format!(
+            "{} theme_manager2_apply target={} display=\"{}\" idx={} after_ms={} readback={} readback_ms={}",
             Local::now().to_rfc3339(),
             modes_str(Some(slot.modes)),
             sanitize_log_msg(&target_name),
             i,
-            started.elapsed().as_millis(),
+            applied_ms,
+            verdict.as_str(),
+            readback_ms,
         ));
-        Ok(())
     }
+    Ok(verdict)
+}
+
+/// What tier 1's read-back concluded — see `readback_verdict`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReadBack {
+    /// A reading matched the slot's modes: the apply took effect.
+    Reached,
+    /// The modes can't show it (`unverifiable_reason`, or "unreadable": no
+    /// reading succeeded). SetCurrentTheme's success is trusted.
+    Unverifiable(&'static str),
+    /// SetCurrentTheme reported success, but the modes never reached the
+    /// slot's (the last reading) — treated as a tier-1 failure.
+    NoOp(Modes),
+}
+
+impl ReadBack {
+    /// The `readback=` log value.
+    fn as_str(self) -> &'static str {
+        match self {
+            ReadBack::Reached => "reached",
+            ReadBack::Unverifiable(why) => why,
+            ReadBack::NoOp(_) => "noop",
+        }
+    }
+}
+
+/// How long tier 1's read-back waits for the modes, in case Windows writes
+/// them after SetCurrentTheme returns.
+const READBACK_WINDOW: Duration = Duration::from_secs(2);
+/// Interval between read-back readings.
+const READBACK_POLL: Duration = Duration::from_millis(100);
+
+/// Tier 1's read-back verdict from `readings`, the modes read after
+/// SetCurrentTheme reported success (oldest first; polling stops at a
+/// match). Only a reading that succeeded can show a no-op — an unreadable
+/// registry proves nothing, as for the retry gate. Pure — unit-tested.
+fn readback_verdict(slot: &Slot, pre: Option<Modes>, readings: &[Option<Modes>]) -> ReadBack {
+    if let Some(reason) = unverifiable_reason(slot, pre) {
+        return ReadBack::Unverifiable(reason);
+    }
+    if readings.contains(&Some(slot.modes)) {
+        return ReadBack::Reached;
+    }
+    match readings.iter().rev().find_map(|r| *r) {
+        Some(last) => ReadBack::NoOp(last),
+        None => ReadBack::Unverifiable("unreadable"),
+    }
+}
+
+/// Read the Personalize modes after SetCurrentTheme reported success until
+/// they match `slot`'s or READBACK_WINDOW has passed; returns the verdict
+/// and the milliseconds it took. Runs on the main thread, between tier 1
+/// (which must stay on that STA thread) and the tier-2 fallback it may lead
+/// to: registry reads only, no COM — and if SetCurrentTheme writes the modes
+/// before returning, the first reading matches and nothing waits.
+fn tier1_readback(slot: &Slot, pre: Option<Modes>) -> (ReadBack, u128) {
+    let started = Instant::now();
+    let mut readings = Vec::new();
+    if unverifiable_reason(slot, pre).is_none() {
+        loop {
+            let reading = read_modes();
+            readings.push(reading);
+            if reading == Some(slot.modes) || started.elapsed() >= READBACK_WINDOW {
+                break;
+            }
+            std::thread::sleep(READBACK_POLL);
+        }
+    }
+    (
+        readback_verdict(slot, pre, &readings),
+        started.elapsed().as_millis(),
+    )
 }
 
 /// Which enumerated theme tier 1 applies, given every index whose
@@ -2057,6 +2303,7 @@ fn name_taken_elsewhere(configured: &Path, name: &str, dirs: &[(PathBuf, bool)])
 
 /// Three-tier apply, best-to-worst:
 ///   1. IThemeManager2  — atomic, reliable, no Settings UWP, no AV-tripping broadcast.
+///      Its success is read back; one that changed nothing falls through to (2).
 ///   2. ShellExecuteW(.theme) + commit_watcher — legacy. Watcher promotes to (3) on silent fail.
 ///   3. Direct registry write — flips light/dark mode but not wallpaper. Last resort.
 ///
@@ -2080,7 +2327,10 @@ fn apply_theme(slot: &Slot) -> Result<&'static str, Box<dyn Error>> {
 
     if theme_file.exists() {
         match apply_via_theme_manager2(slot) {
-            Ok(()) => return Ok("theme-manager2"),
+            // Reported success, but the modes never reached the target
+            // (logged as theme_manager2_noop): fall through as on an error.
+            Ok(ReadBack::NoOp(_)) => {}
+            Ok(_) => return Ok("theme-manager2"),
             Err(e) => log_event(&format!(
                 "{} theme_manager2_err target={} slot={} msg=\"{}\"",
                 Local::now().to_rfc3339(),
@@ -3817,6 +4067,98 @@ mod tests {
         assert_eq!(fs::read_to_string(&ro.0).unwrap(), "  ");
     }
 
+    // --- config.json changing while it's loaded (v0.5.1) ---
+
+    /// A reader whose first read returns `first` and later reads read the
+    /// file: the file changed between load_config_via's read and its write.
+    fn racing_read(first: std::io::Result<String>) -> impl FnMut(&Path) -> std::io::Result<String> {
+        let mut first = Some(first);
+        move |p| first.take().unwrap_or_else(|| read_config_text(p))
+    }
+
+    #[test]
+    fn first_run_never_answers_a_file_that_just_appeared_with_defaults() {
+        // Missing when read, but an editor saved it before the defaults were
+        // written: create_new refuses, and the user's file must be read and
+        // returned — not defaults that a later persist_config would write
+        // over it.
+        let json = r#"{"latitude": 24.753, "longitude": 46.765, "auto_start": false}"#;
+        let t = TempConfig::new("race-create", Some(json));
+        let (cfg, healed) =
+            load_config_via(&t.0, racing_read(Err(std::io::ErrorKind::NotFound.into())))
+                .expect("the user's file must load");
+        assert_eq!(cfg.latitude, 24.753);
+        assert!(!cfg.auto_start && healed.is_none());
+        assert_eq!(fs::read_to_string(&t.0).unwrap(), json, "file untouched");
+    }
+
+    #[test]
+    fn the_empty_file_heal_never_overwrites_a_save_that_landed_first() {
+        // Empty when read, but the user saved real content before the
+        // defaults were written: the heal must see it and stand down.
+        let json = r#"{"latitude": 24.753, "longitude": 46.765}"#;
+        let t = TempConfig::new("race-heal", Some(json));
+        let (cfg, healed) = load_config_via(&t.0, racing_read(Ok(String::new())))
+            .expect("the user's file must load");
+        assert_eq!(cfg.longitude, 46.765);
+        assert!(healed.is_none(), "not a heal");
+        assert_eq!(fs::read_to_string(&t.0).unwrap(), json, "file untouched");
+    }
+
+    #[test]
+    fn a_config_deleted_before_its_heal_is_recreated_like_first_run() {
+        let t = TempConfig::new("race-heal-gone", None);
+        let (cfg, healed) = load_config_via(&t.0, racing_read(Ok("\0\0".to_string()))).unwrap();
+        assert!(
+            !cfg.has_location() && healed.is_none(),
+            "first run, not a heal"
+        );
+        let written: Config = serde_json::from_str(&fs::read_to_string(&t.0).unwrap()).unwrap();
+        assert!(!written.has_location());
+    }
+
+    #[test]
+    fn a_config_that_keeps_changing_is_an_error_and_left_alone() {
+        let json = r#"{"latitude": 1.0}"#;
+        let t = TempConfig::new("race-forever", Some(json));
+        let err = load_config_via(&t.0, |_| Err(std::io::ErrorKind::NotFound.into()))
+            .expect_err("never defaults for a file that exists");
+        assert!(err.contains("kept changing"), "{err}");
+        assert_eq!(fs::read_to_string(&t.0).unwrap(), json);
+    }
+
+    #[test]
+    fn an_empty_config_another_program_is_writing_is_unreadable_not_reset() {
+        // An editor holds the file open to write it: what it will hold is
+        // unknown. Defaults returned as if read would be persisted over its
+        // save later, so the load fails (the session then runs read-only)
+        // and nothing is written.
+        let t = TempConfig::new("heal-busy", Some(""));
+        let writer = fs::OpenOptions::new().write(true).open(&t.0).unwrap();
+        let result = load_config_ex(&t.0);
+        drop(writer);
+        let err = result.expect_err("a file being written is not an empty one");
+        assert!(err.contains("could not be read"), "{err}");
+        assert_eq!(fs::read(&t.0).unwrap(), b"");
+    }
+
+    #[test]
+    fn a_dangling_config_link_is_an_error_that_names_no_race() {
+        // Missing when read, but create_new refuses the link itself: the
+        // load must fail without writing through the link, and must not
+        // blame a file that "kept changing". (A dangling junction already
+        // fails at the read, with access denied.)
+        let t = TempConfig::new("dangling-link", None);
+        let target = t.0.with_extension("missing-target");
+        if let Err(e) = std::os::windows::fs::symlink_file(&target, &t.0) {
+            eprintln!("SKIP: can't create a symlink here ({e}) - dangling-link path not exercised");
+            return;
+        }
+        let err = load_config_ex(&t.0).expect_err("nothing to read or create");
+        assert!(!err.contains("kept changing"), "{err}");
+        assert!(!target.exists(), "the link's target must not be created");
+    }
+
     #[test]
     fn save_config_at_fails_cleanly_on_a_read_only_target() {
         let json = "{\"latitude\": 1.0, \"longitude\": 2.0}";
@@ -4946,6 +5288,121 @@ mod tests {
         }
     }
 
+    // --- tier-1 read-back (v0.5.1) ---
+
+    #[test]
+    fn only_a_declared_change_can_be_verified_from_the_registry() {
+        let night = slot(Theme::Dark, md(false, false), true);
+        assert_eq!(unverifiable_reason(&night, Some(md(true, true))), None);
+        assert_eq!(
+            unverifiable_reason(&night, Some(md(true, false))),
+            None,
+            "half matching still has a change to show"
+        );
+        assert_eq!(
+            unverifiable_reason(&night, None),
+            None,
+            "unreadable before: a reading after can still tell"
+        );
+        assert_eq!(
+            unverifiable_reason(&night, Some(md(false, false))),
+            Some("already-matching")
+        );
+        let guessed = slot(Theme::Dark, md(false, false), false);
+        for pre in [None, Some(md(true, true)), Some(md(false, false))] {
+            assert_eq!(
+                unverifiable_reason(&guessed, pre),
+                Some("modes-not-in-theme-file")
+            );
+        }
+    }
+
+    #[test]
+    fn readback_catches_a_tier1_success_that_changed_nothing() {
+        let night = slot(Theme::Dark, md(false, false), true);
+        let day = Some(md(true, true));
+        // The modes stayed put for the whole window: a no-op, whatever
+        // SetCurrentTheme returned. The last reading is reported.
+        assert_eq!(
+            readback_verdict(&night, day, &[day; 3]),
+            ReadBack::NoOp(md(true, true))
+        );
+        // Half applied (only the taskbar changed) is not the target either.
+        assert_eq!(
+            readback_verdict(&night, day, &[Some(md(true, false))]),
+            ReadBack::NoOp(md(true, false))
+        );
+        // Reached at once, or once Windows wrote the values a moment later.
+        assert_eq!(
+            readback_verdict(&night, day, &[Some(md(false, false))]),
+            ReadBack::Reached
+        );
+        assert_eq!(
+            readback_verdict(
+                &night,
+                day,
+                &[day, Some(md(true, false)), Some(md(false, false))]
+            ),
+            ReadBack::Reached
+        );
+        assert_eq!(
+            readback_verdict(&night, None, &[Some(md(false, false))]),
+            ReadBack::Reached
+        );
+        // A failed reading proves nothing: the last one that succeeded
+        // decides, and with none at all tier 1 is trusted.
+        assert_eq!(
+            readback_verdict(&night, day, &[day, None]),
+            ReadBack::NoOp(md(true, true))
+        );
+        assert_eq!(
+            readback_verdict(&night, day, &[None, None]),
+            ReadBack::Unverifiable("unreadable")
+        );
+    }
+
+    #[test]
+    fn readback_trusts_tier1_when_the_modes_cant_tell() {
+        // Same-mode themes (only the wallpaper differs) and key-less themes
+        // have no change to show, so no reading can make them a no-op.
+        let night = slot(Theme::Dark, md(false, false), true);
+        assert_eq!(
+            readback_verdict(&night, Some(md(false, false)), &[]),
+            ReadBack::Unverifiable("already-matching")
+        );
+        let keyless = slot(Theme::Dark, md(false, false), false);
+        assert_eq!(
+            readback_verdict(&keyless, Some(md(true, true)), &[Some(md(true, true))]),
+            ReadBack::Unverifiable("modes-not-in-theme-file")
+        );
+    }
+
+    #[test]
+    fn readback_polls_the_live_modes_until_the_target_or_the_window_ends() {
+        // Read-only against this machine's Personalize values: the screen's
+        // own modes are reached at the first reading, their opposite stays a
+        // no-op for the whole window, and an unverifiable slot isn't polled.
+        let Some(screen) = read_modes() else {
+            eprintln!("SKIP: Personalize modes unreadable - read-back loop not exercised");
+            return;
+        };
+        let other = md(!screen.apps_light, !screen.system_light);
+        let missed = slot(Theme::Light, other, true);
+        let reached = tier1_readback(&slot(Theme::Light, screen, true), Some(other));
+        let noop = tier1_readback(&missed, Some(screen));
+        let unverifiable = tier1_readback(&missed, Some(other));
+        if read_modes() != Some(screen) {
+            eprintln!("SKIP: the theme changed during the test");
+            return;
+        }
+        assert_eq!(reached.0, ReadBack::Reached);
+        assert!(reached.1 < 500, "{} ms", reached.1);
+        assert_eq!(noop.0, ReadBack::NoOp(screen));
+        assert!(noop.1 >= READBACK_WINDOW.as_millis(), "{} ms", noop.1);
+        assert_eq!(unverifiable.0, ReadBack::Unverifiable("already-matching"));
+        assert!(unverifiable.1 < 100, "{} ms", unverifiable.1);
+    }
+
     // --- tier-1 name matching (v0.5.0) ---
 
     #[test]
@@ -5167,6 +5624,31 @@ mod tests {
     }
 
     #[test]
+    fn theme_files_on_long_paths_are_read_not_taken_as_keyless() {
+        // MAX_PATH (260) or more: neither this test binary nor the app has a
+        // longPathAware manifest, so GetPrivateProfileStringW couldn't open
+        // the plain path and returned the default — every key read as absent.
+        let d = TempDir::new("long-path");
+        let deep = d.0.join("a".repeat(120)).join("b".repeat(120));
+        fs::create_dir_all(&deep).unwrap();
+        let file = deep.join("Long Night.theme");
+        assert!(file.as_os_str().len() > 260);
+        fs::write(
+            &file,
+            b"[Theme]\r\nDisplayName=Far Away\r\n[VisualStyles]\r\nSystemMode=Dark\r\nAppMode=Light\r\n",
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_theme_display_name(&file).as_deref(),
+            Some("Far Away")
+        );
+        assert_eq!(
+            read_theme_ini(&file, "VisualStyles", "AppMode"),
+            Some(Some("Light".to_string()))
+        );
+    }
+
+    #[test]
     fn system_theme_display_names_resolve_via_indirect_strings() {
         // Guarded: meaningful anywhere the stock themes exist (any normal
         // Windows, incl. GitHub windows-latest runners). Exercises the
@@ -5246,12 +5728,12 @@ mod tests {
     fn theme_path_policy_accepts_only_theme_files() {
         let scratch = std::env::temp_dir().join("wts-test-no-scratch.theme");
         let ok = TempTheme::new("policy-ok", b"[Theme]\r\nDisplayName=Ok\r\n");
-        assert_eq!(check_theme_path(&ok.0, &scratch), Ok(()));
+        assert_eq!(check_theme_path(&ok.0, &scratch), Ok(ok.0.clone()));
         // Extension match is case-insensitive.
         let upper =
             std::env::temp_dir().join(format!("wts-test-{}-upper.THEME", std::process::id()));
         fs::write(&upper, b"[Theme]\r\n").unwrap();
-        assert_eq!(check_theme_path(&upper, &scratch), Ok(()));
+        assert_eq!(check_theme_path(&upper, &scratch), Ok(upper.clone()));
         let _ = fs::remove_file(&upper);
 
         let missing =
@@ -5317,10 +5799,107 @@ mod tests {
         );
         // ...but an existing file whose name has a %...% pair is just a file.
         let pct = TempTheme::new("50% Dark 50%", b"[Theme]\r\n");
-        assert_eq!(check_theme_path(&pct.0, &scratch), Ok(()));
-        // Win32 ignores trailing dots: "x.theme." is the file x.theme.
+        assert_eq!(check_theme_path(&pct.0, &scratch), Ok(pct.0.clone()));
+        // Win32 ignores trailing dots: "x.theme." is the file x.theme — and
+        // is used by that name.
         let dotted = PathBuf::from(format!("{}.", ok.0.display()));
-        assert_eq!(check_theme_path(&dotted, &scratch), Ok(()));
+        assert_eq!(check_theme_path(&dotted, &scratch), Ok(ok.0.clone()));
+    }
+
+    #[test]
+    fn a_respelled_theme_path_takes_the_file_name_stored_on_disk() {
+        // Win32 opens a trailing-dot, differently cased or 8.3 spelling as
+        // the same file, but a theme without a DisplayName is named after
+        // its file, and tier 1 matches that name exactly.
+        use windows_sys::Win32::Storage::FileSystem::GetShortPathNameW;
+        let scratch = std::env::temp_dir().join("wts-test-no-scratch.theme");
+        let t = TempTheme::new("Stored Name", b"[Theme]\r\nColor=1\r\n");
+        let stored = t.0.file_name().unwrap();
+        let shouted =
+            t.0.with_file_name(stored.to_string_lossy().to_ascii_uppercase());
+        let dotted = PathBuf::from(format!("{}.", t.0.display()));
+        for typed in [&shouted, &dotted] {
+            assert_eq!(
+                check_theme_path(typed, &scratch),
+                Ok(t.0.clone()),
+                "{typed:?}"
+            );
+        }
+        // The slot carries the stored name, so the file-name fallback names
+        // the theme the way Windows lists it.
+        let cfg = Config {
+            theme_night: Some(shouted.to_string_lossy().into_owned()),
+            ..Config::default()
+        };
+        let slot = resolve_slot(Theme::Dark, &cfg);
+        assert_eq!(slot.file, t.0);
+        assert_eq!(
+            resolve_theme_display_name(&slot.file),
+            Some(t.0.file_stem().unwrap().to_string_lossy().into_owned())
+        );
+        // An 8.3 alias, where the volume makes them.
+        let long = wide(&t.0.to_string_lossy());
+        let mut buf = [0u16; 1024];
+        let n = unsafe { GetShortPathNameW(long.as_ptr(), buf.as_mut_ptr(), buf.len() as u32) }
+            as usize;
+        let short = PathBuf::from(String::from_utf16_lossy(&buf[..n.min(buf.len())]));
+        if n == 0 || n >= buf.len() || short.file_name() == Some(stored) {
+            eprintln!("SKIP: no 8.3 name for {}", t.0.display());
+        } else {
+            assert_eq!(
+                check_theme_path(&short, &scratch),
+                Ok(short.with_file_name(stored))
+            );
+        }
+    }
+
+    #[test]
+    fn a_stored_name_that_isnt_the_same_file_keeps_the_path_as_written() {
+        // A symlink `links\Night.theme` -> `targets\Target.theme`, with an
+        // unrelated `links\Target.theme` beside the link: the canonical name
+        // names a different file there, so the link's own spelling stays.
+        // (Simulated with the target's real canonical path — creating a
+        // symlink needs a privilege tests can't count on.)
+        let d = TempDir::new("stored-name-guard");
+        fs::create_dir_all(d.0.join("links")).unwrap();
+        fs::create_dir_all(d.0.join("targets")).unwrap();
+        let decoy = d.0.join("links\\Target.theme");
+        let target = d.0.join("targets\\Target.theme");
+        fs::write(&decoy, b"[Theme]\r\nDisplayName=Decoy\r\n").unwrap();
+        fs::write(&target, b"[Theme]\r\nDisplayName=Target\r\n").unwrap();
+        let link = d.0.join("links\\Night.theme");
+        let real = fs::canonicalize(&target).unwrap();
+        assert_eq!(with_stored_name(&link, Some(&real)), link);
+        assert_eq!(with_stored_name(&link, None), link);
+        // The same comparison does respell a path to the very file it names.
+        let typed = d.0.join("targets\\target.THEME");
+        assert_eq!(with_stored_name(&typed, Some(&real)), target);
+    }
+
+    #[test]
+    fn long_paths_get_the_verbatim_form_for_win32_file_apis() {
+        let short = r"C:\Users\me\Themes\Night.theme";
+        assert_eq!(win32_path_arg(short), short);
+        let deep = "d".repeat(250);
+        let local = format!(r"C:\{deep}\Night.theme");
+        assert_eq!(win32_path_arg(&local), format!(r"\\?\{local}"));
+        let share = format!(r"\\server\share\{deep}\Night.theme");
+        assert_eq!(
+            win32_path_arg(&share),
+            format!(r"\\?\UNC\server\share\{deep}\Night.theme")
+        );
+        let verbatim = format!(r"\\?\{local}");
+        assert_eq!(win32_path_arg(&verbatim), verbatim);
+        // Not absolute: a prefix can't fix that.
+        let relative = format!(r"{deep}\Night.theme");
+        assert_eq!(win32_path_arg(&relative), relative);
+        // The threshold counts UTF-16 units: 246 stay plain, 247 don't.
+        let of_len = |n: usize| format!(r"C:\{}", "x".repeat(n - 3));
+        assert_eq!(win32_path_arg(&of_len(246)), of_len(246));
+        assert_eq!(
+            win32_path_arg(&of_len(247)),
+            format!(r"\\?\{}", of_len(247))
+        );
     }
 
     #[test]
