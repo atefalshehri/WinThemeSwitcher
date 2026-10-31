@@ -215,7 +215,7 @@ A history of bugs that shipped in a release and the version that fixed them.
 
 ## Contributing
 
-**Status: stable for personal use.** The tray/apply/scheduling core is mature (120 unit tests; CI fails on any compiler or clippy warning, tests included, and on unformatted code; the deployed binary verified daily for months). Working toward distribution polish — winget submission (gated on v0.6.0's CA-signed cert), a Scoop bucket, and retiring the §Antivirus false positives section. Issues and PRs welcome — please open an issue to discuss larger changes before sending a patch. Focus areas: see [Roadmap](#roadmap).
+**Status: stable for personal use.** The tray/apply/scheduling core is mature (120 unit tests; CI fails on any compiler or clippy warning, tests included, on unformatted code, and on a dependency with a known vulnerability or a license other than MIT, Apache-2.0 or Unicode-3.0; the deployed binary verified daily for months). Working toward distribution polish — winget submission (gated on v0.6.0's CA-signed cert), a Scoop bucket, and retiring the §Antivirus false positives section. Issues and PRs welcome — please open an issue to discuss larger changes before sending a patch. Focus areas: see [Roadmap](#roadmap).
 
 ## License
 

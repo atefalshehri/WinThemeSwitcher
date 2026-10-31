@@ -64,3 +64,39 @@ jobs:
 
       - name: Clippy
         run: cargo clippy --release --locked --all-targets -- -D warnings
+
+  # Dependency audit, configured by deny.toml: RustSec advisories, licenses,
+  # banned or duplicated crates and crate sources, for the graph the
+  # x86_64-pc-windows-msvc build uses (cargo-deny reads it from Linux just as
+  # well). A new advisory can fail this job with no code change - deny.toml
+  # says what to do.
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # cargo-deny comes from its GitHub release, checked against this SHA-256 -
+    # not through its Docker action, which downloads the binary without a
+    # check and runs it with a token that can write the Actions cache. To bump
+    # it, take the new version's x86_64-unknown-linux-musl.tar.gz digest from
+    # the release (gh api repos/EmbarkStudios/cargo-deny/releases/tags/<v>).
+    env:
+      DENY_VERSION: "0.20.2"
+      DENY_SHA256: "9f12ed4c49936e09b48bf862b595cde2fe64fcbd9d74dfacac6131ca824c8d5f"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The build job's toolchain (cargo-deny runs cargo metadata).
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-09-12
+        with:
+          toolchain: stable
+
+      - name: Install cargo-deny
+        run: |
+          curl -sSfL -o "$RUNNER_TEMP/cargo-deny.tar.gz" "https://github.com/EmbarkStudios/cargo-deny/releases/download/$DENY_VERSION/cargo-deny-$DENY_VERSION-x86_64-unknown-linux-musl.tar.gz"
+          echo "$DENY_SHA256  $RUNNER_TEMP/cargo-deny.tar.gz" | sha256sum -c -
+          mkdir "$RUNNER_TEMP/cargo-deny"
+          tar -xzf "$RUNNER_TEMP/cargo-deny.tar.gz" -C "$RUNNER_TEMP/cargo-deny" --strip-components=1
+
+      - name: cargo deny check
+        run: '"$RUNNER_TEMP/cargo-deny/cargo-deny" --all-features --locked check'

@@ -1,0 +1,45 @@
+# cargo-deny configuration for the audit job in .github/workflows/ci.yml
+# (cargo deny check: advisories, licenses, bans, sources; cargo-deny 0.20.2).
+# Anything not set here keeps cargo-deny's default.
+
+[graph]
+# The app is built for this target only, so crates that only other targets
+# pull in (the tray and windowing crates have Linux and macOS dependencies)
+# are left out of every check.
+targets = ["x86_64-pc-windows-msvc"]
+
+[advisories]
+# RustSec vulnerability (and the rare "notice") advisories always fail the
+# check; unmaintained and unsound ones fail only for direct dependencies. A
+# new advisory can fail CI with no code change. Move to a fixed version:
+# cargo update -p <crate>@<locked version> when the fix is semver-compatible
+# (the @version is needed for crates locked in several versions, like
+# windows-sys); otherwise raise the requirement in Cargo.toml, or update the
+# crate that pulls it in (cargo tree -i <crate>@<locked version>). Then run
+# scripts\test.ps1 and commit Cargo.lock. Only when no fix is reachable and
+# the advisory doesn't affect this app, add { id = "RUSTSEC-...", reason =
+# "..." } here.
+unmaintained = "workspace"
+unsound = "workspace"
+ignore = []
+
+[licenses]
+# Exactly the licenses the dependency graph uses (checked 2026-10-31): most
+# crates are MIT OR Apache-2.0, winit is Apache-2.0, dpi needs both, and
+# unicode-ident adds Unicode-3.0. A dependency under any other license fails
+# the check until it has been reviewed and added here.
+allow = ["MIT", "Apache-2.0", "Unicode-3.0"]
+
+[bans]
+# Duplicates are reported, not failed: windows-sys in three versions (winit
+# 0.52, this app 0.59, tray-icon and muda 0.61); windows-targets and
+# windows_x86_64_msvc in two (0.52 via windows-sys 0.52/0.59, 0.53 via this
+# app's windows 0.59); windows-link in two (0.1 via windows 0.59, 0.2 via
+# windows-sys 0.61 and chrono).
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+# Registries and git repositories: crates.io only.
+unknown-registry = "deny"
+unknown-git = "deny"
