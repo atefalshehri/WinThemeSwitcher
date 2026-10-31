@@ -1,5 +1,5 @@
 # Applies to every build of this repo: scripts\build.ps1, scripts\test.ps1,
-# bare cargo, and both GitHub workflows.
+# bare cargo, and the CI workflow (ci.yml).
 #
 # "Hybrid CRT": link the Visual C++ runtime (vcruntime140) statically but keep
 # the Universal CRT dynamic. vcruntime140.dll is NOT part of Windows — it comes

@@ -23,7 +23,8 @@
 # The repo has IMMUTABLE RELEASES on (required here): publishing locks the
 # assets and the tag for good and burns the version number even if the
 # release is later deleted, so a bad release is fixed by a new version only.
-#   0 preflight  gh >= 2.93 and authenticated; immutable releases enabled; clean tree;
+#   0 preflight  the publisher cert is trusted here (in Root, not Disallowed);
+#                gh >= 2.93 and authenticated; immutable releases enabled; clean tree;
 #                Cargo.toml version; the commit's workflows are exactly
 #                ci.yml and it can neither run on a tag nor write; an
 #                existing tag must point at HEAD (and be on origin/main),
@@ -52,6 +53,7 @@
 #   22 CI gate failed                 27 publishing / post-publish check failed
 #   23 release state forbids going on 28 tag creation / push failed
 #   24 build.ps1 / local assets bad   29 the commit's workflows fail the guard
+#   30 the publisher cert isn't trusted here (not in Root, or in Disallowed)
 param(
     [Parameter(Mandatory = $true)][string]$Version,
     [switch]$Publish,
@@ -144,7 +146,12 @@ function Test-ZipContents([string]$zipPath, [string]$exePath) {
         if ($a -cne $b) { return "$f inside the zip differs from the repo's at $sha (ignoring line endings)" }
     }
     foreach ($p in @($exePath, $inner)) {
-        if (-not (Test-SignedExe $p)) { return "$p is not Valid + timestamped + signed by $thumbprint" }
+        if (-not (Test-SignedExe $p)) {
+            # The details tell this machine's trust (UnknownError: root
+            # missing; NotTrusted: distrusted) from a bad file (HashMismatch).
+            $g = Get-AuthenticodeSignature -LiteralPath $p
+            return "$p is not Valid + timestamped + signed by $thumbprint (status $($g.Status), signer $(if ($g.SignerCertificate) { $g.SignerCertificate.Thumbprint } else { 'none' }), timestamped $([bool]$g.TimeStamperCertificate))"
+        }
     }
     return ""
 }
@@ -189,7 +196,7 @@ function Get-HeaderText {
     "The exe - standalone and inside the zip - is Authenticode-signed with the project's **self-signed** publisher certificate " +
     "(``CN=WinThemeSwitcher Self-Signed``, thumbprint ``$thumbprint``) and carries an RFC 3161 timestamp. " +
     "Importing the included ``.cer`` ([README: Install]($readme#install), step 2) makes Windows report the signature as valid; " +
-    "SmartScreen may still warn about a new self-signed app (step 3), and so may some antivirus products. " +
+    "SmartScreen may still warn about a new self-signed app (step 3), and so may some antivirus products; with Smart App Control on, Windows blocks it outright (also step 3). " +
     "To check the signature: [README: Verifying the signature]($readme#verifying-the-signature).`n"
 }
 # The notes must be intact; with $header (a draft created by THIS run) they
@@ -256,6 +263,22 @@ $tag = "v$Version"
 $zipName = "win-theme-switcher-$tag-windows-x64.zip"
 $expectedAssets = @($zipName, $exeName, $cerName | Sort-Object)
 if ($NotesFile -and -not (Test-Path -LiteralPath $NotesFile -PathType Leaf)) { Fail 20 "-NotesFile $NotesFile not found" }
+
+# Every signature check below (the build, the staged assets, a draft's or a
+# published release's downloaded assets) needs the publisher cert trusted as
+# a root here, and not distrusted. Otherwise Windows reports each signature
+# as UnknownError or NotTrusted, which would read as a bad build - or, for a
+# published release, as bad assets. CurrentUser\Root also lists the
+# machine's roots; both Disallowed stores are checked.
+$cerPath = Join-Path $repo $cerName
+if (-not (Test-Path -LiteralPath "Cert:\CurrentUser\Root\$thumbprint")) {
+    Fail 30 "the publisher cert $thumbprint is not a trusted root on this machine, so no signature can verify as Valid - check that (Get-PfxCertificate '$cerPath').Thumbprint is $thumbprint, then import it (Windows asks to confirm) with Import-Certificate -FilePath '$cerPath' -CertStoreLocation Cert:\CurrentUser\Root"
+}
+foreach ($store in @("Cert:\CurrentUser\Disallowed", "Cert:\LocalMachine\Disallowed")) {
+    if (Test-Path -LiteralPath "$store\$thumbprint") {
+        Fail 30 "the publisher cert $thumbprint is in $store (untrusted certificates), so every signature reads as NotTrusted - remove it from there first"
+    }
+}
 
 if (-not (Get-Command gh -ErrorAction SilentlyContinue)) { Fail 21 "GitHub CLI (gh) not found" }
 # gh <= 2.92 sends the github.com token to tuf-repo.github.com during
@@ -361,10 +384,10 @@ $reuse = $false
 if ($state -and -not $state.draft) {
     # Published: never modified. Re-verify what is being served, read-only.
     $why = Test-RemoteAssets $null
-    if ($why) { Fail 23 "$tag is PUBLISHED ($($state.url)) and its assets FAIL verification: $why - ship a new patch version" }
+    if ($why) { Fail 23 "$tag is PUBLISHED ($($state.url)) and its assets FAIL verification: $why - re-run this command first (a gh or network error clears on a re-run); only a digest, content or signature mismatch that persists means releasing the next patch version (a signature status of UnknownError or NotTrusted is this machine's trust, not the file)" }
     if ($state.immutable) {
         $why = Test-Attestation
-        if ($why) { Fail 23 "$tag is published and immutable, but its attestation does not verify: $why" }
+        if ($why) { Fail 23 "$tag is published and immutable, but its attestation does not verify: $why - re-run this command first (a gh or network error clears on a re-run). If it persists, compare with an earlier attested release (v0.3.2 or later, e.g. $NotesStartTag): if gh release verify $NotesStartTag --repo $ownerRepo fails too, this machine's gh or network is the problem (upgrade gh, check its TUF cache), not $tag; only gh release verify $tag --repo $ownerRepo or gh release verify-asset $tag <downloaded $exeName> --repo $ownerRepo failing while $NotesStartTag verifies means releasing the next patch version" }
     } else {
         Write-Output "   WARNING: $tag is published but MUTABLE (published before immutable releases were enabled); its assets could still be replaced. Any edit freezes it, e.g.: gh release edit $tag --notes-file <current notes>"
     }
@@ -536,9 +559,10 @@ if ($rc -ne 0) { Fail 27 "gh release edit failed: $errText" }
 # From here on the release is public and (normally) immutable: the assets
 # and tag can't be changed and the version number can't be reused. A check
 # failing here may be transient: re-running this command re-verifies the
-# published release read-only. Only a failure that persists means shipping
-# the next patch version.
-$burned = "$tag is PUBLISHED and can't be changed - re-run this command to re-verify it read-only; if it still fails, release the next patch version"
+# published release read-only and says what to fix. Only bad assets, a tag
+# at the wrong commit or a bad attestation that persist mean shipping the
+# next patch version; a prerelease/latest flag is fixed with gh release edit.
+$burned = "$tag is PUBLISHED - re-run this command first: it re-verifies the release read-only and says what to fix (a gh or network error clears on a re-run; a prerelease/latest flag is fixed with gh release edit); only bad assets, a tag at the wrong commit or a bad attestation that persist mean releasing the next patch version"
 $s = Get-ReleaseState 27
 if (-not $s -or $s.draft -or $s.prerelease) { Fail 27 "after publishing: draft=$($s.draft) prerelease=$($s.prerelease) - check the release page ($burned)" }
 if ((Get-RemoteTagCommit 27) -ne $sha) { Fail 27 "after publishing, $tag does not point at $sha ($burned)" }

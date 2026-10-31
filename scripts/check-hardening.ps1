@@ -1,7 +1,7 @@
 # Verifies that the .cargo\config.toml linker hardening actually reached an
 # exe: no VCRUNTIME140 import (hybrid CRT) and DependentLoadFlags = 0x800
 # (static imports resolve from System32 only). Used by scripts\build.ps1 and
-# by both GitHub workflows, so losing the config can't slip through CI.
+# by the CI workflow (ci.yml), so losing the config can't slip through CI.
 #
 # Usage:
 #   powershell -NoProfile -ExecutionPolicy Bypass -File scripts\check-hardening.ps1 -Exe <path-to-exe>

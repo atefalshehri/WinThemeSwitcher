@@ -14,6 +14,9 @@ permissions:
 jobs:
   build:
     runs-on: windows-latest
+    # A hung step (e.g. a test stuck on a dialog) would otherwise run for
+    # GitHub's 6-hour default while release.ps1's CI gate waits for it.
+    timeout-minutes: 30
     steps:
       # Third-party actions are pinned by commit SHA (tags are mutable).
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -50,12 +53,14 @@ jobs:
       - name: Test
         run: cargo test --locked
 
-      # Advisory (continue-on-error): formatting and lint findings are
-      # reported but don't fail the build.
+      # Hard gates too. Clippy also lints the tests (--all-targets) and fails
+      # on any compiler or clippy warning. The toolchain is the floating
+      # stable, so a new Rust release can add a lint that fails this step with
+      # no code change: rustup update stable locally to see it, then fix it or
+      # #[allow] it with a reason. Never move these flags into RUSTFLAGS -
+      # that replaces the .cargo/config.toml hardening.
       - name: Format check
         run: cargo fmt --check
-        continue-on-error: true
 
       - name: Clippy
-        run: cargo clippy --release --locked -- -W clippy::all
-        continue-on-error: true
+        run: cargo clippy --release --locked --all-targets -- -D warnings

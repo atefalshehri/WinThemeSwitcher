@@ -25,6 +25,8 @@ Automatically swap between two Windows 11 **themes** at local sunrise and sunset
    Windows shows a security warning when adding a root certificate — that's expected; confirm it.
 3. Run `win-theme-switcher.exe`. SmartScreen may say *"Windows protected your PC"* for a new self-signed app — choose **More info → Run anyway**. A half-orange / half-dark-blue circle appears in the notification area; on Windows 11 new icons often start in the overflow (**^**) menu — drag it onto the taskbar to keep it visible.
 
+   **Smart App Control** is a separate check. When it's **On** (Windows Security → App & browser control → Smart App Control settings), Windows blocks this self-signed build outright: there's no *Run anyway*, no way to allow a single app, and the certificate from step 2 doesn't count. To use the app, turn Smart App Control off (whether it can be turned back on later depends on your Windows build), or wait for the CA-signed builds planned for v0.6.0. In *Evaluation* mode it blocks nothing yet, but Windows may later switch it on by itself, and from then on the app is blocked, including its start at login.
+
 On first launch the app reads your coordinates via Windows Location. If Location is off or denied, a dialog asks if you want to enable it (opens Settings) or fall back to manual entry (opens `config.json` in an editor). After editing config, right-click tray → **Refresh**.
 
 ## Configuration
@@ -73,7 +75,7 @@ If two copies are launched, the second shows a notice and exits (single-instance
 Get-AuthenticodeSignature .\win-theme-switcher.exe | Format-List Status, SignerCertificate
 ```
 
-After [Install](#install) step 2 this shows `Status : Valid` with `SignerCertificate : [Subject] CN=WinThemeSwitcher Self-Signed`. (Before the cert is trusted, `Status` is `UnknownError` — the chain ends in a root Windows doesn't know yet.) A valid signature means the file was signed with this project's key and hasn't been modified since. Self-signed certs can't suppress SmartScreen — that's cloud reputation, which a CA-signed cert builds over time (v0.6.0 row in [Roadmap](#roadmap)).
+After [Install](#install) step 2 this shows `Status : Valid` with `SignerCertificate : [Subject] CN=WinThemeSwitcher Self-Signed`. (Before the cert is trusted, `Status` is `UnknownError` — the chain ends in a root Windows doesn't know yet.) A valid signature means the file was signed with this project's key and hasn't been modified since. Self-signed certs can't suppress SmartScreen — that's cloud reputation, which a CA-signed cert builds over time (v0.6.0 row in [Roadmap](#roadmap)). Nor does a self-signed cert get past Smart App Control, which goes by cloud reputation or a signature from a CA in Microsoft's Trusted Root Program, never a root you added yourself ([Install](#install) step 3).
 
 Releases are **immutable** on GitHub (v0.3.2 and later): their files and tag can't be changed, and GitHub attaches a release attestation. With [GitHub CLI](https://cli.github.com/) **2.93 or later** (earlier versions leak your login token during this check — [GHSA-8xvp-7hj6-mcj9](https://github.com/cli/cli/security/advisories/GHSA-8xvp-7hj6-mcj9)), signed in with `gh auth login`, you can confirm that a downloaded file is exactly the one published (this checks the file's contents, not its signature):
 
@@ -112,7 +114,7 @@ cargo build --release     # → target\release\win-theme-switcher.exe
 cargo test
 ```
 
-Run cargo from the repo folder: `.cargo\config.toml` (picked up from the current directory) links the Visual C++ runtime statically, so the exe has no `VCRUNTIME140.dll` dependency. Some antivirus products flag freshly built *unsigned* executables; if yours does, exclude the `target\` folder or sign the output with your own code-signing cert.
+Run cargo from the repo folder: `.cargo\config.toml` (picked up from the current directory) links the Visual C++ runtime statically, so the exe has no `VCRUNTIME140.dll` dependency. Some antivirus products flag freshly built *unsigned* executables; if yours does, exclude the `target\` folder or sign the output with your own code-signing cert. Smart App Control can't be handled that way: when it's on, it blocks the build scripts and tests that cargo compiles and runs, so building needs it off.
 
 **Maintainer release builds** use `scripts\build.ps1` (build → verify linker hardening → sign with the project cert + RFC 3161 timestamp → deploy), `scripts\test.ps1` (signs the test binary before running it), and `scripts\release.ps1` (the only thing that writes GitHub releases: CI gate → signed build → verified draft → tag + publish) — all need the project's private signing key, so they only work on the maintainer's machine. Details in [CLAUDE.md → Build](CLAUDE.md#build).
 
@@ -195,7 +197,7 @@ A history of bugs that shipped in a release and the version that fixed them.
    - **1c. Done in v0.4.1**: the recurring `wake_listener_err stage=power_register code=87` was a wrong API — fixed (see [Correctness fixes](#correctness-fixes)).
    - **1d. Done in v0.5.0**: releases are no longer marked *prerelease*; `/releases/latest` works, which unblocks winget automation.
    - **1e. Done 2026-09-28**: GitHub *immutable releases* enabled — a published release's files and tag are locked and carry a release attestation (`gh release verify-asset`); `scripts\release.ps1` requires the setting and verifies the attestation after publishing. Releases published before the setting was enabled became immutable when next edited: v0.3.2–v0.5.0 were converted the same day after their files were re-verified (v0.3.2's and v0.4.1's stale "unsigned" notes corrected); v0.1.0–v0.3.1 were left as they are.
-2. **CA-signed releases** via [SignPath Foundation's free OSS program](https://signpath.org) — signing moves into CI, so releases no longer depend on the maintainer's machine and local key. Reduces SmartScreen prompts over time via cert reputation (no cert eliminates them outright). Azure Trusted Signing is not an option: individual validation is US/Canada-only.
+2. **CA-signed releases** via [SignPath Foundation's free OSS program](https://signpath.org) — signing moves into CI, so releases no longer depend on the maintainer's machine and local key. Reduces SmartScreen prompts over time via cert reputation (no cert eliminates them outright). It's also what lets the exe run with Smart App Control on, provided the certificate chains to a CA in Microsoft's Trusted Root Program — check that before choosing a provider. Azure Trusted Signing is not an option: individual validation is US/Canada-only.
 3. **Submit the first CA-signed binary to Microsoft Defender** — this gates winget, whose validation pipeline runs AV scans — and to Kaspersky. Repeat only if a specific release gets flagged.
 4. **winget package** (`InstallerType: portable`), only after steps 2–3 (CA signing and the Defender submission), since winget's validation runs AV scans; asset hashes are already final at publish time (steps 1b and 1e). A personal Scoop bucket may come earlier: Scoop's `persist` mechanism fits the exe-relative config model better than winget's symlink layout.
 
@@ -213,7 +215,7 @@ A history of bugs that shipped in a release and the version that fixed them.
 
 ## Contributing
 
-**Status: stable for personal use.** The tray/apply/scheduling core is mature (120 unit tests; free of compiler and clippy warnings when released, though CI only reports clippy's findings and doesn't fail on them; the deployed binary verified daily for months). Working toward distribution polish — winget submission (gated on v0.6.0's CA-signed cert), a Scoop bucket, and retiring the §Antivirus false positives section. Issues and PRs welcome — please open an issue to discuss larger changes before sending a patch. Focus areas: see [Roadmap](#roadmap).
+**Status: stable for personal use.** The tray/apply/scheduling core is mature (120 unit tests; CI fails on any compiler or clippy warning, tests included, and on unformatted code; the deployed binary verified daily for months). Working toward distribution polish — winget submission (gated on v0.6.0's CA-signed cert), a Scoop bucket, and retiring the §Antivirus false positives section. Issues and PRs welcome — please open an issue to discuss larger changes before sending a patch. Focus areas: see [Roadmap](#roadmap).
 
 ## License
 
