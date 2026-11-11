@@ -45,10 +45,18 @@ On first launch the app reads your coordinates via Windows Location. If Location
 
 | Field | Default | Meaning |
 |---|---|---|
-| `latitude` / `longitude` | from Windows Location, else `0.0` | Decimal degrees. `0.0, 0.0` triggers the first-run location flow. |
+| `latitude` / `longitude` | from Windows Location, else `0.0` | Decimal degrees: latitude −90 to 90 (north positive), longitude −180 to 180 (east positive). `0.0, 0.0`, or neither key, triggers the first-run location flow. |
 | `auto_start` | `true` | When `true`, registers `HKCU\...\Run\WinThemeSwitcher`; when `false`, removes the entry. Applied on every launch and on Refresh. |
 | `theme_day` | `null` → `%SystemRoot%\Resources\Themes\aero.theme` | Path to the `.theme` applied after sunrise. |
 | `theme_night` | `null` → `%SystemRoot%\Resources\Themes\dark.theme` | Path to the `.theme` applied after sunset. |
+
+**Coordinates** (from v0.6.0, not released yet; v0.5.1 and earlier use whatever numbers the file has, and save Windows Location's reading at full precision).
+
+- A latitude or longitude outside its range, or one of the two keys without the other (left out or misspelled), is reported as a config error and the file is left as it is. On Refresh the app keeps switching by the settings it had. At startup it runs on the defaults until the file is fixed and you choose Refresh: the stock Windows themes, and Windows Location's coordinates if Location is on (otherwise it doesn't switch).
+- A longitude written 0 to 360 (237.67), which v0.3.2 through v0.5.1 happened to handle, is an error too: west is negative, so subtract 360 (−122.33).
+- The error names the key, not the number: the text also goes to `events.log`, and your coordinates are kept out of it.
+- Coordinates the app reads from Windows Location are saved with 2 decimals (about 1 km, which moves a sunrise or sunset by a few seconds), 3 from 60° latitude on.
+- Coordinates already in the file are never rewritten. To shorten ones an earlier version saved, edit them down to 2 decimals. Or, with Windows Location on, set both to `0.0` and choose Refresh — with Location off that leaves the app without coordinates, and it stops switching until the file has them again.
 
 **Custom themes.** Save the theme you want in Settings → Personalization → Themes → **Save**, give it a **unique name**, and point the config at the saved file, e.g. `"%LOCALAPPDATA%\\Microsoft\\Windows\\Themes\\MyNight.theme"` (JSON needs double backslashes).
 
@@ -181,14 +189,14 @@ A history of bugs that shipped in a release and the version that fixed them.
 ### Foundation
 
 - **Planned for v0.6.0 — behavior fixes** (the September 2026 audit's remaining follow-ups and the October 2026 review's; the audit's custom-theme, `tray-icon` and Actions-pinning items shipped in v0.5.0):
-  - coordinates aren't range-checked: an out-of-range value (225 for 22.5) gives a schedule that's hours off, and an out-of-range latitude can swap day and night; a single missing or misspelled coordinate key counts as 0.0 (a value that isn't a number is already reported as a config error, and a file with no coordinates at all keeps meaning "ask Windows Location");
-  - saved coordinates keep full sensor precision (2 decimals is plenty; 3 from 60° on, as a margin: from about 65.7°, where polar day and night begin, a small change can move their start by tens of minutes);
+  - *done on main 2026-11-11, ships with v0.6.0:* coordinates are range-checked — an out-of-range value (225 for 22.5) gave a schedule that was hours off, and an out-of-range latitude could swap day and night; a single missing or misspelled coordinate key counted as 0.0. Both are config errors now (a value that isn't a number already was, and a file with no coordinates at all keeps meaning "ask Windows Location");
+  - *done on main 2026-11-11, ships with v0.6.0:* coordinates read from Windows Location are saved with 2 decimals instead of full sensor precision (3 from 60° on, as a margin: from about 65.7°, where polar day and night begin, a small change can move their start by tens of minutes); coordinates already in the file are left as they are;
   - a double Toggle during a pending apply retry is reverted by the retry (the stand-down only sees an odd number of toggles); the fix starts by making the step from a tick's apply outcome to its saved state and next deadline a pure, tested function;
   - if the first copy runs elevated, a second copy can still start (the single-instance check can't open the elevated copy's lock, and carries on);
   - there's no application manifest (themed dialogs; DPI awareness for the dialogs shown before the tray exists) and no version resource, and the running version is never logged;
   - autostart is registered from wherever the exe runs (even a temp folder); a read-only exe folder fails silently; the Run and Personalize registry keys are opened but never created when missing; an entry disabled in Startup settings goes unexplained; repairing an empty or NUL-filled `config.json` turns autostart back on even if you had turned it off;
   - a slow Windows Location lookup blocks startup and Refresh for up to a minute (v0.6.0 caps the wait; v0.8.0 moves the lookup off the startup path);
-  - the first-run location dialogs can say untrue things (that Settings opened when it didn't; "off or not allowed" after a timeout), and they refer to a tray icon that doesn't exist yet;
+  - the first-run location dialogs can say untrue things (that Settings opened when it didn't; "off or not allowed" whenever the lookup fails for another reason — a timeout, an error, a reading the app rejects), and they refer to a tray icon that doesn't exist yet;
   - a theme on an unreachable network share freezes the tray for 20–40 s each time its path is checked;
   - the release ships without third-party license notices.
 - **Planned for v0.6.1 — the tier-2 path** (pure bug fixes; tier 2 runs whenever tier 1 can't apply the theme, and for a custom theme Settings doesn't list, or whose name another theme file shares, that's every switch):
@@ -234,14 +242,14 @@ Accepted by design (details in CLAUDE.md); they don't block v1.0:
 ### Maintenance notes
 
 - **winit `ApplicationHandler` migration** — planned with v0.8.0, which rebuilds startup anyway (winit 0.31 is still in beta; the pinned 0.30 only deprecates `EventLoop::run`, allowed at the call site). Worth evaluating then: dropping winit for a plain Win32 message loop — the pattern already exists in the wake listener.
-- **Dependency updates** — `windows-sys` 0.61 at the start of v0.6.0 (it touches every Win32 call); `windows` 0.62 and `tray-icon` 0.26 with v0.8.0's location and tooltip work.
+- **Dependency updates** — `windows-sys` 0.61 at the start of v0.6.0 (it touches every Win32 call; done on main 2026-11-11); `windows` 0.62 and `tray-icon` 0.26 with v0.8.0's location and tooltip work.
 - **Not tied to a release** — declare `rust-version` (1.91); Dependabot for the pinned Actions and crates; parse and lint `scripts\*.ps1` in CI; `release.ps1` refuses a CI result older than about a week (the dependency audit sees advisories as of the push); `build.ps1` and `test.ps1` check the signing certificate before compiling and also look for cargo on PATH, and `test.ps1` fails when a filter matches no test and refuses `RUSTFLAGS` like `build.ps1`; keep the build machine's profile path out of the exe; tests for `set_auto_start` (against a throwaway registry key), log rotation, a half-written registry pair, and schedule-contract sweeps at 65.4° and at a mid-latitude; tests that skip silently on CI fail there instead, once a CI run shows the runner has what they need; an Upgrading section in this README.
 
 **Not planned**: GUI configuration (`config.json` + Refresh is the UX), custom wake times (sunrise/sunset is the whole point; offsets from them are fine), cross-platform (Windows only — macOS already has this natively), in-app update check (it would add the app's first network call, itself an AV signal; upgrades will come through winget and Scoop, and until then it's Quit and replace the exe), pause/snooze toggle (a manual override already pauses until the next transition or the next app start), and ADM-style scripting/hotkeys/battery rules (out of scope for a small tray tool).
 
 ## Contributing
 
-**Status: stable for personal use.** The tray/apply/scheduling core is mature (120 unit tests; CI fails on any compiler or clippy warning, tests included, on unformatted code, and on a dependency with a known vulnerability or a license other than MIT, Apache-2.0 or Unicode-3.0; in daily use on the maintainer's PC). Working toward distribution — CA signing (v0.7.0), then a winget package and a Scoop bucket, and retiring the §Antivirus false positives section. Issues and PRs welcome — please open an issue to discuss larger changes before sending a patch. Focus areas: see [Roadmap](#roadmap).
+**Status: stable for personal use.** The tray/apply/scheduling core is mature (128 unit tests; CI fails on any compiler or clippy warning, tests included, on unformatted code, and on a dependency with a known vulnerability or a license other than MIT, Apache-2.0 or Unicode-3.0; in daily use on the maintainer's PC). Working toward distribution — CA signing (v0.7.0), then a winget package and a Scoop bucket, and retiring the §Antivirus false positives section. Issues and PRs welcome — please open an issue to discuss larger changes before sending a patch. Focus areas: see [Roadmap](#roadmap).
 
 ## License
 

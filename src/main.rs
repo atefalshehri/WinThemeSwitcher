@@ -270,6 +270,56 @@ impl Config {
     }
 }
 
+/// Whether the pair is a place on Earth, in decimal degrees. False for NaN
+/// and the infinities. Checked wherever coordinates enter (config.json,
+/// Windows Location): `schedule` computes something for any numbers — 225
+/// typed for 22.5 gives a schedule that's hours off, and an out-of-range
+/// latitude can swap day and night.
+fn valid_coordinates(lat: f64, lon: f64) -> bool {
+    (-90.0..=90.0).contains(&lat) && (-180.0..=180.0).contains(&lon)
+}
+
+/// Latitude from which a Windows Location reading keeps a third decimal.
+const FINE_COORDINATES_LAT: f64 = 60.0;
+
+/// A Windows Location reading at the precision worth keeping: 2 decimals
+/// (about 1 km; it moves a sunrise or sunset by a few seconds), 3 from
+/// FINE_COORDINATES_LAT on — a margin for the latitudes from about 65.7°,
+/// where polar day and night begin and a small change in position can move
+/// their start by tens of minutes. Full sensor precision would only put the
+/// user's address into config.json. Pure — unit-tested.
+fn round_coordinates(lat: f64, lon: f64) -> (f64, f64) {
+    let scale = if lat.abs() >= FINE_COORDINATES_LAT {
+        1000.0
+    } else {
+        100.0
+    };
+    // `+ 0.0` turns a rounded -0.0 into 0.0 (it would be saved as "-0.0").
+    let round = |v: f64| (v * scale).round() / scale + 0.0;
+    let (rlat, rlon) = (round(lat), round(lon));
+    if rlat == 0.0 && rlon == 0.0 {
+        // 0/0 means "no location yet" (has_location): a reading next to it
+        // stays as it is rather than rounding into that.
+        return (lat + 0.0, lon + 0.0);
+    }
+    (rlat, rlon)
+}
+
+/// A Windows Location reading as the app keeps it — rounded — or why it
+/// can't be used: "out-of-range" when it isn't a place on Earth, "zero" for
+/// exactly 0/0, which a Config can't tell from "no location yet". Checked
+/// before rounding, so a reading just outside a limit isn't rounded into
+/// range. Pure — unit-tested.
+fn usable_location(lat: f64, lon: f64) -> Result<(f64, f64), &'static str> {
+    if !valid_coordinates(lat, lon) {
+        return Err("out-of-range");
+    }
+    if lat == 0.0 && lon == 0.0 {
+        return Err("zero");
+    }
+    Ok(round_coordinates(lat, lon))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Theme {
     Light,
@@ -723,8 +773,9 @@ fn load_config_at(path: &Path) -> Result<Config, String> {
 
 /// Load the config from `path`. A missing file is first-run: defaults are
 /// written and returned. `Err` means the file EXISTS but could not be read or
-/// parsed — it is left untouched on disk so a hand-edit typo can be fixed
-/// instead of silently wiping the user's coordinates and theme paths.
+/// parsed, or its coordinates can't be used (parse_config) — it is left
+/// untouched on disk so a hand-edit typo can be fixed instead of silently
+/// wiping the user's coordinates and theme paths.
 ///
 /// Also reports whether the file was self-healed (so callers can log it — a
 /// heal resets settings, and must not be silent). Logging stays out of here
@@ -773,11 +824,7 @@ fn load_config_via(
                     }),
                 ));
             }
-            Ok(content) => {
-                return serde_json::from_str::<Config>(&content)
-                    .map(|cfg| (cfg, None))
-                    .map_err(|e| format!("config.json is not valid JSON: {e}"));
-            }
+            Ok(content) => return parse_config(&content).map(|cfg| (cfg, None)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 let cfg = Config::default();
                 match create_config(path, &cfg) {
@@ -797,6 +844,87 @@ fn load_config_via(
         return Err("config.json is a link to a file that can't be opened".to_string());
     }
     Err("config.json kept changing while it was being read".to_string())
+}
+
+/// The two coordinate keys as config.json has them. `Config` can't show
+/// whether a key is there: a missing one deserializes to 0.0.
+#[derive(Deserialize)]
+struct CoordinateKeys {
+    latitude: Option<serde::de::IgnoredAny>,
+    longitude: Option<serde::de::IgnoredAny>,
+}
+
+/// config.json's text as a Config, with its coordinates checked. An Err is a
+/// config error like any other: the file stays as it is and the user is
+/// told. Pure — unit-tested.
+fn parse_config(content: &str) -> Result<Config, String> {
+    let cfg = serde_json::from_str::<Config>(content).map_err(config_json_error)?;
+    let keys = serde_json::from_str::<CoordinateKeys>(content).map_err(config_json_error)?;
+    check_coordinates(&cfg, &keys)?;
+    Ok(cfg)
+}
+
+/// serde_json's error as a config error, minus the value it quotes for a
+/// wrong type: `invalid type: string "24.71", expected f64 at line 2 column
+/// 23` would put a coordinate typed in quotes into events.log. What was
+/// expected and where stay.
+fn config_json_error(e: serde_json::Error) -> String {
+    let mut text = e.to_string();
+    if text.starts_with("invalid type: ") || text.starts_with("invalid value: ") {
+        if let Some(i) = text.rfind(", expected ") {
+            text = format!("wrong kind of value{}", &text[i..]);
+        }
+    }
+    format!("config.json is not valid JSON: {text}")
+}
+
+/// The file's coordinates are both there or both absent (absent, or both
+/// 0.0, means "ask Windows Location"), and in range. One key without the
+/// other — left out or misspelled — used to count as 0.0, and the schedule
+/// was computed for a place on the equator or the Greenwich meridian.
+///
+/// The messages name the key, never its value: they go to events.log as
+/// well as the dialog, and a slip (two values swapped, a digit too many)
+/// would put the user's real coordinates there.
+fn check_coordinates(cfg: &Config, keys: &CoordinateKeys) -> Result<(), String> {
+    match (keys.latitude.is_some(), keys.longitude.is_some()) {
+        (false, false) => return Ok(()),
+        (true, true) => {}
+        (has_lat, _) => {
+            let (has, lacks) = if has_lat {
+                ("latitude", "longitude")
+            } else {
+                ("longitude", "latitude")
+            };
+            return Err(format!(
+                "config.json has \"{has}\" but no \"{lacks}\" (check the spelling). \
+                 Set both, or neither to use Windows Location."
+            ));
+        }
+    }
+    let lat_ok = valid_coordinates(cfg.latitude, 0.0);
+    let lon_ok = valid_coordinates(0.0, cfg.longitude);
+    if lat_ok && lon_ok {
+        return Ok(());
+    }
+    let mut problems = Vec::new();
+    if !lat_ok {
+        problems.push("latitude must be between -90 and 90");
+    }
+    if !lon_ok {
+        problems.push("longitude must be between -180 and 180");
+    }
+    let hint = if valid_coordinates(cfg.longitude, cfg.latitude) {
+        " (are the two swapped?)"
+    } else if lat_ok && cfg.longitude > 180.0 && cfg.longitude <= 360.0 {
+        // Perhaps written 0 to 360, east from Greenwich: v0.3.2 through
+        // v0.5.1 happened to compute the right schedule for that. A
+        // question, since it may as well be a typo (225 for 22.5).
+        " (a 0 to 360 longitude? West is negative: subtract 360)"
+    } else {
+        ""
+    };
+    Err(format!("config.json: {}{hint}", problems.join("; ")))
 }
 
 /// First run: write `cfg` as a new config.json. create_new, not a replace:
@@ -1052,7 +1180,25 @@ fn ensure_com_initialized() {
     }
 }
 
+/// Where Windows Location says the PC is, rounded (round_coordinates). None
+/// when Location is off, denied or fails — or returns a reading the app
+/// can't use (usable_location), which is logged, without the values.
 fn try_get_windows_location() -> Option<(f64, f64)> {
+    let (lat, lon) = query_windows_location()?;
+    match usable_location(lat, lon) {
+        Ok(place) => Some(place),
+        Err(reason) => {
+            log_event(&format!(
+                "{} location_rejected reason={}",
+                Local::now().to_rfc3339(),
+                reason,
+            ));
+            None
+        }
+    }
+}
+
+fn query_windows_location() -> Option<(f64, f64)> {
     let access = Geolocator::RequestAccessAsync().ok()?.get().ok()?;
     if access != GeolocationAccessStatus::Allowed {
         return None;
@@ -3917,13 +4063,311 @@ mod tests {
 
     #[test]
     fn config_unknown_and_missing_fields_are_defaulted() {
-        let json = r#"{"latitude": 1.0, "some_future_field": true}"#;
+        let json = r#"{"theme_day": "C:\\d.theme", "some_future_field": true}"#;
         let t = TempConfig::new("partial", Some(json));
         let cfg = load_config_at(&t.0).expect("unknown/missing fields are not errors");
-        assert_eq!(cfg.latitude, 1.0);
-        assert_eq!(cfg.longitude, 0.0);
+        // What the file does set is read (not swapped for plain defaults).
+        assert_eq!(cfg.theme_day.as_deref(), Some("C:\\d.theme"));
+        assert!(cfg.extra.contains_key("some_future_field"));
+        assert!(
+            !cfg.has_location(),
+            "no coordinate keys: Windows Location is asked"
+        );
         assert!(cfg.auto_start, "missing fields fall back to defaults");
+        assert!(cfg.theme_night.is_none());
         assert_eq!(fs::read_to_string(&t.0).unwrap(), json);
+    }
+
+    // --- coordinates: range, both-or-neither, saved precision (v0.6.0) ---
+
+    #[test]
+    fn out_of_range_coordinates_are_a_config_error_and_the_file_is_kept() {
+        // The roadmap's case: 225 typed for 22.5 used to give a schedule
+        // that was hours off, with nothing said.
+        let json = r#"{"latitude": 225, "longitude": 46.7, "theme_night": "C:\\night.theme"}"#;
+        let t = TempConfig::new("range-225", Some(json));
+        let err = load_config_at(&t.0).expect_err("225 is not a latitude");
+        let bad_lat = "config.json: latitude must be between -90 and 90";
+        let bad_lon = "config.json: longitude must be between -180 and 180";
+        assert_eq!(err, bad_lat);
+        assert_eq!(fs::read_to_string(&t.0).unwrap(), json, "file untouched");
+
+        let swapped = format!("{bad_lat} (are the two swapped?)");
+        let from_360 = format!("{bad_lon} (a 0 to 360 longitude? West is negative: subtract 360)");
+        for (json, want) in [
+            (r#"{"latitude": 24.7, "longitude": -180.5}"#, bad_lon),
+            (
+                r#"{"latitude": -90.0001, "longitude": 1e300}"#,
+                "config.json: latitude must be between -90 and 90; \
+                 longitude must be between -180 and 180",
+            ),
+            // Typed in the other order, a common slip: ask. Any latitude
+            // that could be a longitude gets the question, typo or not.
+            (r#"{"latitude": -122.33, "longitude": 47.61}"#, &swapped),
+            (r#"{"latitude": 91, "longitude": 0}"#, &swapped),
+            // Not when the pair makes no sense the other way round either.
+            (r#"{"latitude": 181, "longitude": 47.61}"#, bad_lat),
+            (r#"{"latitude": 95, "longitude": 120}"#, bad_lat),
+            // A longitude written 0 to 360 (v0.5.1 happened to handle it),
+            // or a digit too many: the hint is a question.
+            (r#"{"latitude": 47.61, "longitude": 237.67}"#, &from_360),
+            (r#"{"latitude": 47.61, "longitude": 360}"#, &from_360),
+            (r#"{"latitude": 47.61, "longitude": 360.5}"#, bad_lon),
+            // 0.0 for the other value doesn't make the pair "no location yet".
+            (r#"{"latitude": 0.0, "longitude": -200}"#, bad_lon),
+        ] {
+            assert_eq!(parse_config(json).expect_err(json), want, "{json}");
+        }
+    }
+
+    #[test]
+    fn a_coordinate_error_never_quotes_the_coordinates() {
+        // The message goes to events.log as well as the dialog. A slip must
+        // not put the user's real coordinates there: here the longitude,
+        // typed as the latitude, and the digits of a latitude typed 10x.
+        for json in [
+            r#"{"latitude": -122.33, "longitude": 47.61}"#,
+            r#"{"latitude": 247.13, "longitude": 46.68}"#,
+            r#"{"latitude": 24.71, "longitude": 466.8}"#,
+            r#"{"latitude": 24.71}"#,
+            r#"{"longitude": 46.68}"#,
+        ] {
+            let err = parse_config(json).expect_err(json);
+            for digits in ["122", "47", "247", "13", "46", "68", "24", "71"] {
+                assert!(!err.contains(digits), "{json}: {err}");
+            }
+        }
+        // Nor does serde_json's own error for a coordinate typed in quotes
+        // (it says `invalid type: string "24.713552", expected f64 at …`).
+        assert_eq!(
+            parse_config("{\n  \"latitude\": \"24.713552\",\n  \"longitude\": 46.675296\n}")
+                .unwrap_err(),
+            "config.json is not valid JSON: wrong kind of value, expected f64 at line 2 column 25"
+        );
+        // What was expected, and where, is still said for the other keys.
+        assert_eq!(
+            parse_config(r#"{"auto_start": "yes"}"#).unwrap_err(),
+            "config.json is not valid JSON: wrong kind of value, expected a boolean \
+             at line 1 column 20"
+        );
+        // Errors that quote no value are passed on as they are.
+        let err = parse_config(r#"{"latitude": 1.0, "latitude": 2.0}"#).unwrap_err();
+        assert!(err.contains("duplicate field `latitude`"), "{err}");
+        let err = parse_config(r#"{"latitude": 24.7,}"#).unwrap_err();
+        assert!(err.contains("at line 1 column 19"), "{err}");
+    }
+
+    #[test]
+    fn coordinates_at_the_limits_load_and_have_a_schedule() {
+        let now = utc(2026, 6, 21, 12, 0, 0);
+        // Noon UTC at the June solstice: the north pole has the midnight sun,
+        // the south pole the polar night, and at longitude 180 it's midnight.
+        for (lat, lon, want) in [
+            (90.0, 180.0, Theme::Light),
+            (-90.0, -180.0, Theme::Dark),
+            (0.0, 180.0, Theme::Dark),
+            (0.0, -180.0, Theme::Dark),
+            (90.0, 0.0, Theme::Light),
+        ] {
+            let json = format!(r#"{{"latitude": {lat:?}, "longitude": {lon:?}}}"#);
+            let cfg = parse_config(&json).expect(&json);
+            assert_eq!((cfg.latitude, cfg.longitude), (lat, lon));
+            assert!(cfg.has_location());
+            let (theme, next) = schedule(now, lat, lon);
+            assert_eq!(theme, want, "{json}");
+            assert!(next > now, "{json}");
+            assert_ne!(schedule(next, lat, lon).0, theme, "{json}: a real flip");
+        }
+        // Whole numbers, as a hand edit may have them.
+        let cfg = parse_config(r#"{"latitude": -90, "longitude": 180}"#).unwrap();
+        assert_eq!((cfg.latitude, cfg.longitude), (-90.0, 180.0));
+        assert!(valid_coordinates(-90.0, -180.0) && valid_coordinates(0.0, 0.0));
+        for (lat, lon) in [
+            (90.000001, 0.0),
+            (0.0, -180.000001),
+            (f64::NAN, 0.0),
+            (0.0, f64::NAN),
+            (f64::INFINITY, 0.0),
+            (0.0, f64::NEG_INFINITY),
+        ] {
+            assert!(!valid_coordinates(lat, lon), "{lat} {lon}");
+        }
+    }
+
+    #[test]
+    fn one_coordinate_without_the_other_is_a_config_error() {
+        // Left out, or misspelled (an unknown key is kept, not an error):
+        // the missing one used to count as 0.0, and the schedule was
+        // computed for that place.
+        let missing_lon = "config.json has \"latitude\" but no \"longitude\" (check the \
+                           spelling). Set both, or neither to use Windows Location.";
+        let missing_lat = "config.json has \"longitude\" but no \"latitude\" (check the \
+                           spelling). Set both, or neither to use Windows Location.";
+        for (json, want) in [
+            (r#"{"latitude": 24.7}"#, missing_lon),
+            (r#"{"latitude": 24.7, "longitud": 46.7}"#, missing_lon),
+            (r#"{"latitude": 24.7, "Longitude": 46.7}"#, missing_lon),
+            (r#"{"longitude": 46.7, "auto_start": false}"#, missing_lat),
+            (r#"{"lattitude": 24.7, "longitude": 46.7}"#, missing_lat),
+            // Also when the one that's there is 0.0 or out of range.
+            (r#"{"latitude": 0.0}"#, missing_lon),
+            (r#"{"longitude": 999}"#, missing_lat),
+        ] {
+            assert_eq!(parse_config(json).expect_err(json), want, "{json}");
+        }
+        let json = r#"{"latitude": 24.7, "longitud": 46.7}"#;
+        let t = TempConfig::new("one-key", Some(json));
+        load_config_at(&t.0).expect_err("one key without the other");
+        assert_eq!(fs::read_to_string(&t.0).unwrap(), json, "file untouched");
+
+        // Neither key, or both 0.0: no location yet, not an error.
+        for json in [
+            r#"{}"#,
+            r#"{"auto_start": false}"#,
+            r#"{"latitude": 0.0, "longitude": 0.0}"#,
+            r#"{"latitude": 0, "longitude": -0.0}"#,
+            // Both misspelled is "neither": Windows Location is asked.
+            r#"{"lat": 24.7, "lon": 46.7}"#,
+        ] {
+            assert!(!parse_config(json).expect(json).has_location(), "{json}");
+        }
+        // One of them 0.0 with the other set is a real place.
+        let cfg = parse_config(r#"{"latitude": 51.48, "longitude": 0.0}"#).unwrap();
+        assert!(cfg.has_location());
+    }
+
+    #[test]
+    fn a_coordinate_that_is_not_a_number_is_still_a_json_error() {
+        for json in [
+            r#"{"latitude": "24.7", "longitude": 46.7}"#,
+            r#"{"latitude": null, "longitude": 46.7}"#,
+            r#"{"latitude": 24.7, "longitude": [46.7]}"#,
+            r#"{"latitude": 24.7, "longitude": 1e999}"#,
+            r#"{"latitude": 24.7, "latitude": 24.8, "longitude": 46.7}"#,
+            r#"[24.7, 46.7]"#,
+        ] {
+            let err = parse_config(json).expect_err(json);
+            assert!(err.starts_with("config.json is not valid JSON: "), "{err}");
+        }
+    }
+
+    #[test]
+    fn refresh_keeps_the_last_good_config_when_a_coordinate_goes_out_of_range() {
+        let t = TempConfig::new(
+            "range-refresh",
+            Some(r#"{"latitude": 24.71, "longitude": 46.68, "auto_start": false}"#),
+        );
+        let mut cfg = Config::default();
+        let mut have_disk_cfg = false;
+        let (_, error) = adopt_reloaded_config(load_config_at(&t.0), &mut cfg, &mut have_disk_cfg);
+        assert!(error.is_none() && have_disk_cfg);
+        // The user edits the file and slips: Refresh reports it and keeps
+        // switching by the coordinates it had.
+        fs::write(&t.0, r#"{"latitude": 247.1, "longitude": 46.68}"#).unwrap();
+        let (assert_autostart, error) =
+            adopt_reloaded_config(load_config_at(&t.0), &mut cfg, &mut have_disk_cfg);
+        assert!(error.is_some_and(|e| e.contains("latitude must be between")));
+        assert_eq!((cfg.latitude, cfg.longitude), (24.71, 46.68));
+        assert!(assert_autostart && !cfg.auto_start);
+    }
+
+    #[test]
+    fn a_windows_location_reading_is_rounded_before_it_is_kept() {
+        for ((lat, lon), want) in [
+            // 2 decimals below 60°, north or south.
+            ((24.713_552, 46.675_296), (24.71, 46.68)),
+            ((-33.868_82, 151.209_3), (-33.87, 151.21)),
+            ((40.712_776, -74.005_974), (40.71, -74.01)),
+            ((59.994_9, 10.752_245), (59.99, 10.75)),
+            // 3 decimals from 60° on — decided by the reading, so a
+            // latitude that rounds up to 60 has 2.
+            ((59.999_9, 10.752_245), (60.0, 10.75)),
+            ((60.0, 10.752_245), (60.0, 10.752)),
+            ((69.649_205, 18.955_324), (69.649, 18.955)),
+            ((-77.846_323, 166.668_235), (-77.846, 166.668)),
+            // The limits stay in range.
+            ((89.999_96, 179.999_96), (90.0, 180.0)),
+            ((-89.999_96, -179.999_96), (-90.0, -180.0)),
+        ] {
+            assert_eq!(round_coordinates(lat, lon), want, "{lat} {lon}");
+            assert_eq!(usable_location(lat, lon), Ok(want));
+            // Rounding what was rounded changes nothing.
+            assert_eq!(round_coordinates(want.0, want.1), want);
+            assert!(valid_coordinates(want.0, want.1));
+        }
+        // Saved as typed digits, not as 24.710000000000001.
+        let cfg = Config {
+            latitude: round_coordinates(24.713_552, 46.675_296).0,
+            longitude: round_coordinates(24.713_552, 46.675_296).1,
+            ..Config::default()
+        };
+        let json = serde_json::to_string(&cfg).unwrap();
+        assert!(
+            json.contains(r#""latitude":24.71,"longitude":46.68,"#),
+            "{json}"
+        );
+        // Just west of Greenwich: 0.0, never the "-0.0" that would be saved.
+        let (lat, lon) = round_coordinates(51.507_4, -0.001_2);
+        assert_eq!((lat, lon), (51.51, 0.0));
+        assert!(lon.is_sign_positive());
+        assert!(round_coordinates(-0.001_2, 36.82).0.is_sign_positive());
+        // A reading next to 0/0 is not rounded into "no location yet".
+        assert_eq!(round_coordinates(0.004, -0.003), (0.004, -0.003));
+        assert_eq!(usable_location(0.004, -0.003), Ok((0.004, -0.003)));
+        let (lat, lon) = round_coordinates(-0.0, 0.004);
+        assert!(lat.is_sign_positive() && lon == 0.004);
+        // Exactly 0/0 is no location: kept, it would read as "not set yet"
+        // with nothing said.
+        assert_eq!(usable_location(0.0, 0.0), Err("zero"));
+        assert_eq!(usable_location(-0.0, 0.0), Err("zero"));
+        // Not a place on Earth: no location, rather than a schedule for it.
+        // Checked before rounding, which would bring the last two in range.
+        for (lat, lon) in [
+            (f64::NAN, 46.7),
+            (24.7, f64::INFINITY),
+            (90.5, 0.0),
+            (0.0, 180.5),
+            (90.000_4, 0.0),
+            (10.0, 180.004),
+        ] {
+            assert_eq!(
+                usable_location(lat, lon),
+                Err("out-of-range"),
+                "{lat} {lon}"
+            );
+        }
+    }
+
+    #[test]
+    fn rounding_a_reading_moves_sunrise_and_sunset_by_seconds() {
+        // What "2 decimals is plenty" rests on: readings as far from their
+        // rounded values as rounding allows, through a year.
+        for (lat, lon, off) in [
+            (0.0, 36.82, 0.0049),
+            (24.71, 46.68, 0.0049),
+            (-33.87, 151.21, 0.0049),
+            (45.0, -93.27, 0.0049),
+            (59.99, 10.75, 0.0049),
+            // 3 decimals: Reykjavik, and just below the polar model.
+            (64.146, -21.942, 0.00049),
+            (65.4, 25.47, 0.00049),
+        ] {
+            let (raw_lat, raw_lon) = (lat + off, lon - off);
+            assert_eq!(round_coordinates(raw_lat, raw_lon), (lat, lon));
+            for month in 1..=12 {
+                for day in [1, 11, 21] {
+                    let now = utc(2026, month, day, 12, 0, 0);
+                    let raw = transitions_window(now, raw_lat, raw_lon);
+                    let rounded = transitions_window(now, lat, lon);
+                    assert_eq!(raw.len(), rounded.len(), "{lat} {lon} {now}");
+                    for (a, b) in raw.iter().zip(&rounded) {
+                        assert_eq!(a.1, b.1);
+                        let moved = (a.0 - b.0).num_seconds().abs();
+                        assert!(moved <= 10, "{lat} {lon} {now}: moved {moved} s");
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -4039,7 +4483,10 @@ mod tests {
 
     #[test]
     fn load_config_ex_reports_heals_and_their_save_failures() {
-        let valid = TempConfig::new("heal-valid", Some("{\"latitude\": 1.0}"));
+        let valid = TempConfig::new(
+            "heal-valid",
+            Some("{\"latitude\": 1.0, \"longitude\": 2.0}"),
+        );
         assert!(load_config_ex(&valid.0).unwrap().1.is_none());
         let missing = TempConfig::new("heal-missing", None);
         assert!(
