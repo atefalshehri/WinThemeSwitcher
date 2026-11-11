@@ -16,8 +16,10 @@ targets = ["x86_64-pc-windows-msvc"]
 # (the @version is needed for crates locked in several versions, like
 # windows-sys); otherwise raise the requirement in Cargo.toml, or update the
 # crate that pulls it in (cargo tree -i <crate>@<locked version>). Then run
-# scripts\test.ps1 and commit Cargo.lock. Only when no fix is reachable and
-# the advisory doesn't affect this app, add { id = "RUSTSEC-...", reason =
+# scripts\test.ps1 and scripts\notices.ps1, and commit Cargo.lock together
+# with THIRD-PARTY-NOTICES.txt (it lists every crate with its version; CI's
+# build job fails on a stale one). Only when no fix is reachable and the
+# advisory doesn't affect this app, add { id = "RUSTSEC-...", reason =
 # "..." } here.
 unmaintained = "workspace"
 unsound = "workspace"
@@ -27,7 +29,9 @@ ignore = []
 # Exactly the licenses the dependency graph uses (checked 2026-10-31): most
 # crates are MIT OR Apache-2.0, winit is Apache-2.0, dpi needs both, and
 # unicode-ident adds Unicode-3.0. A dependency under any other license fails
-# the check until it has been reviewed and added here.
+# the check until it has been reviewed and added here. Its license text
+# reaches THIRD-PARTY-NOTICES.txt from the crate's own files (run
+# scripts\notices.ps1 after any dependency change).
 allow = ["MIT", "Apache-2.0", "Unicode-3.0"]
 
 [bans]

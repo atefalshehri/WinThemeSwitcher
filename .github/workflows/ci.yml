@@ -49,6 +49,18 @@ jobs:
       - name: Verify linker hardening
         run: powershell -NoProfile -ExecutionPolicy Bypass -File scripts/check-hardening.ps1 -Exe target/release/win-theme-switcher.exe
 
+      # THIRD-PARTY-NOTICES.txt (shipped in the release zip) must be what
+      # scripts/notices.ps1 generates from Cargo.lock and the crates' license
+      # files; line endings aside, so the checkout's autocrlf doesn't matter.
+      # After the build, so the crate sources are in the cargo registry. A
+      # dependency change that forgets to regenerate the file fails here:
+      # run scripts\notices.ps1 and commit the result with Cargo.lock. The
+      # script prints nothing that depends on the machine or the toolchain,
+      # so a failure with no dependency change is worth understanding (the
+      # message names the first differing line) before regenerating.
+      - name: Third-party notices are current
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File scripts/notices.ps1 -Check
+
       # Hard gate. The .cargo/config.toml linker flags apply here too.
       - name: Test
         run: cargo test --locked
