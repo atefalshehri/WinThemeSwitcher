@@ -544,7 +544,9 @@ $registrySrc = Join-Path $cargoHome "registry\src"
 
 # One line per package: "{p}|{l}|{r}" = "name vX.Y.Z[ (proc-macro)][ (source)][ (*)]",
 # license expression, repository. The first line is the app itself.
-$lines = Invoke-Cargo tree --locked --target $target --edges "normal,build" --prefix none --format "{p}|{l}|{r}"
+# --color never: CI sets CARGO_TERM_COLOR=always, and cargo then wraps the
+# "(*)" repeat marker in ANSI escape codes even when its output is captured.
+$lines = Invoke-Cargo tree --color never --locked --target $target --edges "normal,build" --prefix none --format "{p}|{l}|{r}"
 if ($rc -ne 0) { Fail 40 "cargo tree failed (exit $rc; is Cargo.lock out of date with Cargo.toml?): $errText" }
 $lines = @($lines | Where-Object { $_.Trim() })
 if ($lines.Count -lt 1 -or $lines[0] -cnotmatch '^\S+ v\S+ \(.+\)\|[^|]*\|') {
@@ -583,7 +585,7 @@ foreach ($k in $keys) {
     if (-not $c.dir -and -not $fetched) {
         $fetched = $true
         Write-Output "notices: $($c.name) $($c.version) is not in the cargo registry -- running cargo fetch --locked"
-        $null = Invoke-Cargo fetch --locked --target $target
+        $null = Invoke-Cargo fetch --color never --locked --target $target
         if ($rc -ne 0) { Fail 40 "cargo fetch failed (exit $rc): $errText" }
         $c.dir = Find-CrateDir $c.name $c.version
     }
