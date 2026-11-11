@@ -36,8 +36,9 @@ use windows_sys::Win32::System::Power::{
     PowerRegisterSuspendResumeNotification, DEVICE_NOTIFY_SUBSCRIBE_PARAMETERS,
 };
 use windows_sys::Win32::System::Registry::{
-    RegCloseKey, RegDeleteValueW, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW, HKEY,
-    HKEY_CURRENT_USER, KEY_QUERY_VALUE, KEY_SET_VALUE, REG_DWORD, REG_SZ,
+    RegCloseKey, RegCreateKeyExW, RegDeleteValueW, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW,
+    HKEY, HKEY_CURRENT_USER, KEY_QUERY_VALUE, KEY_SET_VALUE, REG_BINARY, REG_DWORD,
+    REG_OPTION_NON_VOLATILE, REG_SZ,
 };
 use windows_sys::Win32::System::RemoteDesktop::{
     WTSRegisterSessionNotification, NOTIFY_FOR_THIS_SESSION,
@@ -66,6 +67,11 @@ const WTS_SESSION_UNLOCK: WPARAM = 0x8;
 
 const THEME_KEY: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize";
 const RUN_KEY: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+/// Where Windows keeps the user's on/off switch for each Run entry (Settings
+/// → Apps → Startup, Task Manager → Startup apps). Read, never written: the
+/// user's switch wins.
+const STARTUP_APPROVED_RUN_KEY: &str =
+    "Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\StartupApproved\\Run";
 const APP_NAME: &str = "WinThemeSwitcher";
 
 // === IThemeManager2 (themeui.dll, undocumented but stable since Win10 1809) ===
@@ -248,7 +254,7 @@ struct Config {
     theme_day: Option<String>,
     theme_night: Option<String>,
     /// Keys this version doesn't know (a user's note, a newer version's
-    /// setting). Kept so save_config writes them back instead of silently
+    /// setting). Kept so a save writes them back instead of silently
     /// deleting them.
     #[serde(flatten)]
     extra: serde_json::Map<String, serde_json::Value>,
@@ -874,15 +880,52 @@ fn write_log_line(line: &str) {
 #[derive(Debug)]
 struct Healed {
     reason: &'static str,
+    /// The `auto_start` the repaired config got (healed_config).
+    auto_start: bool,
     /// Set when writing the healed defaults back failed (the reset then only
     /// exists in memory, and repeats next launch).
     save_err: Option<String>,
 }
 
-/// `load_config_ex` without the heal flag (tests use this form).
+/// What a successful `load_config_ex` has to tell besides the config.
+#[derive(Debug)]
+enum LoadNote {
+    /// The file was empty and was reset (so callers can log it — a heal
+    /// resets settings, and must not be silent).
+    Healed(Healed),
+    /// First run, but config.json could not be created (the reason): the
+    /// defaults exist in memory only, and nothing this session holds came
+    /// from a file.
+    NotCreated(String),
+}
+
+/// A loaded config, with what the session has to know about where it came
+/// from.
+#[derive(Debug)]
+struct Loaded {
+    cfg: Config,
+    /// false: config.json was missing and could not be created
+    /// (LoadNote::NotCreated), so `cfg` is the defaults and nothing of it
+    /// came from a file. A repaired empty file counts as read: it was read,
+    /// and held nothing.
+    from_file: bool,
+}
+
+impl Loaded {
+    /// Pure — unit-tested.
+    fn new(cfg: Config, note: Option<&LoadNote>) -> Self {
+        Loaded {
+            cfg,
+            from_file: !matches!(note, Some(LoadNote::NotCreated(_))),
+        }
+    }
+}
+
+/// `load_config_ex` without the note, for a PC where autostart is registered
+/// (tests use this form; it never reads the registry).
 #[cfg(test)]
 fn load_config_at(path: &Path) -> Result<Config, String> {
-    load_config_ex(path).map(|(cfg, _)| cfg)
+    load_config_ex(path, || Some(true)).map(|(cfg, _)| cfg)
 }
 
 /// Load the config from `path`. A missing file is first-run: defaults are
@@ -891,11 +934,39 @@ fn load_config_at(path: &Path) -> Result<Config, String> {
 /// untouched on disk so a hand-edit typo can be fixed instead of silently
 /// wiping the user's coordinates and theme paths.
 ///
-/// Also reports whether the file was self-healed (so callers can log it — a
-/// heal resets settings, and must not be silent). Logging stays out of here
-/// because tests call this directly and log_path() is exe-relative.
-fn load_config_ex(path: &Path) -> Result<(Config, Option<Healed>), String> {
-    load_config_via(path, read_config_text)
+/// `registered` says whether autostart is registered right now (None: can't
+/// tell); it is asked only when an empty file is repaired (healed_config).
+/// Production passes auto_start_registered, tests a constant — they never
+/// read the real registry.
+///
+/// Logging and dialogs stay out of here because tests call this directly
+/// and log_path() is exe-relative.
+fn load_config_ex(
+    path: &Path,
+    registered: impl FnMut() -> Option<bool>,
+) -> Result<(Config, Option<LoadNote>), String> {
+    load_config_via(path, read_config_text, registered)
+}
+
+/// The config an empty or NUL-filled config.json is repaired with: the
+/// defaults, except that `auto_start` says what is registered at that moment
+/// (`registered`: whether the Run value exists; None when that can't be
+/// read, which keeps the default). The file can't say what the user had
+/// chosen, and the default `true` used to turn autostart back on for someone
+/// who had turned it off — in that session, and through the repaired file at
+/// every later start. This way a repair changes nothing about autostart.
+/// The cost: an empty file on a PC where autostart isn't registered is not a
+/// first run — it is repaired with `auto_start: false`. That is a file left
+/// by a crash during the very first run, before autostart was registered,
+/// and a config.json created empty ahead of the first start, by hand or by
+/// an installer (one that holds `{}` isn't empty, and loads as the
+/// defaults). Pure — unit-tested.
+fn healed_config(registered: Option<bool>) -> Config {
+    let default = Config::default();
+    Config {
+        auto_start: registered.unwrap_or(default.auto_start),
+        ..default
+    }
 }
 
 /// `load_config_ex` with its read step passed in, so tests can make the file
@@ -909,15 +980,18 @@ fn load_config_ex(path: &Path) -> Result<(Config, Option<Healed>), String> {
 fn load_config_via(
     path: &Path,
     mut read: impl FnMut(&Path) -> std::io::Result<String>,
-) -> Result<(Config, Option<Healed>), String> {
+    mut registered: impl FnMut() -> Option<bool>,
+) -> Result<(Config, Option<LoadNote>), String> {
     for _ in 0..3 {
         match read(path) {
             Ok(content) if config_content_is_empty(&content) => {
                 // A crash mid-write can leave a 0-byte or NUL-filled file
                 // (the latter when the size was extended but the data never
-                // flushed). Nothing in it to preserve — self-heal like first
-                // run instead of erroring on every launch.
-                let cfg = Config::default();
+                // flushed). Nothing in it to preserve — self-heal
+                // (healed_config: the defaults, autostart as it is
+                // registered) instead of erroring on every launch.
+                let cfg = healed_config(registered());
+                let auto_start = cfg.auto_start;
                 let save_err = match heal_empty_config(path, &cfg) {
                     Ok(true) => None,
                     Ok(false) => continue,
@@ -932,20 +1006,24 @@ fn load_config_via(
                 };
                 return Ok((
                     cfg,
-                    Some(Healed {
+                    Some(LoadNote::Healed(Healed {
                         reason: "empty",
+                        auto_start,
                         save_err,
-                    }),
+                    })),
                 ));
             }
             Ok(content) => return parse_config(&content).map(|cfg| (cfg, None)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 let cfg = Config::default();
                 match create_config(path, &cfg) {
+                    Ok(()) => return Ok((cfg, None)),
                     Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                    // Written — or the folder isn't writable, and every run
-                    // starts from the defaults.
-                    _ => return Ok((cfg, None)),
+                    // The folder can't be written (or the disk is full, …):
+                    // this run, and every later one, starts from the
+                    // defaults. Said out loud by the caller — it used to be
+                    // silent.
+                    Err(e) => return Ok((cfg, Some(LoadNote::NotCreated(e.to_string())))),
                 }
             }
             Err(e) => return Err(format!("config.json could not be read: {e}")),
@@ -1146,14 +1224,18 @@ fn config_content_is_empty(content: &str) -> bool {
         .is_empty()
 }
 
-/// Serialize `cfg` over config.json unconditionally. Only call with a Config
-/// that was successfully loaded from disk this session — persisting a
-/// default/fallback Config here is exactly the settings-wipe bug fixed in
-/// v0.3.2 (broken files must stay on disk for the user to repair).
-fn save_config(cfg: &Config) -> Result<(), Box<dyn Error>> {
-    save_config_at(&config_path(), cfg)
-}
-
+/// Serialize `cfg` over the config.json at `path` unconditionally. Only call
+/// with a Config that was successfully loaded from that file this session —
+/// persisting a default/fallback Config here is exactly the settings-wipe
+/// bug fixed in v0.3.2 (broken files must stay on disk for the user to
+/// repair). Two things keep to that: run() never persists in a session
+/// whose file is broken, and persist_config_at sends a session whose file
+/// could not be created to create_config instead. Nothing re-checks the
+/// file at the moment of the replace: whatever was saved into it since the
+/// load is replaced — after an ordinary load, and just the same after a
+/// repair of an empty file, written or not (when the repair couldn't be
+/// written, the file read as empty and this is what writes it).
+///
 /// Atomic replace: write a sibling temp file, then rename it over `path`
 /// (std's rename replaces an existing file on Windows). A crash leaves either
 /// the old file or the new one — never the truncated/NUL-filled middle state
@@ -1207,31 +1289,84 @@ fn save_config_at(path: &Path, cfg: &Config) -> Result<(), Box<dyn Error>> {
         .unwrap_or_else(|| "rename failed".into()))
 }
 
-/// Load config.json from its real location, logging a self-heal.
-fn load_config_logged() -> Result<Config, String> {
-    load_config_ex(&config_path()).map(|(cfg, healed)| {
-        if let Some(h) = healed {
-            let action = if h.save_err.is_some() {
-                "reset-in-memory"
-            } else {
-                "reset-to-defaults"
-            };
-            log_event(&format!(
-                "{} config_healed reason={} action={}",
-                Local::now().to_rfc3339(),
-                h.reason,
-                action,
-            ));
-            if let Some(e) = h.save_err {
+/// config.json was missing and could not be created at the latest load
+/// (LoadNote::NotCreated; `Loaded::from_file` false). While set,
+/// persist_config only creates the file — it never replaces one: what the
+/// session holds is the defaults, or after a Refresh the settings it had
+/// loaded earlier, and a file that has appeared since is the user's.
+static CONFIG_NOT_ON_DISK: AtomicBool = AtomicBool::new(false);
+
+/// Load config.json from its real location, logging a self-heal and
+/// reporting a first-run file that couldn't be created.
+fn load_config_logged() -> Result<Loaded, String> {
+    load_config_ex(&config_path(), auto_start_registered).map(|(cfg, note)| {
+        let loaded = Loaded::new(cfg, note.as_ref());
+        CONFIG_NOT_ON_DISK.store(!loaded.from_file, Ordering::SeqCst);
+        match note {
+            Some(LoadNote::Healed(h)) => {
+                let action = if h.save_err.is_some() {
+                    "reset-in-memory"
+                } else {
+                    "reset-to-defaults"
+                };
                 log_event(&format!(
-                    "{} config_save_err msg=\"{}\"",
+                    "{} config_healed reason={} action={} auto_start={}",
                     Local::now().to_rfc3339(),
-                    sanitize_log_msg(&e),
+                    h.reason,
+                    action,
+                    h.auto_start,
                 ));
+                if let Some(e) = h.save_err {
+                    log_event(&format!(
+                        "{} config_save_err msg=\"{}\"",
+                        Local::now().to_rfc3339(),
+                        sanitize_log_msg(&e),
+                    ));
+                }
             }
+            Some(LoadNote::NotCreated(e)) => report_config_not_created(&e),
+            None => {}
         }
-        cfg
+        loaded
     })
+}
+
+/// The can't-save-settings box was shown (once per run of the app).
+static NOT_WRITABLE_BOX_SHOWN: AtomicBool = AtomicBool::new(false);
+
+/// First run in a folder where config.json can't be created — a read-only
+/// folder, typically: say so. It used to be silent: the app ran on the
+/// defaults, asked for the location at every start, and Open Config opened
+/// nothing. The log line is best effort (events.log lives in the same
+/// folder), so the box is what tells the user; the session carries on. Also
+/// reached from a Refresh that finds the file gone and can't create it (the
+/// session then keeps the config it had — adopt_reloaded_config).
+fn report_config_not_created(err: &str) {
+    log_event(&format!(
+        "{} config_create_err msg=\"{}\"",
+        Local::now().to_rfc3339(),
+        sanitize_log_msg(err),
+    ));
+    let folder = config_path()
+        .parent()
+        .map(|d| d.display().to_string())
+        .unwrap_or_default();
+    let body = format!(
+        "WinThemeSwitcher can't write to its own folder:\n{folder}\n\n\
+         config.json could not be created there ({err}), so your settings can't be \
+         saved — the app starts from the defaults and looks up or asks for your \
+         location at every start — and the log (events.log) most likely can't be \
+         written either. For now the app keeps running: on the default settings, or \
+         on the ones it had loaded before the file went missing.\n\n\
+         To fix it: Quit, move win-theme-switcher.exe to a folder you can write \
+         to — for example %LOCALAPPDATA%\\Programs\\WinThemeSwitcher — and start it \
+         from there.",
+    );
+    show_warning_once(
+        &NOT_WRITABLE_BOX_SHOWN,
+        "WinThemeSwitcher — Settings can't be saved",
+        body,
+    );
 }
 
 /// Whether `path` is a symlink/junction or a hard link with other names —
@@ -1254,14 +1389,31 @@ fn is_linked_file(path: &Path) -> bool {
     ok != 0 && info.nNumberOfLinks > 1
 }
 
-/// save_config with the failure logged instead of dropped.
+/// Write `cfg` to config.json at `path`. A config that came from the file
+/// replaces it (save_config_at). One that didn't (`not_on_disk`: the file
+/// was missing and couldn't be created) only goes into a file that is still
+/// missing — a file that has appeared since is the user's, and defaults
+/// plus a location must not be written over it.
+fn persist_config_at(path: &Path, cfg: &Config, not_on_disk: bool) -> Result<(), String> {
+    if not_on_disk {
+        create_config(path, cfg).map_err(|e| e.to_string())
+    } else {
+        save_config_at(path, cfg).map_err(|e| e.to_string())
+    }
+}
+
+/// persist_config_at for the real config.json, with the failure logged
+/// instead of dropped.
 fn persist_config(cfg: &Config) {
-    if let Err(e) = save_config(cfg) {
-        log_event(&format!(
+    let not_on_disk = CONFIG_NOT_ON_DISK.load(Ordering::SeqCst);
+    match persist_config_at(&config_path(), cfg, not_on_disk) {
+        // Created after all: from here on the file holds this config.
+        Ok(()) => CONFIG_NOT_ON_DISK.store(false, Ordering::SeqCst),
+        Err(e) => log_event(&format!(
             "{} config_save_err msg=\"{}\"",
             Local::now().to_rfc3339(),
-            sanitize_log_msg(&e.to_string()),
-        ));
+            sanitize_log_msg(&e),
+        )),
     }
 }
 
@@ -1272,16 +1424,28 @@ fn persist_config(cfg: &Config) {
 /// (whose auto_start=true default must not override the file's false) — and
 /// the load error to report, if any. Pure — unit-tested.
 fn adopt_reloaded_config(
-    load: Result<Config, String>,
+    load: Result<Loaded, String>,
     cfg: &mut Config,
     have_disk_cfg: &mut bool,
 ) -> (bool, Option<String>) {
     match load {
-        Ok(new_cfg) => {
+        Ok(Loaded {
+            cfg: new_cfg,
+            from_file: true,
+        }) => {
             *cfg = new_cfg;
             *have_disk_cfg = true;
             (true, None)
         }
+        // config.json is missing and can't be created. At a Refresh that is
+        // as likely a drive or share that can't be reached right now as a
+        // deleted file, and the defaults would replace the settings this
+        // session holds — and turn autostart on over a file that says
+        // false. Nothing was loaded, so nothing changes (through v0.5.1 the
+        // defaults were adopted); load_config_logged has reported it.
+        Ok(Loaded {
+            from_file: false, ..
+        }) => (*have_disk_cfg, None),
         // Keep the last-known-good (or fallback) config; the broken file
         // stays on disk for the user to fix.
         Err(e) => (*have_disk_cfg, Some(e)),
@@ -1497,6 +1661,19 @@ fn show_warning_async(open: &'static AtomicBool, title: &'static str, body: Stri
     });
 }
 
+/// A warning MessageBox on a detached thread, shown at most once per run of
+/// the app — for a condition that can't change while the app runs (where
+/// its exe is, whether its folder can be written), so saying it again at
+/// every Refresh would only nag. `shown` is never reset.
+fn show_warning_once(shown: &'static AtomicBool, title: &'static str, body: String) {
+    if shown.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    std::thread::spawn(move || {
+        show_message_box(title, &body, MB_OK | MB_ICONWARNING);
+    });
+}
+
 /// A theme-path warning box is already on screen.
 static THEME_PATH_BOX_OPEN: AtomicBool = AtomicBool::new(false);
 
@@ -1580,99 +1757,141 @@ fn read_modes() -> Option<Modes> {
     }
 }
 
-/// One HKCU Personalize DWORD. Err is a short `key=value` style reason.
-fn read_personalize_dword(name: &str) -> Result<u32, String> {
-    let subkey = wide(THEME_KEY);
-    let value = wide(name);
-    unsafe {
-        let mut hkey: HKEY = ptr::null_mut();
-        let rc = RegOpenKeyExW(
+/// An open registry key, closed on drop.
+struct RegKey(HKEY);
+
+impl Drop for RegKey {
+    fn drop(&mut self) {
+        unsafe {
+            RegCloseKey(self.0);
+        }
+    }
+}
+
+/// Open the HKCU key `path` with `access`. With `create_missing`, a key that
+/// isn't there is created (with any missing parents) — only then is
+/// RegCreateKeyExW called, so with the key in place this does exactly what a
+/// plain open does. Every profile gets the Run and Personalize keys from the
+/// Default hive; they are missing only after a deliberate deletion, and
+/// then autostart and the registry tier used to fail for good. Err is the
+/// failing API's name and its Win32 code (the return value, not
+/// GetLastError).
+fn open_hkcu_key(
+    path: &str,
+    access: u32,
+    create_missing: bool,
+) -> Result<RegKey, (&'static str, u32)> {
+    let subkey = wide(path);
+    let mut hkey: HKEY = ptr::null_mut();
+    let rc = unsafe { RegOpenKeyExW(HKEY_CURRENT_USER, subkey.as_ptr(), 0, access, &mut hkey) };
+    if rc == 0 {
+        return Ok(RegKey(hkey));
+    }
+    if rc != ERROR_FILE_NOT_FOUND || !create_missing {
+        return Err(("RegOpenKeyExW", rc));
+    }
+    let rc = unsafe {
+        RegCreateKeyExW(
             HKEY_CURRENT_USER,
             subkey.as_ptr(),
             0,
-            KEY_QUERY_VALUE,
+            ptr::null(),
+            REG_OPTION_NON_VOLATILE,
+            access,
+            ptr::null(),
             &mut hkey,
-        );
-        if rc != 0 {
-            return Err(format!("open-rc-{rc}"));
-        }
-        let mut data: u32 = 0;
-        let mut size: u32 = 4;
-        let mut kind: u32 = 0;
-        let rc = RegQueryValueExW(
-            hkey,
+            ptr::null_mut(),
+        )
+    };
+    if rc == 0 {
+        Ok(RegKey(hkey))
+    } else {
+        Err(("RegCreateKeyExW", rc))
+    }
+}
+
+/// One HKCU Personalize DWORD. Err is a short `key=value` style reason.
+fn read_personalize_dword(name: &str) -> Result<u32, String> {
+    read_hkcu_dword(THEME_KEY, name)
+}
+
+/// The 4-byte REG_DWORD `name` under the HKCU key `key` (the key is a
+/// parameter so tests can use a throwaway one).
+fn read_hkcu_dword(key: &str, name: &str) -> Result<u32, String> {
+    let value = wide(name);
+    let hkey =
+        open_hkcu_key(key, KEY_QUERY_VALUE, false).map_err(|(_, rc)| format!("open-rc-{rc}"))?;
+    let mut data: u32 = 0;
+    let mut size: u32 = 4;
+    let mut kind: u32 = 0;
+    let rc = unsafe {
+        RegQueryValueExW(
+            hkey.0,
             value.as_ptr(),
             ptr::null_mut(),
             &mut kind,
             &mut data as *mut u32 as *mut u8,
             &mut size,
-        );
-        RegCloseKey(hkey);
-        if rc != 0 {
-            return Err(format!("query-rc-{rc}"));
-        }
-        if kind != REG_DWORD || size != 4 {
-            return Err(format!("type-{kind}-size-{size}"));
-        }
-        Ok(data)
+        )
+    };
+    if rc != 0 {
+        return Err(format!("query-rc-{rc}"));
     }
+    if kind != REG_DWORD || size != 4 {
+        return Err(format!("type-{kind}-size-{size}"));
+    }
+    Ok(data)
 }
 
+/// Tier 3's write of the two Personalize values. On a half write (one mode
+/// flipped, the other failed) it repaints: callers skip their broadcast on
+/// Err, and a changed value must not stay un-announced.
 fn write_theme_registry(modes: Modes) -> Result<(), Box<dyn Error>> {
-    let subkey = wide(THEME_KEY);
-    let apps = wide("AppsUseLightTheme");
-    let sys = wide("SystemUsesLightTheme");
-    unsafe {
-        let mut hkey: HKEY = ptr::null_mut();
-        if RegOpenKeyExW(
-            HKEY_CURRENT_USER,
-            subkey.as_ptr(),
-            0,
-            KEY_SET_VALUE,
-            &mut hkey,
-        ) != 0
-        {
-            return Err("RegOpenKeyExW failed for Personalize".into());
+    write_modes_at(THEME_KEY, modes).map_err(|(msg, half_written)| {
+        if half_written {
+            broadcast_setting_change();
+            poke_shell();
         }
-        // Both results matter: a blocked write (AV/HIPS, ACL, hive error)
-        // must surface as Err so tick's bounded retry runs, instead of being
-        // logged as applied=registry while nothing changed. A half write
-        // (Apps flipped, System failed) by a tick is harmless to the retry
-        // gate: tick takes the failure baseline from a reading made AFTER
-        // this returns. (A Toggle's half write during a pending retry does
-        // read as a move and stands the retry down.)
-        let mut failed: Option<String> = None;
-        let mut any_ok = false;
-        for (name, name_w, light) in [
-            ("AppsUseLightTheme", &apps, modes.apps_light),
-            ("SystemUsesLightTheme", &sys, modes.system_light),
-        ] {
-            let value = u32::from(light);
-            let rc = RegSetValueExW(
-                hkey,
+        msg.into()
+    })
+}
+
+/// Write `modes` as the two light/dark DWORDs under the HKCU key `key`
+/// (Personalize; a parameter so tests can use a throwaway key), creating the
+/// key if it is missing. Err is the message — it names the API and carries
+/// the Win32 code — and whether the first value was written before the
+/// second failed.
+fn write_modes_at(key: &str, modes: Modes) -> Result<(), (String, bool)> {
+    let hkey = open_hkcu_key(key, KEY_SET_VALUE, true)
+        .map_err(|(api, rc)| (format!("{api} Personalize rc={rc}"), false))?;
+    // Both results matter: a blocked write (AV/HIPS, ACL, hive error)
+    // must surface as Err so tick's bounded retry runs, instead of being
+    // logged as applied=registry while nothing changed. A half write
+    // (Apps flipped, System failed) by a tick is harmless to the retry
+    // gate: tick takes the failure baseline from a reading made AFTER
+    // this returns. (A Toggle's half write during a pending retry does
+    // read as a move and stands the retry down.)
+    let mut any_ok = false;
+    for (name, light) in [
+        ("AppsUseLightTheme", modes.apps_light),
+        ("SystemUsesLightTheme", modes.system_light),
+    ] {
+        let name_w = wide(name);
+        let value = u32::from(light);
+        let rc = unsafe {
+            RegSetValueExW(
+                hkey.0,
                 name_w.as_ptr(),
                 0,
                 REG_DWORD,
                 &value as *const u32 as *const u8,
                 4,
-            );
-            if rc != 0 {
-                failed = Some(format!("RegSetValueExW {name} rc={rc}"));
-                break;
-            }
-            any_ok = true;
+            )
+        };
+        if rc != 0 {
+            return Err((format!("RegSetValueExW {name} rc={rc}"), any_ok));
         }
-        RegCloseKey(hkey);
-        if let Some(e) = failed {
-            if any_ok {
-                // Half-written (one mode flipped): callers skip their
-                // broadcast on Err, so repaint here rather than leave a
-                // changed value un-announced.
-                broadcast_setting_change();
-                poke_shell();
-            }
-            return Err(e.into());
-        }
+        any_ok = true;
     }
     Ok(())
 }
@@ -2728,66 +2947,380 @@ fn apply_theme(slot: &Slot) -> Result<&'static str, Box<dyn Error>> {
     Ok("registry")
 }
 
-/// Make the HKCU Run value match `enable`. Writes only when the value differs
-/// (a missing value — e.g. deleted by an AV quarantine — always differs, so
-/// the documented re-assert-on-launch/Refresh recovery still works), and
-/// surfaces every registry failure as Err instead of dropping it.
-fn set_auto_start(enable: bool) -> Result<(), Box<dyn Error>> {
-    const ERROR_FILE_NOT_FOUND: u32 = 2;
-    let subkey = wide(RUN_KEY);
-    let name = wide(APP_NAME);
-    unsafe {
-        let mut hkey: HKEY = ptr::null_mut();
-        let rc = RegOpenKeyExW(
-            HKEY_CURRENT_USER,
-            subkey.as_ptr(),
-            0,
-            KEY_QUERY_VALUE | KEY_SET_VALUE,
-            &mut hkey,
-        );
-        if rc == ERROR_FILE_NOT_FOUND && !enable {
+/// Make the HKCU Run value match `enable`: this exe's quoted path, or no
+/// value. Writes only when the value differs (a missing value — e.g. deleted
+/// by an AV quarantine — always differs, so the documented
+/// re-assert-on-launch/Refresh recovery still works), and surfaces every
+/// registry failure as Err instead of dropping it. Call it through
+/// apply_auto_start, which first decides whether to register from here.
+fn set_auto_start(enable: bool) -> Result<(), String> {
+    let command = if enable {
+        let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
+        Some(format!("\"{}\"", exe.to_string_lossy()))
+    } else {
+        None
+    };
+    set_run_value(RUN_KEY, APP_NAME, command.as_deref()).map(|_| ())
+}
+
+/// set_auto_start's registry work, with the key, the value name and the
+/// command line as parameters — tests run it against a throwaway HKCU key,
+/// never the real Run key. `Some(command)`: the REG_SZ value `name` under
+/// `key` holds exactly `command` afterwards; the key is created if it is
+/// missing, and nothing is written when the value already matches. `None`:
+/// the value is gone afterwards; a value or a key that isn't there is
+/// success, and no key is ever created to delete from. Ok says whether a
+/// value was written or deleted (false: it was already as asked).
+fn set_run_value(key: &str, name: &str, command: Option<&str>) -> Result<bool, String> {
+    let reg_err = |(api, rc): (&str, u32)| format!("{api} Run rc={rc}");
+    let name_w = wide(name);
+    let access = KEY_QUERY_VALUE | KEY_SET_VALUE;
+    let Some(want) = command else {
+        let hkey = match open_hkcu_key(key, access, false) {
+            Ok(hkey) => hkey,
             // No Run key at all → certainly no Run value to remove.
-            return Ok(());
-        }
-        if rc != 0 {
-            return Err(format!("RegOpenKeyExW Run rc={rc}").into());
-        }
-        let result = if enable {
-            match std::env::current_exe() {
-                Ok(exe) => {
-                    let want = format!("\"{}\"", exe.to_string_lossy());
-                    if read_reg_sz(hkey, &name).as_deref() == Some(want.as_str()) {
-                        Ok(())
-                    } else {
-                        let want_w = wide(&want);
-                        let rc = RegSetValueExW(
-                            hkey,
-                            name.as_ptr(),
-                            0,
-                            REG_SZ,
-                            want_w.as_ptr() as *const u8,
-                            (want_w.len() * 2) as u32,
-                        );
-                        if rc == 0 {
-                            Ok(())
-                        } else {
-                            Err(format!("RegSetValueExW Run rc={rc}"))
-                        }
-                    }
-                }
-                Err(e) => Err(format!("current_exe: {e}")),
-            }
-        } else {
-            let rc = RegDeleteValueW(hkey, name.as_ptr());
-            if rc == 0 || rc == ERROR_FILE_NOT_FOUND {
-                Ok(())
-            } else {
-                Err(format!("RegDeleteValueW Run rc={rc}"))
-            }
+            Err((_, ERROR_FILE_NOT_FOUND)) => return Ok(false),
+            Err(e) => return Err(reg_err(e)),
         };
-        RegCloseKey(hkey);
-        result.map_err(|e| e.into())
+        return match unsafe { RegDeleteValueW(hkey.0, name_w.as_ptr()) } {
+            0 => Ok(true),
+            ERROR_FILE_NOT_FOUND => Ok(false),
+            rc => Err(format!("RegDeleteValueW Run rc={rc}")),
+        };
+    };
+    let hkey = open_hkcu_key(key, access, true).map_err(reg_err)?;
+    if unsafe { read_reg_sz(hkey.0, &name_w) }.as_deref() == Some(want) {
+        return Ok(false);
     }
+    let want_w = wide(want);
+    let rc = unsafe {
+        RegSetValueExW(
+            hkey.0,
+            name_w.as_ptr(),
+            0,
+            REG_SZ,
+            want_w.as_ptr() as *const u8,
+            (want_w.len() * 2) as u32,
+        )
+    };
+    if rc == 0 {
+        Ok(true)
+    } else {
+        Err(format!("RegSetValueExW Run rc={rc}"))
+    }
+}
+
+/// Whether the HKCU key `key` has a value `name`, of any type. Some(false)
+/// when the value or the whole key isn't there; None when that can't be
+/// read. Read-only.
+fn hkcu_value_exists(key: &str, name: &str) -> Option<bool> {
+    let name_w = wide(name);
+    let hkey = match open_hkcu_key(key, KEY_QUERY_VALUE, false) {
+        Ok(hkey) => hkey,
+        Err((_, ERROR_FILE_NOT_FOUND)) => return Some(false),
+        Err(_) => return None,
+    };
+    let rc = unsafe {
+        RegQueryValueExW(
+            hkey.0,
+            name_w.as_ptr(),
+            ptr::null_mut(),
+            ptr::null_mut(),
+            ptr::null_mut(),
+            ptr::null_mut(),
+        )
+    };
+    match rc {
+        0 => Some(true),
+        ERROR_FILE_NOT_FOUND => Some(false),
+        _ => None,
+    }
+}
+
+/// Whether autostart is registered right now: the Run value exists, whatever
+/// it points at. What load_config_ex asks when it repairs an empty
+/// config.json (healed_config).
+fn auto_start_registered() -> Option<bool> {
+    hkcu_value_exists(RUN_KEY, APP_NAME)
+}
+
+/// The type and data of the value `name` under the HKCU key `key`; None
+/// when it isn't there or can't be read. Read-only.
+fn read_hkcu_value(key: &str, name: &str) -> Option<(u32, Vec<u8>)> {
+    let name_w = wide(name);
+    let hkey = open_hkcu_key(key, KEY_QUERY_VALUE, false).ok()?;
+    let mut kind: u32 = 0;
+    let mut size: u32 = 0;
+    let rc = unsafe {
+        RegQueryValueExW(
+            hkey.0,
+            name_w.as_ptr(),
+            ptr::null_mut(),
+            &mut kind,
+            ptr::null_mut(),
+            &mut size,
+        )
+    };
+    if rc != 0 {
+        return None;
+    }
+    let mut data = vec![0u8; size as usize];
+    let rc = unsafe {
+        RegQueryValueExW(
+            hkey.0,
+            name_w.as_ptr(),
+            ptr::null_mut(),
+            &mut kind,
+            data.as_mut_ptr(),
+            &mut size,
+        )
+    };
+    // A value that grew between the two calls (ERROR_MORE_DATA) is
+    // unreadable for this purpose.
+    if rc != 0 {
+        return None;
+    }
+    data.truncate(size as usize);
+    Some((kind, data))
+}
+
+/// What Windows' own startup switch says about a Run entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StartupSwitch {
+    On,
+    /// Switched off in Settings → Apps → Startup or Task Manager → Startup
+    /// apps: Windows skips the Run entry at login.
+    Off,
+    /// No recognizable record. Nothing is said then.
+    Unknown,
+}
+
+/// Read a StartupApproved\Run value (its registry type and data). Windows
+/// writes 12 bytes of REG_BINARY: a little-endian DWORD of flags, then the
+/// FILETIME of the moment the entry was switched off (zero while it is on).
+/// The entry is off when the lowest flag bit is set — 02 and 06 are "on",
+/// 03 and 07 "off". Undocumented; taken from what Windows 11 build 26300
+/// stores for entries that are on (02 for the Run entries of this account,
+/// 06 for a machine-wide one) and from how startup managers read it. Any
+/// other type or length is Unknown, since saying "off" for a record that
+/// doesn't mean it would mislead. Pure — unit-tested.
+fn startup_switch(kind: u32, data: &[u8]) -> StartupSwitch {
+    if kind != REG_BINARY || data.len() != 12 {
+        return StartupSwitch::Unknown;
+    }
+    if data[0] & 1 == 1 {
+        StartupSwitch::Off
+    } else {
+        StartupSwitch::On
+    }
+}
+
+/// Whether the switched-off line is due: the record `name` under the HKCU
+/// key `key` (StartupApproved\Run; parameters so tests can use a throwaway
+/// key) says Off, and `logged` hasn't been set yet — it is set here. A
+/// missing, unreadable or unrecognized record never makes a line. Read-only.
+fn startup_switch_note_due(key: &str, name: &str, logged: &AtomicBool) -> bool {
+    read_hkcu_value(key, name)
+        .is_some_and(|(kind, data)| startup_switch(kind, &data) == StartupSwitch::Off)
+        && !logged.swap(true, Ordering::Relaxed)
+}
+
+/// With autostart registered: one line, once per run of the app, when the
+/// user has switched the entry off in Windows' Startup settings — the
+/// explanation for "auto_start is true but the app doesn't start at login".
+/// The switch itself is never touched: it is the user's, and overriding it
+/// is what malware does.
+fn note_startup_switch() {
+    static LOGGED: AtomicBool = AtomicBool::new(false);
+    if startup_switch_note_due(STARTUP_APPROVED_RUN_KEY, APP_NAME, &LOGGED) {
+        log_event(&format!(
+            "{} autostart_disabled_in_startup_settings auto_start=true \
+             note=\"switched off in Settings > Apps > Startup or Task Manager > Startup apps; \
+             the app will not start at login until it is switched on there\"",
+            Local::now().to_rfc3339(),
+        ));
+    }
+}
+
+/// A Windows path as the list of names it consists of, for comparing two
+/// spellings of a folder: a `\\?\` or `\\.\` prefix is dropped (`\\?\UNC\`
+/// reads as `\\`), `/` counts as `\`, repeated and trailing separators and
+/// `.` vanish, and letters are lower-cased. A share's key starts with `\\`,
+/// so it never equals a drive path. None for a path that doesn't start at a
+/// drive letter or a share (relative, drive-relative, a volume GUID).
+/// 8.3 short names are a different spelling this can't see through — the
+/// caller passes the long spelling as well (path_spellings). Pure.
+fn path_key(path: &str) -> Option<Vec<String>> {
+    let s = path.trim().replace('/', "\\");
+    let device = s.strip_prefix(r"\\?\").or_else(|| s.strip_prefix(r"\\.\"));
+    let (unc, rest) = match device {
+        Some(rest) => match rest.get(..4) {
+            Some(head) if head.eq_ignore_ascii_case(r"UNC\") => (true, &rest[4..]),
+            _ => (false, rest),
+        },
+        None => match s.strip_prefix(r"\\") {
+            Some(rest) => (true, rest),
+            None => (false, s.as_str()),
+        },
+    };
+    if !unc {
+        // `X:\…` only: `C:name` (drive-relative) is not `C:\name`.
+        let b = rest.as_bytes();
+        if !(b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && b[2] == b'\\') {
+            return None;
+        }
+    }
+    let mut names: Vec<String> = rest
+        .split('\\')
+        .filter(|name| !name.is_empty() && *name != ".")
+        .map(str::to_lowercase)
+        .collect();
+    if unc {
+        // Server and share.
+        if names.len() < 2 {
+            return None;
+        }
+        names.insert(0, r"\\".to_string());
+    }
+    Some(names)
+}
+
+/// Whether the exe sits in, or anywhere below, one of the temporary
+/// folders. Each side is a list of spellings of the same thing — the path
+/// as given and, where it could be resolved, its long form (path_spellings)
+/// — because %TEMP% is often stored in 8.3 form
+/// (`C:\Users\LONGUS~1\AppData\Local\Temp`) while the exe's path is not, or
+/// the other way round; one matching pair is enough. Compared by path_key,
+/// name by name, so `C:\Temporary` is not inside `C:\Temp`. A temp folder
+/// that is only a drive or a share root, or not absolute, is ignored: with
+/// TEMP set to `D:\` every exe on that drive would count. Pure —
+/// unit-tested.
+fn in_temp_folder(exe_spellings: &[String], temp_spellings: &[String]) -> bool {
+    let exes: Vec<Vec<String>> = exe_spellings.iter().filter_map(|s| path_key(s)).collect();
+    temp_spellings
+        .iter()
+        .filter_map(|s| path_key(s))
+        .filter(|temp| {
+            let root_len = if temp[0] == r"\\" { 3 } else { 1 };
+            temp.len() > root_len
+        })
+        .any(|temp| {
+            exes.iter()
+                .any(|exe| exe.len() > temp.len() && exe[..temp.len()] == temp[..])
+        })
+}
+
+/// `path` as given plus, when it can be resolved, its canonical form (long
+/// names, links followed, `\\?\` prefix — path_key reads both).
+fn path_spellings(path: &Path) -> Vec<String> {
+    let mut spellings = vec![path.to_string_lossy().into_owned()];
+    if let Ok(real) = fs::canonicalize(path) {
+        spellings.push(real.to_string_lossy().into_owned());
+    }
+    spellings
+}
+
+/// The temporary folders an exe may have been unpacked to, in every
+/// spelling: %TMP% and %TEMP% (where Explorer extracts a file started from
+/// inside a zip, and where archivers and browsers put theirs),
+/// %LOCALAPPDATA%\Temp (their usual value, in case this process was started
+/// with other ones) and %SystemRoot%\Temp. Not GetTempPathW: without TMP
+/// and TEMP it answers with the profile folder, and then the recommended
+/// install folder would count as temporary.
+fn temp_folder_spellings() -> Vec<String> {
+    temp_folders(|name| std::env::var_os(name))
+        .iter()
+        .flat_map(|f| path_spellings(f))
+        .collect()
+}
+
+/// temp_folder_spellings' list of folders, as the environment names them
+/// (`var`: a variable's value — a parameter so tests don't depend on the
+/// real environment). A variable that is unset or empty contributes
+/// nothing. Pure — unit-tested.
+fn temp_folders(var: impl Fn(&str) -> Option<std::ffi::OsString>) -> Vec<PathBuf> {
+    let var = |name: &str| var(name).filter(|v| !v.is_empty());
+    let mut folders: Vec<PathBuf> = ["TMP", "TEMP"]
+        .into_iter()
+        .filter_map(&var)
+        .map(PathBuf::from)
+        .collect();
+    folders.extend(
+        ["LOCALAPPDATA", "SystemRoot"]
+            .into_iter()
+            .filter_map(&var)
+            .map(|base| PathBuf::from(base).join("Temp")),
+    );
+    folders
+}
+
+/// Whether this exe runs from a temporary folder — typically started from
+/// inside the downloaded zip. Worked out once: neither the exe's place nor
+/// the environment changes while the app runs.
+fn exe_in_temp_folder() -> bool {
+    static IN_TEMP: OnceLock<bool> = OnceLock::new();
+    *IN_TEMP.get_or_init(|| {
+        std::env::current_exe()
+            .is_ok_and(|exe| in_temp_folder(&path_spellings(&exe), &temp_folder_spellings()))
+    })
+}
+
+/// What apply_auto_start does about the Run value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AutoStartPlan {
+    /// Point the Run value at this exe.
+    Register,
+    /// Remove the Run value.
+    Remove,
+    /// `auto_start` is on, but the exe runs from a temporary folder, which
+    /// Windows or the archiver deletes: the Run value is left exactly as it
+    /// is (one that exists may belong to the real install), and the user is
+    /// told.
+    LeaveTempFolder,
+}
+
+/// Pure — unit-tested. `auto_start: false` removes the value wherever the
+/// exe runs, as before.
+fn auto_start_plan(enable: bool, exe_in_temp: bool) -> AutoStartPlan {
+    match (enable, exe_in_temp) {
+        (false, _) => AutoStartPlan::Remove,
+        (true, true) => AutoStartPlan::LeaveTempFolder,
+        (true, false) => AutoStartPlan::Register,
+    }
+}
+
+/// The running-from-a-temporary-folder box was shown (once per run).
+static TEMP_FOLDER_BOX_SHOWN: AtomicBool = AtomicBool::new(false);
+
+/// Autostart not registered because the exe runs from a temporary folder:
+/// one log line and one warning box per run of the app. The exe's path goes
+/// into the box only, never into events.log (it names the user's profile).
+fn report_temp_folder() {
+    static LOGGED: AtomicBool = AtomicBool::new(false);
+    if !LOGGED.swap(true, Ordering::Relaxed) {
+        log_event(&format!(
+            "{} autostart_skipped reason=temp-folder",
+            Local::now().to_rfc3339(),
+        ));
+    }
+    let folder = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|d| d.display().to_string()))
+        .unwrap_or_default();
+    let body = format!(
+        "WinThemeSwitcher is running from a temporary folder:\n{folder}\n\n\
+         That usually means it was started from inside the downloaded zip. Such \
+         folders get deleted, so the app has not set itself up to start with Windows \
+         from here, and settings saved here will be lost.\n\n\
+         To install it: Quit, extract the zip to a permanent folder that only your \
+         account can write to — for example %LOCALAPPDATA%\\Programs\\WinThemeSwitcher \
+         — and start win-theme-switcher.exe from there.",
+    );
+    show_warning_once(
+        &TEMP_FOLDER_BOX_SHOWN,
+        "WinThemeSwitcher — Running from a temporary folder",
+        body,
+    );
 }
 
 /// Read a REG_SZ value from an open key; None if absent, not REG_SZ, or
@@ -2825,16 +3358,60 @@ unsafe fn read_reg_sz(hkey: HKEY, name: &[u16]) -> Option<String> {
     Some(String::from_utf16_lossy(&buf[..len]))
 }
 
-/// set_auto_start with the failure logged — a missing autostart entry must
-/// leave a diagnosable trace in events.log.
+/// Bring the autostart registration in line with config.json's `auto_start`
+/// (auto_start_plan), with every outcome that leaves the app not starting
+/// at login traceable in events.log: a failed registry call, a temporary
+/// folder, or the user's own switch in Windows' Startup settings.
 fn apply_auto_start(enable: bool) {
-    if let Err(e) = set_auto_start(enable) {
-        log_event(&format!(
+    let plan = auto_start_plan(enable, enable && exe_in_temp_folder());
+    match carry_out_auto_start(plan, set_auto_start) {
+        AutoStartOutcome::Registered => note_startup_switch(),
+        AutoStartOutcome::Removed => {}
+        AutoStartOutcome::LeftAlone => report_temp_folder(),
+        AutoStartOutcome::Failed { op, msg } => log_event(&format!(
             "{} autostart_err op={} msg=\"{}\"",
             Local::now().to_rfc3339(),
-            if enable { "set" } else { "delete" },
-            sanitize_log_msg(&e.to_string()),
-        ));
+            op,
+            sanitize_log_msg(&msg),
+        )),
+    }
+}
+
+/// How carrying out an AutoStartPlan ended — what apply_auto_start then
+/// logs or tells the user.
+#[derive(Debug, PartialEq, Eq)]
+enum AutoStartOutcome {
+    /// The Run value points at this exe (written now, or already so).
+    Registered,
+    /// There is no Run value (deleted now, or already gone).
+    Removed,
+    /// Nothing was done to the Run value (AutoStartPlan::LeaveTempFolder).
+    LeftAlone,
+    /// The registry call failed: the `op=` of the autostart_err line and
+    /// its message.
+    Failed { op: &'static str, msg: String },
+}
+
+/// Carry out `plan` through `set_run` — set_auto_start; a parameter so
+/// tests can watch it, or point it at a throwaway key. LeaveTempFolder
+/// never calls it: the Run value stays exactly as it is, neither rewritten
+/// nor removed.
+fn carry_out_auto_start(
+    plan: AutoStartPlan,
+    set_run: impl FnOnce(bool) -> Result<(), String>,
+) -> AutoStartOutcome {
+    let register = match plan {
+        AutoStartPlan::LeaveTempFolder => return AutoStartOutcome::LeftAlone,
+        AutoStartPlan::Register => true,
+        AutoStartPlan::Remove => false,
+    };
+    match set_run(register) {
+        Ok(()) if register => AutoStartOutcome::Registered,
+        Ok(()) => AutoStartOutcome::Removed,
+        Err(msg) => AutoStartOutcome::Failed {
+            op: if register { "set" } else { "delete" },
+            msg,
+        },
     }
 }
 
@@ -3682,7 +4259,10 @@ fn run() -> Result<(), Box<dyn Error>> {
     // override a broken file's false, on startup OR on a Refresh.
     let mut have_disk_cfg = loaded.is_ok();
     let mut cfg = match loaded {
-        Ok(mut cfg) => {
+        // A first run whose config.json couldn't be created (`from_file`
+        // false) carries on like any first run, on the defaults; the user
+        // has been told (load_config_logged).
+        Ok(Loaded { mut cfg, .. }) => {
             if !cfg.has_location() {
                 acquire_location(&mut cfg);
             }
@@ -4351,10 +4931,13 @@ mod tests {
     fn config_empty_file_is_healed_to_defaults() {
         // A crash mid-write (fs::write truncates first) leaves a 0-byte
         // config.json. There is nothing in it to preserve, so it must
-        // self-heal like first run instead of erroring on every launch.
+        // self-heal instead of erroring on every launch.
         let t = TempConfig::new("empty", Some("  \n"));
         let cfg = load_config_at(&t.0).expect("empty file must heal to defaults");
         assert!(!cfg.has_location());
+        // Not the default as such: load_config_at stands for a PC where
+        // autostart is registered, and a repair follows the registration
+        // (repairing_an_empty_config_leaves_autostart_as_it_is_registered).
         assert!(cfg.auto_start);
         let written = fs::read_to_string(&t.0).unwrap();
         let reparsed: Config = serde_json::from_str(&written).unwrap();
@@ -4559,13 +5142,14 @@ mod tests {
         );
         let mut cfg = Config::default();
         let mut have_disk_cfg = false;
-        let (_, error) = adopt_reloaded_config(load_config_at(&t.0), &mut cfg, &mut have_disk_cfg);
+        let reload = || load_config_at(&t.0).map(read_from_file);
+        let (_, error) = adopt_reloaded_config(reload(), &mut cfg, &mut have_disk_cfg);
         assert!(error.is_none() && have_disk_cfg);
         // The user edits the file and slips: Refresh reports it and keeps
         // switching by the coordinates it had.
         fs::write(&t.0, r#"{"latitude": 247.1, "longitude": 46.68}"#).unwrap();
         let (assert_autostart, error) =
-            adopt_reloaded_config(load_config_at(&t.0), &mut cfg, &mut have_disk_cfg);
+            adopt_reloaded_config(reload(), &mut cfg, &mut have_disk_cfg);
         assert!(error.is_some_and(|e| e.contains("latitude must be between")));
         assert_eq!((cfg.latitude, cfg.longitude), (24.71, 46.68));
         assert!(assert_autostart && !cfg.auto_start);
@@ -4781,20 +5365,34 @@ mod tests {
         assert_eq!(back["future"]["a"], 1);
     }
 
+    /// "Autostart is registered", for loads where a heal may ask. Tests
+    /// never read the real Run key.
+    fn registered() -> Option<bool> {
+        Some(true)
+    }
+
+    /// The heal a load reported.
+    fn healed(note: Option<LoadNote>) -> Healed {
+        match note {
+            Some(LoadNote::Healed(h)) => h,
+            other => panic!("expected a heal, got {other:?}"),
+        }
+    }
+
     #[test]
     fn load_config_ex_reports_heals_and_their_save_failures() {
         let valid = TempConfig::new(
             "heal-valid",
             Some("{\"latitude\": 1.0, \"longitude\": 2.0}"),
         );
-        assert!(load_config_ex(&valid.0).unwrap().1.is_none());
+        assert!(load_config_ex(&valid.0, registered).unwrap().1.is_none());
         let missing = TempConfig::new("heal-missing", None);
         assert!(
-            load_config_ex(&missing.0).unwrap().1.is_none(),
+            load_config_ex(&missing.0, registered).unwrap().1.is_none(),
             "first run is not a heal"
         );
         let empty = TempConfig::new("heal-empty", Some("\0\0 \n"));
-        let h = load_config_ex(&empty.0).unwrap().1.expect("heal reported");
+        let h = healed(load_config_ex(&empty.0, registered).unwrap().1);
         assert_eq!(h.reason, "empty");
         assert!(h.save_err.is_none());
         // Healing a file that can't be written: reported, file untouched.
@@ -4802,11 +5400,11 @@ mod tests {
         let mut perms = fs::metadata(&ro.0).unwrap().permissions();
         perms.set_readonly(true);
         fs::set_permissions(&ro.0, perms.clone()).unwrap();
-        let result = load_config_ex(&ro.0);
+        let result = load_config_ex(&ro.0, registered);
         #[allow(clippy::permissions_set_readonly_false)]
         perms.set_readonly(false);
         fs::set_permissions(&ro.0, perms).unwrap();
-        let h = result.unwrap().1.expect("heal reported");
+        let h = healed(result.unwrap().1);
         assert!(
             h.save_err.is_some(),
             "the failed write-back must be reported"
@@ -4831,9 +5429,12 @@ mod tests {
         // over it.
         let json = r#"{"latitude": 24.753, "longitude": 46.765, "auto_start": false}"#;
         let t = TempConfig::new("race-create", Some(json));
-        let (cfg, healed) =
-            load_config_via(&t.0, racing_read(Err(std::io::ErrorKind::NotFound.into())))
-                .expect("the user's file must load");
+        let (cfg, healed) = load_config_via(
+            &t.0,
+            racing_read(Err(std::io::ErrorKind::NotFound.into())),
+            registered,
+        )
+        .expect("the user's file must load");
         assert_eq!(cfg.latitude, 24.753);
         assert!(!cfg.auto_start && healed.is_none());
         assert_eq!(fs::read_to_string(&t.0).unwrap(), json, "file untouched");
@@ -4845,7 +5446,7 @@ mod tests {
         // defaults were written: the heal must see it and stand down.
         let json = r#"{"latitude": 24.753, "longitude": 46.765}"#;
         let t = TempConfig::new("race-heal", Some(json));
-        let (cfg, healed) = load_config_via(&t.0, racing_read(Ok(String::new())))
+        let (cfg, healed) = load_config_via(&t.0, racing_read(Ok(String::new())), registered)
             .expect("the user's file must load");
         assert_eq!(cfg.longitude, 46.765);
         assert!(healed.is_none(), "not a heal");
@@ -4854,22 +5455,31 @@ mod tests {
 
     #[test]
     fn a_config_deleted_before_its_heal_is_recreated_like_first_run() {
+        // The heal was started (the registry was asked, and says autostart
+        // isn't registered), but what gets written is a first run's file:
+        // the default auto_start, not the repair's.
         let t = TempConfig::new("race-heal-gone", None);
-        let (cfg, healed) = load_config_via(&t.0, racing_read(Ok("\0\0".to_string()))).unwrap();
+        let (cfg, healed) =
+            load_config_via(&t.0, racing_read(Ok("\0\0".to_string())), || Some(false)).unwrap();
         assert!(
             !cfg.has_location() && healed.is_none(),
             "first run, not a heal"
         );
+        assert!(cfg.auto_start, "a first run keeps the default");
         let written: Config = serde_json::from_str(&fs::read_to_string(&t.0).unwrap()).unwrap();
-        assert!(!written.has_location());
+        assert!(!written.has_location() && written.auto_start);
     }
 
     #[test]
     fn a_config_that_keeps_changing_is_an_error_and_left_alone() {
         let json = r#"{"latitude": 1.0}"#;
         let t = TempConfig::new("race-forever", Some(json));
-        let err = load_config_via(&t.0, |_| Err(std::io::ErrorKind::NotFound.into()))
-            .expect_err("never defaults for a file that exists");
+        let err = load_config_via(
+            &t.0,
+            |_| Err(std::io::ErrorKind::NotFound.into()),
+            registered,
+        )
+        .expect_err("never defaults for a file that exists");
         assert!(err.contains("kept changing"), "{err}");
         assert_eq!(fs::read_to_string(&t.0).unwrap(), json);
     }
@@ -4882,7 +5492,7 @@ mod tests {
         // and nothing is written.
         let t = TempConfig::new("heal-busy", Some(""));
         let writer = fs::OpenOptions::new().write(true).open(&t.0).unwrap();
-        let result = load_config_ex(&t.0);
+        let result = load_config_ex(&t.0, registered);
         drop(writer);
         let err = result.expect_err("a file being written is not an empty one");
         assert!(err.contains("could not be read"), "{err}");
@@ -4901,7 +5511,7 @@ mod tests {
             eprintln!("SKIP: can't create a symlink here ({e}) - dangling-link path not exercised");
             return;
         }
-        let err = load_config_ex(&t.0).expect_err("nothing to read or create");
+        let err = load_config_ex(&t.0, registered).expect_err("nothing to read or create");
         assert!(!err.contains("kept changing"), "{err}");
         assert!(!target.exists(), "the link's target must not be created");
     }
@@ -4940,7 +5550,8 @@ mod tests {
         let (assert_auto, err) = adopt_reloaded_config(Err("bad".into()), &mut cfg, &mut have);
         assert!(!assert_auto && err.is_some() && !have);
         // (b) Broken at startup, fixed before Refresh: adopt it, re-assert.
-        let (assert_auto, err) = adopt_reloaded_config(Ok(good(false)), &mut cfg, &mut have);
+        let (assert_auto, err) =
+            adopt_reloaded_config(Ok(read_from_file(good(false))), &mut cfg, &mut have);
         assert!(assert_auto && err.is_none() && have);
         assert!(!cfg.auto_start);
         // (c) Good earlier, broken now: keep last-known-good and re-assert
@@ -4948,6 +5559,63 @@ mod tests {
         let (assert_auto, err) = adopt_reloaded_config(Err("bad".into()), &mut cfg, &mut have);
         assert!(assert_auto && err.is_some());
         assert!(!cfg.auto_start, "last-known-good retained");
+    }
+
+    /// A config that was read from its file, as load_config_logged hands it
+    /// on.
+    fn read_from_file(cfg: Config) -> Loaded {
+        Loaded {
+            cfg,
+            from_file: true,
+        }
+    }
+
+    #[test]
+    fn refresh_never_adopts_the_defaults_of_a_config_that_could_not_be_created() {
+        // config.json missing and not creatable at a Refresh — the app's
+        // drive or share can't be reached right now, say. Through v0.5.1
+        // the defaults replaced the session's settings, and their
+        // auto_start=true registered autostart over a file that said false.
+        let not_created = || -> Result<Loaded, String> {
+            Ok(Loaded::new(
+                Config::default(),
+                Some(&LoadNote::NotCreated(
+                    "the network path was not found".into(),
+                )),
+            ))
+        };
+        let mut cfg = Config {
+            latitude: 24.71,
+            longitude: 46.68,
+            auto_start: false,
+            theme_night: Some("C:\\Themes\\night.theme".into()),
+            ..Config::default()
+        };
+        let mut have = true;
+        let (assert_auto, err) = adopt_reloaded_config(not_created(), &mut cfg, &mut have);
+        assert!(err.is_none(), "not a config error: the file isn't broken");
+        assert_eq!((cfg.latitude, cfg.longitude), (24.71, 46.68));
+        assert_eq!(cfg.theme_night.as_deref(), Some("C:\\Themes\\night.theme"));
+        // Autostart is re-asserted, but from the settings that were kept.
+        assert!(assert_auto && have && !cfg.auto_start);
+        // A session that started with a broken file has nothing from disk:
+        // it keeps its fallback, and still must not touch autostart.
+        let mut cfg = Config {
+            latitude: 1.0,
+            longitude: 2.0,
+            ..Config::default()
+        };
+        let mut have = false;
+        let (assert_auto, err) = adopt_reloaded_config(not_created(), &mut cfg, &mut have);
+        assert!(!assert_auto && err.is_none() && !have);
+        assert_eq!((cfg.latitude, cfg.longitude), (1.0, 2.0));
+        // The file is back: adopted as always.
+        let back = Config {
+            auto_start: false,
+            ..Config::default()
+        };
+        let (assert_auto, _) = adopt_reloaded_config(Ok(read_from_file(back)), &mut cfg, &mut have);
+        assert!(assert_auto && have && !cfg.auto_start && !cfg.has_location());
     }
 
     #[test]
@@ -4967,6 +5635,826 @@ mod tests {
             !t.0.with_extension("json.tmp").exists(),
             "the temp file must be renamed away, not left behind"
         );
+    }
+
+    // --- autostart: an empty config's repair, a folder that can't be
+    // written, a temporary folder, the registry, Startup settings (v0.6.0) ---
+
+    #[test]
+    fn repairing_an_empty_config_leaves_autostart_as_it_is_registered() {
+        // The default auto_start=true used to go into the repaired file,
+        // which re-registered autostart for someone who had turned it off.
+        for (i, (registered, want)) in [(Some(true), true), (Some(false), false), (None, true)]
+            .into_iter()
+            .enumerate()
+        {
+            assert_eq!(healed_config(registered).auto_start, want);
+            for (kind, content) in [("empty", ""), ("nul", "\0\0\0\0")] {
+                let t = TempConfig::new(&format!("heal-auto-{i}-{kind}"), Some(content));
+                let (cfg, note) = load_config_ex(&t.0, || registered).unwrap();
+                assert_eq!(cfg.auto_start, want, "{registered:?} {kind}");
+                assert!(!cfg.has_location() && cfg.theme_day.is_none());
+                let h = healed(note);
+                assert_eq!(h.auto_start, want);
+                assert!(h.save_err.is_none());
+                // The repaired file says the same, so later starts agree.
+                let written: Config =
+                    serde_json::from_str(&fs::read_to_string(&t.0).unwrap()).unwrap();
+                assert_eq!(written.auto_start, want);
+            }
+        }
+    }
+
+    #[test]
+    fn a_repair_that_cannot_be_written_follows_the_same_autostart_rule() {
+        let t = TempConfig::new("heal-auto-readonly", Some(" "));
+        let mut perms = fs::metadata(&t.0).unwrap().permissions();
+        perms.set_readonly(true);
+        fs::set_permissions(&t.0, perms.clone()).unwrap();
+        let result = load_config_ex(&t.0, || Some(false));
+        #[allow(clippy::permissions_set_readonly_false)]
+        perms.set_readonly(false);
+        fs::set_permissions(&t.0, perms).unwrap();
+        let (cfg, note) = result.unwrap();
+        assert!(
+            !cfg.auto_start,
+            "healed in memory, autostart not registered"
+        );
+        let h = healed(note);
+        assert!(!h.auto_start && h.save_err.is_some());
+        assert_eq!(fs::read_to_string(&t.0).unwrap(), " ", "file untouched");
+    }
+
+    #[test]
+    fn only_a_repair_asks_whether_autostart_is_registered() {
+        // First run keeps the default (on), and neither it nor an ordinary
+        // load reads the registry.
+        fn never() -> Option<bool> {
+            panic!("the registry must not be read for this load")
+        }
+        let missing = TempConfig::new("auto-first-run", None);
+        let (cfg, note) = load_config_ex(&missing.0, never).unwrap();
+        assert!(cfg.auto_start && note.is_none());
+        let written: Config =
+            serde_json::from_str(&fs::read_to_string(&missing.0).unwrap()).unwrap();
+        assert!(written.auto_start);
+        let off = TempConfig::new("auto-valid-off", Some(r#"{"auto_start": false}"#));
+        assert!(!load_config_ex(&off.0, never).unwrap().0.auto_start);
+        let broken = TempConfig::new("auto-broken", Some("{"));
+        assert!(load_config_ex(&broken.0, never).is_err());
+    }
+
+    #[test]
+    fn a_config_that_cannot_be_created_is_reported_and_runs_on_defaults() {
+        // Stands in for a folder that can't be written: one that isn't
+        // there. The read finds nothing, and so does the create.
+        let dir = std::env::temp_dir().join(format!("wts-test-{}-no-folder", std::process::id()));
+        let path = dir.join("config.json");
+        let (cfg, note) = load_config_ex(&path, registered).expect("the session carries on");
+        assert!(cfg.auto_start && !cfg.has_location(), "the defaults");
+        match &note {
+            Some(LoadNote::NotCreated(err)) => assert!(!err.is_empty()),
+            other => panic!("expected NotCreated, got {other:?}"),
+        }
+        assert!(!dir.exists() && !path.exists(), "nothing was created");
+        // What the session is told: none of this came from a file …
+        let loaded = Loaded::new(cfg, note.as_ref());
+        assert!(!loaded.from_file);
+        // … so when the folder is there after all, with the user's file in
+        // it, a save (the location, once found) leaves that file alone.
+        let folder = TempDir::new("no-folder");
+        assert_eq!(folder.0, dir);
+        let json = r#"{"latitude": 1.0, "longitude": 2.0, "auto_start": false}"#;
+        fs::write(&path, json).unwrap();
+        let located = Config {
+            latitude: 24.71,
+            longitude: 46.68,
+            ..loaded.cfg
+        };
+        assert!(persist_config_at(&path, &located, !loaded.from_file).is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), json);
+    }
+
+    #[test]
+    fn every_other_load_counts_as_read_from_the_file() {
+        // An ordinary load, a first run that wrote its file, and a repair —
+        // written or not: the file was read, and a later save replaces it.
+        let valid = TempConfig::new("from-file-valid", Some(r#"{"auto_start": false}"#));
+        let first = TempConfig::new("from-file-first-run", None);
+        let empty = TempConfig::new("from-file-empty", Some(""));
+        for t in [&valid, &first, &empty] {
+            let (cfg, note) = load_config_ex(&t.0, registered).unwrap();
+            assert!(Loaded::new(cfg, note.as_ref()).from_file, "{:?}", t.0);
+        }
+        let unwritten = LoadNote::Healed(Healed {
+            reason: "empty",
+            auto_start: false,
+            save_err: Some("access denied".into()),
+        });
+        assert!(Loaded::new(healed_config(Some(false)), Some(&unwritten)).from_file);
+    }
+
+    #[test]
+    fn a_config_that_did_not_come_from_a_file_never_replaces_one() {
+        let located = Config {
+            latitude: 24.71,
+            longitude: 46.68,
+            ..Config::default()
+        };
+        // config.json couldn't be created at the load, but is there now:
+        // it is the user's, and stays.
+        let json = r#"{"latitude": 1.0, "longitude": 2.0, "auto_start": false}"#;
+        let appeared = TempConfig::new("persist-appeared", Some(json));
+        assert!(persist_config_at(&appeared.0, &located, true).is_err());
+        assert_eq!(fs::read_to_string(&appeared.0).unwrap(), json);
+        // Still missing: created.
+        let missing = TempConfig::new("persist-missing", None);
+        persist_config_at(&missing.0, &located, true).expect("created");
+        assert_eq!(load_config_at(&missing.0).unwrap().latitude, 24.71);
+        // A config that was loaded from the file replaces it, as always.
+        persist_config_at(&appeared.0, &located, false).expect("replaced");
+        assert_eq!(load_config_at(&appeared.0).unwrap().latitude, 24.71);
+    }
+
+    #[test]
+    fn auto_start_plan_table() {
+        use AutoStartPlan::*;
+        assert_eq!(auto_start_plan(true, false), Register);
+        // From a temporary folder the Run value is left alone …
+        assert_eq!(auto_start_plan(true, true), LeaveTempFolder);
+        // … but auto_start: false removes it wherever the exe runs.
+        assert_eq!(auto_start_plan(false, false), Remove);
+        assert_eq!(auto_start_plan(false, true), Remove);
+    }
+
+    #[test]
+    fn path_key_reads_every_spelling_of_a_folder_alike() {
+        let want: Vec<String> = ["c:", "users", "ann", "appdata", "local", "temp"]
+            .map(String::from)
+            .to_vec();
+        for spelling in [
+            r"C:\Users\Ann\AppData\Local\Temp",
+            r"c:\users\ann\appdata\local\temp\",
+            r"C:\Users\Ann\AppData\Local\Temp\\",
+            r"C:/Users/Ann/AppData/Local/Temp/",
+            r"\\?\C:\Users\Ann\AppData\Local\Temp",
+            r"\\.\C:\USERS\ANN\APPDATA\LOCAL\TEMP\",
+            r"C:\Users\Ann\.\AppData\\Local\Temp",
+            r"  C:\Users\Ann\AppData\Local\Temp ",
+        ] {
+            assert_eq!(path_key(spelling).as_ref(), Some(&want), "{spelling}");
+        }
+        // Non-ASCII names fold too.
+        assert_eq!(path_key(r"D:\ÄÖ\Ünïcode"), path_key(r"d:\äö\ünïcode\"));
+        // A share is never a drive path, in either of its spellings.
+        let share = path_key(r"\\Server\Share\Temp").unwrap();
+        assert_eq!(share, [r"\\", "server", "share", "temp"]);
+        assert_eq!(path_key(r"\\?\UNC\server\share\temp\"), Some(share.clone()));
+        assert_eq!(path_key(r"\\?\unc\SERVER\SHARE\Temp"), Some(share));
+        // Not a place that can be compared: relative, drive-relative,
+        // rooted without a drive, a volume GUID, a server without a share.
+        for not_absolute in [
+            "",
+            "Temp",
+            r".\Temp",
+            r"C:Temp",
+            "C:",
+            r"\Temp",
+            r"\\?\Volume{4c1b02c1-d990-11dc-99ae-806e6f6e6963}\Temp",
+            r"\\server",
+            r"%TEMP%\x",
+        ] {
+            assert_eq!(path_key(not_absolute), None, "{not_absolute}");
+        }
+    }
+
+    #[test]
+    fn an_exe_in_a_temp_folder_is_seen_through_8_3_names_case_and_prefixes() {
+        let s = |list: &[&str]| list.iter().map(|p| p.to_string()).collect::<Vec<String>>();
+        // What the app gathers when %TEMP% is stored in 8.3 form: the value
+        // as it is, and its resolved long form.
+        let temps = s(&[
+            r"C:\Users\LONGUS~1\AppData\Local\Temp",
+            r"\\?\C:\Users\Long User Name\AppData\Local\Temp",
+        ]);
+        // Started from inside the zip (Explorer's Temp1_<zip> folder), in
+        // the long spelling, the short one, other case, with a prefix.
+        for exe in [
+            r"C:\Users\Long User Name\AppData\Local\Temp\Temp1_wts.zip\win-theme-switcher.exe",
+            r"C:\Users\LONGUS~1\AppData\Local\Temp\Temp1_wts.zip\win-theme-switcher.exe",
+            r"c:\users\longus~1\appdata\local\temp\7zO4A1B\WIN-THEME-SWITCHER.EXE",
+            r"\\?\C:\Users\Long User Name\AppData\Local\Temp\win-theme-switcher.exe",
+            r"C:/Users/Long User Name/AppData/Local/Temp/x/y/win-theme-switcher.exe",
+        ] {
+            assert!(in_temp_folder(&s(&[exe]), &temps), "{exe}");
+        }
+        // The exe in 8.3 form while %TEMP% is long: its own long form is
+        // the second spelling that matches.
+        let long_temp = s(&[r"C:\Users\Long User Name\AppData\Local\Temp\"]);
+        let short_exe = r"C:\Users\LONGUS~1\AppData\Local\Temp\Rar$EXa0.123\win-theme-switcher.exe";
+        assert!(!in_temp_folder(&s(&[short_exe]), &long_temp));
+        assert!(in_temp_folder(
+            &s(&[
+                short_exe,
+                r"\\?\C:\Users\Long User Name\AppData\Local\Temp\Rar$EXa0.123\win-theme-switcher.exe",
+            ]),
+            &long_temp
+        ));
+        // Not temporary: the recommended folder, a sibling whose name only
+        // starts like the temp folder's, the temp folder's parent, another
+        // drive, and something named like the temp folder itself.
+        for exe in [
+            r"C:\Users\Long User Name\AppData\Local\Programs\WinThemeSwitcher\win-theme-switcher.exe",
+            r"C:\Users\Long User Name\AppData\Local\Temporary\win-theme-switcher.exe",
+            r"C:\Users\Long User Name\AppData\Local\win-theme-switcher.exe",
+            r"D:\Users\Long User Name\AppData\Local\Temp\win-theme-switcher.exe",
+            r"C:\Users\Long User Name\AppData\Local\Temp",
+        ] {
+            assert!(!in_temp_folder(&s(&[exe]), &temps), "{exe}");
+        }
+        // A temp folder that is a whole drive or share, or not absolute, is
+        // ignored — everything would be "temporary" otherwise.
+        let exe = s(&[r"D:\Apps\WinThemeSwitcher\win-theme-switcher.exe"]);
+        for temp in [r"D:\", "D:", r"\\?\D:\", "", "Temp", r"\Apps"] {
+            assert!(!in_temp_folder(&exe, &s(&[temp])), "{temp}");
+        }
+        assert!(in_temp_folder(&exe, &s(&[r"D:\Apps"])));
+        let on_share = s(&[r"\\nas\home\tmp\win-theme-switcher.exe"]);
+        assert!(!in_temp_folder(&on_share, &s(&[r"\\nas\home"])));
+        assert!(in_temp_folder(&on_share, &s(&[r"\\?\UNC\NAS\Home\Tmp\"])));
+        // Nothing to compare with.
+        assert!(!in_temp_folder(&exe, &[]));
+        assert!(!in_temp_folder(&[], &temps));
+    }
+
+    #[test]
+    fn temp_folders_are_what_the_environment_names_plus_the_usual_two() {
+        fn env(
+            pairs: &'static [(&'static str, &'static str)],
+        ) -> impl Fn(&str) -> Option<std::ffi::OsString> {
+            move |name| {
+                pairs
+                    .iter()
+                    .find(|(key, _)| *key == name)
+                    .map(|(_, value)| value.into())
+            }
+        }
+        let paths = |list: &[&str]| list.iter().map(PathBuf::from).collect::<Vec<PathBuf>>();
+        assert_eq!(
+            temp_folders(env(&[
+                ("TMP", r"D:\Scratch"),
+                ("TEMP", r"C:\Users\ANN~1\AppData\Local\Temp"),
+                ("LOCALAPPDATA", r"C:\Users\Ann\AppData\Local"),
+                ("SystemRoot", r"C:\Windows"),
+                ("USERPROFILE", r"C:\Users\Ann"),
+            ])),
+            paths(&[
+                r"D:\Scratch",
+                r"C:\Users\ANN~1\AppData\Local\Temp",
+                r"C:\Users\Ann\AppData\Local\Temp",
+                r"C:\Windows\Temp",
+            ])
+        );
+        // Each source by itself.
+        assert_eq!(temp_folders(env(&[("TMP", r"E:\t")])), paths(&[r"E:\t"]));
+        assert_eq!(temp_folders(env(&[("TEMP", r"E:\t")])), paths(&[r"E:\t"]));
+        assert_eq!(
+            temp_folders(env(&[("LOCALAPPDATA", r"C:\Users\Ann\AppData\Local")])),
+            paths(&[r"C:\Users\Ann\AppData\Local\Temp"])
+        );
+        assert_eq!(
+            temp_folders(env(&[("SystemRoot", r"C:\Windows")])),
+            paths(&[r"C:\Windows\Temp"])
+        );
+        // Unset or empty: nothing — never the profile folder (what
+        // GetTempPathW falls back to), and never a relative "Temp".
+        assert!(temp_folders(env(&[("USERPROFILE", r"C:\Users\Ann")])).is_empty());
+        assert!(temp_folders(env(&[
+            ("TMP", ""),
+            ("TEMP", ""),
+            ("LOCALAPPDATA", ""),
+            ("SystemRoot", ""),
+        ]))
+        .is_empty());
+    }
+
+    #[test]
+    fn a_file_in_the_real_temp_folder_is_seen_whatever_its_spelling() {
+        // One temp folder at a time (the one the test files go to), so no
+        // other entry of the app's list can stand in for a spelling that
+        // wasn't resolved.
+        let t = TempConfig::new("in-temp", Some("x"));
+        let text = |p: &Path| p.to_string_lossy().into_owned();
+        let temp = std::env::temp_dir();
+        assert!(in_temp_folder(&[text(&t.0)], &[text(&temp)]));
+        // The file's long spelling alone, with and without the prefix: what
+        // current_exe() gives when %TEMP% itself is stored in 8.3 form, as
+        // on GitHub's runners (C:\Users\RUNNER~1\AppData\Local\Temp). Only
+        // the resolved spelling path_spellings adds to the folder matches
+        // then.
+        let long = text(&fs::canonicalize(&t.0).unwrap());
+        assert!(in_temp_folder(
+            std::slice::from_ref(&long),
+            &path_spellings(&temp)
+        ));
+        let bare = long.trim_start_matches(r"\\?\").to_string();
+        assert!(in_temp_folder(&[bare], &path_spellings(&temp)));
+        // The other way round: the file as given against the folder's long
+        // spelling alone.
+        let long_temp = text(&fs::canonicalize(&temp).unwrap());
+        assert!(in_temp_folder(&path_spellings(&t.0), &[long_temp]));
+        // And the app's own list has the folder — where TMP or TEMP names
+        // it (without them the test files go to the profile folder, which
+        // the app rightly doesn't count).
+        if std::env::var_os("TMP").is_some() || std::env::var_os("TEMP").is_some() {
+            assert!(in_temp_folder(&[text(&t.0)], &temp_folder_spellings()));
+        }
+        // The folder README recommends is not a temporary one. (Compared as
+        // text: the tests stay out of that folder, where the app may be
+        // installed.)
+        if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+            let exe =
+                PathBuf::from(local).join("Programs\\WinThemeSwitcher\\win-theme-switcher.exe");
+            assert!(!in_temp_folder(&[text(&exe)], &temp_folder_spellings()));
+        }
+    }
+
+    #[test]
+    fn an_8_3_spelling_on_disk_is_resolved_on_either_side() {
+        // A real folder with a long name and, where the volume makes them,
+        // an 8.3 alias: the two spellings share no text, and only
+        // path_spellings' resolved form brings them together.
+        use windows_sys::Win32::Storage::FileSystem::GetShortPathNameW;
+        let d = TempDir::new("a long folder name for 8.3");
+        let text = |p: &Path| p.to_string_lossy().into_owned();
+        fs::write(d.0.join("win-theme-switcher.exe"), b"x").unwrap();
+        let long_dir = fs::canonicalize(&d.0).unwrap();
+        let given = wide(&text(&d.0));
+        let mut buf = [0u16; 1024];
+        let n = unsafe { GetShortPathNameW(given.as_ptr(), buf.as_mut_ptr(), buf.len() as u32) }
+            as usize;
+        let short_dir = PathBuf::from(String::from_utf16_lossy(&buf[..n.min(buf.len())]));
+        if n == 0 || n >= buf.len() || path_key(&text(&short_dir)) == path_key(&text(&long_dir)) {
+            eprintln!("SKIP: no 8.3 name for {}", d.0.display());
+            return;
+        }
+        let short_exe = short_dir.join("win-theme-switcher.exe");
+        let long_exe = long_dir.join("win-theme-switcher.exe");
+        // The exe in 8.3 form, the temp folder in long form.
+        assert!(!in_temp_folder(&[text(&short_exe)], &[text(&long_dir)]));
+        assert!(in_temp_folder(
+            &path_spellings(&short_exe),
+            &[text(&long_dir)]
+        ));
+        // The temp folder in 8.3 form (as %TEMP% often is), the exe long.
+        assert!(!in_temp_folder(&[text(&long_exe)], &[text(&short_dir)]));
+        assert!(in_temp_folder(
+            &[text(&long_exe)],
+            &path_spellings(&short_dir)
+        ));
+    }
+
+    #[test]
+    fn startup_switch_reads_what_windows_records() {
+        use StartupSwitch::*;
+        // On, as Windows 11 stores it for an entry that was never switched
+        // off (02) and for a machine-wide one (06).
+        let on = [0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        assert_eq!(startup_switch(REG_BINARY, &on), On);
+        let on6 = [0x06, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        assert_eq!(startup_switch(REG_BINARY, &on6), On);
+        // Off: the lowest flag bit, followed by the time it was switched off.
+        let off = [
+            0x03, 0, 0, 0, 0x5C, 0x1B, 0x9A, 0x2E, 0x47, 0x33, 0xDC, 0x01,
+        ];
+        assert_eq!(startup_switch(REG_BINARY, &off), Off);
+        let off7 = [
+            0x07, 0, 0, 0, 0x10, 0x72, 0xE4, 0x09, 0xA1, 0x2F, 0xDC, 0x01,
+        ];
+        assert_eq!(startup_switch(REG_BINARY, &off7), Off);
+        // Switched off and on again: the flag is clear whatever follows.
+        let on_again = [
+            0x02, 0, 0, 0, 0x5C, 0x1B, 0x9A, 0x2E, 0x47, 0x33, 0xDC, 0x01,
+        ];
+        assert_eq!(startup_switch(REG_BINARY, &on_again), On);
+        // Not the record Windows writes: nothing is said.
+        assert_eq!(startup_switch(REG_BINARY, &[]), Unknown);
+        assert_eq!(startup_switch(REG_BINARY, &[0x03]), Unknown);
+        assert_eq!(startup_switch(REG_BINARY, &[0x03, 0, 0, 0]), Unknown);
+        assert_eq!(startup_switch(REG_BINARY, &off[..11]), Unknown);
+        assert_eq!(startup_switch(REG_BINARY, &[0x03; 16]), Unknown);
+        assert_eq!(startup_switch(REG_DWORD, &[0x03, 0, 0, 0]), Unknown);
+        assert_eq!(startup_switch(REG_SZ, &off), Unknown);
+        assert_eq!(startup_switch(REG_DWORD, &off), Unknown);
+    }
+
+    /// A throwaway key `HKCU\Software\WinThemeSwitcherTest-<pid>-<n>-<name>`
+    /// for the registry tests, deleted with everything below it when the
+    /// test ends — also when an assertion fails. The registry tests work
+    /// under such a key only: never the real Run, StartupApproved or
+    /// Personalize keys. `new` doesn't create it (a missing key is a case).
+    struct TestKey(String);
+
+    impl TestKey {
+        const PREFIX: &'static str = "Software\\WinThemeSwitcherTest-";
+
+        fn new(name: &str) -> Self {
+            static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let key = Self(format!(
+                "{}{}-{}-{name}",
+                Self::PREFIX,
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed),
+            ));
+            key.delete();
+            key
+        }
+
+        /// The path of a key below this one.
+        fn sub(&self, name: &str) -> String {
+            format!("{}\\{name}", self.0)
+        }
+
+        fn delete(&self) {
+            use windows_sys::Win32::System::Registry::{RegDeleteKeyW, RegDeleteTreeW};
+            // Whatever happens to self.0, nothing else is ever deleted.
+            if !self.0.starts_with(Self::PREFIX) || self.0.len() <= Self::PREFIX.len() {
+                return;
+            }
+            let path = wide(&self.0);
+            unsafe {
+                RegDeleteTreeW(HKEY_CURRENT_USER, path.as_ptr());
+                RegDeleteKeyW(HKEY_CURRENT_USER, path.as_ptr());
+            }
+        }
+    }
+
+    impl Drop for TestKey {
+        fn drop(&mut self) {
+            self.delete();
+        }
+    }
+
+    fn key_exists(path: &str) -> bool {
+        open_hkcu_key(path, KEY_QUERY_VALUE, false).is_ok()
+    }
+
+    /// Write a value of any type, creating the key.
+    fn set_raw_value(key: &str, name: &str, kind: u32, data: &[u8]) {
+        let hkey = open_hkcu_key(key, KEY_SET_VALUE, true).expect("test key");
+        let name_w = wide(name);
+        let rc = unsafe {
+            RegSetValueExW(
+                hkey.0,
+                name_w.as_ptr(),
+                0,
+                kind,
+                data.as_ptr(),
+                data.len() as u32,
+            )
+        };
+        assert_eq!(rc, 0);
+    }
+
+    /// A REG_SZ value's text, as set_run_value reads it.
+    fn read_sz(key: &str, name: &str) -> Option<String> {
+        let hkey = open_hkcu_key(key, KEY_QUERY_VALUE, false).ok()?;
+        unsafe { read_reg_sz(hkey.0, &wide(name)) }
+    }
+
+    const CMD: &str = "\"C:\\Program Files\\Some App\\win-theme-switcher.exe\"";
+
+    #[test]
+    fn the_test_key_guard_removes_its_key_and_everything_below() {
+        let path;
+        {
+            let t = TestKey::new("guard");
+            path = t.0.clone();
+            assert!(path.starts_with("Software\\WinThemeSwitcherTest-"));
+            assert!(!key_exists(&path), "not created by new()");
+            set_raw_value(&t.sub("a\\b"), "v", REG_DWORD, &1u32.to_le_bytes());
+            set_raw_value(&t.0, "w", REG_SZ, &[0, 0]);
+            assert!(key_exists(&t.sub("a\\b")));
+        }
+        assert!(!key_exists(&path), "deleted on drop");
+        // And on the way out of a failed assertion.
+        let caught = std::panic::catch_unwind(|| {
+            let t = TestKey::new("guard-panic");
+            set_raw_value(&t.0, "v", REG_SZ, &[0, 0]);
+            let path = t.0.clone();
+            std::panic::resume_unwind(Box::new(path));
+        });
+        let path = *caught.unwrap_err().downcast::<String>().unwrap();
+        assert!(!key_exists(&path), "deleted when the test fails");
+    }
+
+    #[test]
+    fn enabling_autostart_creates_a_missing_run_key_and_its_value() {
+        // The key, and here its parent too, isn't there (deleted on
+        // purpose — every profile starts with one): enable used to fail
+        // with "RegOpenKeyExW Run rc=2" at every start.
+        let t = TestKey::new("run-create");
+        let run = t.sub("CurrentVersion\\Run");
+        assert_eq!(hkcu_value_exists(&run, APP_NAME), Some(false), "no key");
+        assert_eq!(
+            set_run_value(&run, APP_NAME, Some(CMD)),
+            Ok(true),
+            "key and value created"
+        );
+        assert_eq!(read_sz(&run, APP_NAME).as_deref(), Some(CMD));
+        assert_eq!(hkcu_value_exists(&run, APP_NAME), Some(true));
+        // Stored as REG_SZ with its terminator, as Windows expects.
+        let (kind, data) = read_hkcu_value(&run, APP_NAME).unwrap();
+        assert_eq!(kind, REG_SZ);
+        assert_eq!(data.len(), (CMD.encode_utf16().count() + 1) * 2);
+        assert_eq!(&data[data.len() - 2..], [0, 0]);
+    }
+
+    #[test]
+    fn enabling_autostart_writes_only_when_the_value_differs() {
+        let t = TestKey::new("run-match");
+        assert_eq!(set_run_value(&t.0, APP_NAME, Some(CMD)), Ok(true));
+        // Other programs' entries are not this function's business.
+        set_raw_value(&t.0, "Other App", REG_SZ, &[b'x', 0, 0, 0]);
+        // Already what it should be: no registry write is made. What the
+        // function reports is the evidence — the key's last-write time
+        // can't be, since Windows leaves a key alone anyway when a value is
+        // set to the data it already has (measured on build 26300).
+        assert_eq!(set_run_value(&t.0, APP_NAME, Some(CMD)), Ok(false));
+        assert_eq!(read_sz(&t.0, APP_NAME).as_deref(), Some(CMD));
+        // Another exe (the app was moved): rewritten.
+        let moved = "\"D:\\Apps\\WinThemeSwitcher\\win-theme-switcher.exe\"";
+        assert_eq!(set_run_value(&t.0, APP_NAME, Some(moved)), Ok(true));
+        assert_eq!(read_sz(&t.0, APP_NAME).as_deref(), Some(moved));
+        assert_eq!(set_run_value(&t.0, APP_NAME, Some(moved)), Ok(false));
+        // A value of another type with that name: replaced by the string.
+        set_raw_value(&t.0, APP_NAME, REG_BINARY, &[1, 2, 3]);
+        assert_eq!(set_run_value(&t.0, APP_NAME, Some(moved)), Ok(true));
+        assert_eq!(read_sz(&t.0, APP_NAME).as_deref(), Some(moved));
+        assert_eq!(read_sz(&t.0, "Other App").as_deref(), Some("x"));
+    }
+
+    #[test]
+    fn from_a_temp_folder_the_run_value_is_left_exactly_as_it_is() {
+        use AutoStartOutcome::*;
+        // The Run value of the real install, and an exe started from
+        // inside the zip that would otherwise point it at itself.
+        let t = TestKey::new("run-temp");
+        let unpacked =
+            "\"C:\\Users\\Ann\\AppData\\Local\\Temp\\Temp1_wts.zip\\win-theme-switcher.exe\"";
+        let set_run = |register: bool| {
+            set_run_value(&t.0, APP_NAME, register.then_some(unpacked)).map(|_| ())
+        };
+        set_run_value(&t.0, APP_NAME, Some(CMD)).unwrap();
+        let in_temp = auto_start_plan(true, true);
+        assert_eq!(carry_out_auto_start(in_temp, set_run), LeftAlone);
+        assert_eq!(
+            read_sz(&t.0, APP_NAME).as_deref(),
+            Some(CMD),
+            "neither rewritten nor removed"
+        );
+        // The registry step isn't even called.
+        let never = |_: bool| -> Result<(), String> { panic!("the Run value must be left alone") };
+        assert_eq!(carry_out_auto_start(in_temp, never), LeftAlone);
+        // No entry yet: none is made from there.
+        set_run_value(&t.0, APP_NAME, None).unwrap();
+        assert_eq!(carry_out_auto_start(in_temp, set_run), LeftAlone);
+        assert_eq!(hkcu_value_exists(&t.0, APP_NAME), Some(false));
+        // From a permanent folder it is registered …
+        let installed = auto_start_plan(true, false);
+        assert_eq!(carry_out_auto_start(installed, set_run), Registered);
+        assert_eq!(read_sz(&t.0, APP_NAME).as_deref(), Some(unpacked));
+        // … and auto_start: false removes it from anywhere.
+        let off = auto_start_plan(false, true);
+        assert_eq!(carry_out_auto_start(off, set_run), Removed);
+        assert_eq!(hkcu_value_exists(&t.0, APP_NAME), Some(false));
+        // A failed registry call comes back with the autostart_err line's
+        // op and message.
+        let denied = |_: bool| Err("RegSetValueExW Run rc=5".to_string());
+        assert_eq!(
+            carry_out_auto_start(installed, denied),
+            Failed {
+                op: "set",
+                msg: "RegSetValueExW Run rc=5".to_string()
+            }
+        );
+        let denied = |_: bool| Err("RegDeleteValueW Run rc=5".to_string());
+        assert_eq!(
+            carry_out_auto_start(off, denied),
+            Failed {
+                op: "delete",
+                msg: "RegDeleteValueW Run rc=5".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn disabling_autostart_removes_the_value_and_nothing_else() {
+        let t = TestKey::new("run-remove");
+        set_run_value(&t.0, APP_NAME, Some(CMD)).unwrap();
+        set_raw_value(&t.0, "Other App", REG_SZ, &[b'x', 0, 0, 0]);
+        assert_eq!(set_run_value(&t.0, APP_NAME, None), Ok(true), "removed");
+        assert_eq!(hkcu_value_exists(&t.0, APP_NAME), Some(false));
+        assert_eq!(read_sz(&t.0, "Other App").as_deref(), Some("x"));
+        // Already gone: success, again and again.
+        assert_eq!(
+            set_run_value(&t.0, APP_NAME, None),
+            Ok(false),
+            "a missing value is success"
+        );
+        assert!(key_exists(&t.0), "the key itself stays");
+    }
+
+    #[test]
+    fn disabling_autostart_without_a_run_key_is_success_and_creates_none() {
+        let t = TestKey::new("run-remove-no-key");
+        let run = t.sub("Run");
+        assert_eq!(
+            set_run_value(&run, APP_NAME, None),
+            Ok(false),
+            "a missing key is success"
+        );
+        assert!(!key_exists(&run) && !key_exists(&t.0), "nothing created");
+        assert_eq!(hkcu_value_exists(&run, APP_NAME), Some(false));
+        assert_eq!(read_hkcu_value(&run, APP_NAME), None);
+    }
+
+    #[test]
+    fn the_startup_switch_is_read_from_the_registry_as_stored() {
+        // A stand-in for StartupApproved\Run, with records as Windows
+        // writes them — the real key is only ever read, by the app.
+        let t = TestKey::new("startup-approved");
+        let off = [
+            0x03, 0, 0, 0, 0x5C, 0x1B, 0x9A, 0x2E, 0x47, 0x33, 0xDC, 0x01,
+        ];
+        set_raw_value(&t.0, APP_NAME, REG_BINARY, &off);
+        set_raw_value(
+            &t.0,
+            "On",
+            REG_BINARY,
+            &[2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        );
+        set_raw_value(&t.0, "Empty", REG_BINARY, &[]);
+        set_raw_value(&t.0, "Text", REG_SZ, &[b'3', 0, 0, 0]);
+        let switch = |name: &str| {
+            read_hkcu_value(&t.0, name).map(|(kind, data)| startup_switch(kind, &data))
+        };
+        assert_eq!(
+            read_hkcu_value(&t.0, APP_NAME),
+            Some((REG_BINARY, off.to_vec()))
+        );
+        assert_eq!(switch(APP_NAME), Some(StartupSwitch::Off));
+        assert_eq!(switch("On"), Some(StartupSwitch::On));
+        assert_eq!(switch("Empty"), Some(StartupSwitch::Unknown));
+        assert_eq!(switch("Text"), Some(StartupSwitch::Unknown));
+        // No record: an entry may have none (it means on, like a 02 one).
+        assert_eq!(switch("Missing"), None);
+        // Reading changed nothing.
+        assert_eq!(
+            read_hkcu_value(&t.0, APP_NAME),
+            Some((REG_BINARY, off.to_vec()))
+        );
+    }
+
+    #[test]
+    fn the_switched_off_line_is_due_once_and_only_for_a_record_that_says_off() {
+        let t = TestKey::new("startup-note");
+        let off = [
+            0x03, 0, 0, 0, 0x5C, 0x1B, 0x9A, 0x2E, 0x47, 0x33, 0xDC, 0x01,
+        ];
+        set_raw_value(&t.0, "Off", REG_BINARY, &off);
+        set_raw_value(
+            &t.0,
+            "On",
+            REG_BINARY,
+            &[2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        );
+        set_raw_value(&t.0, "Short", REG_BINARY, &[3, 0, 0, 0]);
+        set_raw_value(&t.0, "Text", REG_SZ, &[b'3', 0, 0, 0]);
+        let logged = AtomicBool::new(false);
+        // On, unrecognized, or no record at all: nothing to say …
+        for quiet in ["On", "Short", "Text", "Missing"] {
+            assert!(!startup_switch_note_due(&t.0, quiet, &logged), "{quiet}");
+        }
+        assert!(!startup_switch_note_due(&t.sub("NoKey"), "Off", &logged));
+        // … and the one line isn't used up by it.
+        assert!(!logged.load(Ordering::Relaxed));
+        assert!(startup_switch_note_due(&t.0, "Off", &logged));
+        assert!(
+            !startup_switch_note_due(&t.0, "Off", &logged),
+            "once per run of the app"
+        );
+        // The user's switch is only read.
+        assert_eq!(
+            read_hkcu_value(&t.0, "Off"),
+            Some((REG_BINARY, off.to_vec()))
+        );
+    }
+
+    #[test]
+    fn the_registry_tier_creates_a_missing_personalize_key() {
+        let t = TestKey::new("personalize");
+        let key = t.sub("Themes\\Personalize");
+        assert_eq!(
+            read_hkcu_dword(&key, "AppsUseLightTheme"),
+            Err("open-rc-2".to_string()),
+            "no key yet"
+        );
+        let mixed = Modes {
+            apps_light: true,
+            system_light: false,
+        };
+        write_modes_at(&key, mixed).expect("key created, both values written");
+        assert_eq!(read_hkcu_dword(&key, "AppsUseLightTheme"), Ok(1));
+        assert_eq!(read_hkcu_dword(&key, "SystemUsesLightTheme"), Ok(0));
+        // With the key there: overwritten in place.
+        write_modes_at(&key, Modes::from(Theme::Dark)).unwrap();
+        assert_eq!(read_hkcu_dword(&key, "AppsUseLightTheme"), Ok(0));
+        assert_eq!(read_hkcu_dword(&key, "SystemUsesLightTheme"), Ok(0));
+        // What read_modes rejects: a value that isn't a 4-byte DWORD.
+        set_raw_value(&key, "AppsUseLightTheme", REG_SZ, &[b'1', 0, 0, 0]);
+        assert_eq!(
+            read_hkcu_dword(&key, "AppsUseLightTheme"),
+            Err("type-1-size-4".to_string())
+        );
+        assert_eq!(
+            read_hkcu_dword(&key, "Missing"),
+            Err("query-rc-2".to_string())
+        );
+    }
+
+    #[test]
+    fn a_registry_key_that_cannot_be_opened_names_the_api_and_its_code() {
+        // Without create_missing a missing key is the caller's to judge.
+        let t = TestKey::new("open-err");
+        match open_hkcu_key(&t.0, KEY_QUERY_VALUE, false) {
+            Err(e) => assert_eq!(e, ("RegOpenKeyExW", ERROR_FILE_NOT_FOUND)),
+            Ok(_) => panic!("the key doesn't exist"),
+        }
+        assert!(!key_exists(&t.0), "an open never creates");
+        assert!(open_hkcu_key(&t.0, KEY_QUERY_VALUE, true).is_ok());
+        assert!(key_exists(&t.0));
+    }
+
+    #[test]
+    fn a_failed_registry_call_is_reported_with_the_api_and_its_code() {
+        use windows_sys::Win32::Foundation::ERROR_CHILD_MUST_BE_VOLATILE;
+        use windows_sys::Win32::System::Registry::REG_OPTION_VOLATILE;
+        let access = KEY_QUERY_VALUE | KEY_SET_VALUE;
+        let code = |r: Result<RegKey, (&'static str, u32)>| r.err().expect("must fail");
+        let dark = Modes::from(Theme::Dark);
+        // An open that fails with something other than "not found": a key
+        // name longer than the registry allows (255 characters). Nothing is
+        // created for it, and the callers pass the API and its code on.
+        let t = TestKey::new("reg-err");
+        let too_long = t.sub(&"k".repeat(300));
+        let (api, rc) = code(open_hkcu_key(&too_long, access, true));
+        assert_eq!(api, "RegOpenKeyExW");
+        assert!(rc != 0 && rc != ERROR_FILE_NOT_FOUND, "rc={rc}");
+        assert_eq!(
+            write_modes_at(&too_long, dark),
+            Err((format!("RegOpenKeyExW Personalize rc={rc}"), false))
+        );
+        let run_err = Err(format!("RegOpenKeyExW Run rc={rc}"));
+        assert_eq!(set_run_value(&too_long, APP_NAME, Some(CMD)), run_err);
+        assert_eq!(set_run_value(&too_long, APP_NAME, None), run_err);
+        // A key that isn't there and can't be created: a lasting key below
+        // a volatile one. That is the create's error, not the open's.
+        let parent = wide(&t.sub("volatile"));
+        let mut hkey: HKEY = ptr::null_mut();
+        let made = unsafe {
+            RegCreateKeyExW(
+                HKEY_CURRENT_USER,
+                parent.as_ptr(),
+                0,
+                ptr::null(),
+                REG_OPTION_VOLATILE,
+                KEY_QUERY_VALUE,
+                ptr::null(),
+                &mut hkey,
+                ptr::null_mut(),
+            )
+        };
+        assert_eq!(made, 0);
+        drop(RegKey(hkey));
+        let child = t.sub("volatile\\Run");
+        assert_eq!(
+            code(open_hkcu_key(&child, access, true)),
+            ("RegCreateKeyExW", ERROR_CHILD_MUST_BE_VOLATILE)
+        );
+        let rc = ERROR_CHILD_MUST_BE_VOLATILE;
+        assert_eq!(
+            write_modes_at(&child, dark),
+            Err((format!("RegCreateKeyExW Personalize rc={rc}"), false))
+        );
+        assert_eq!(
+            set_run_value(&child, APP_NAME, Some(CMD)),
+            Err(format!("RegCreateKeyExW Run rc={rc}"))
+        );
+        // Removing never creates, so there it is just a key that isn't
+        // there.
+        assert_eq!(set_run_value(&child, APP_NAME, None), Ok(false));
+        assert!(!key_exists(&child));
     }
 
     #[test]
