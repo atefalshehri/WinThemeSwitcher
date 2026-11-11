@@ -11,7 +11,10 @@
 # /DEPENDENTLOADFLAG:0x800 (LOAD_LIBRARY_SEARCH_SYSTEM32) makes the loader
 # resolve the exe's static DLL imports from System32 only, never from the
 # exe's own folder — a DLL planted next to the signed exe (which runs at every
-# login via HKCU\Run) can't hijack it.
+# login via HKCU\Run) can't hijack it. One import doesn't come from System32:
+# comctl32.dll, which the application manifest (app.manifest, embedded by
+# build.rs) redirects to version 6 in Windows' own side-by-side store,
+# %SystemRoot%\WinSxS, before any folder is searched.
 [target.x86_64-pc-windows-msvc]
 rustflags = [
     "-C", "target-feature=+crt-static",

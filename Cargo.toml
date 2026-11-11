@@ -34,6 +34,8 @@ features = [
     "Win32_System_WindowsProgramming",
     "Win32_UI_WindowsAndMessaging",
     "Win32_UI_Shell",
+    # Tests only: the manifest test reads the process's DPI awareness.
+    "Win32_UI_HiDpi",
     "Win32_Graphics_Dwm",
     # RegisterClassW/WNDCLASSW (wake listener window) are cfg-gated on GDI
     # (WNDCLASSW has an HBRUSH field). tray-icon and muda share this

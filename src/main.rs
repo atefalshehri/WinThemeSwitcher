@@ -4663,12 +4663,22 @@ fn claim_single_instance() -> InstanceClaim {
     claim
 }
 
+/// What events.log says when the app starts: the running version, which is
+/// also the version in the exe's version resource and manifest (build.rs
+/// takes it from the same Cargo.toml). Nothing else goes into this line — no
+/// path, no user name, no coordinates.
+const APP_START: &str = concat!("app_start version=", env!("CARGO_PKG_VERSION"));
+
 fn main() {
     // Runtime LoadLibrary calls by bare name (dependencies load e.g.
     // uxtheme.dll that way) search System32 only — never the exe's own
     // folder. .cargo\config.toml's /DEPENDENTLOADFLAG does the same for the
     // static imports. Everything this app loads is a system DLL; COM/WinRT
-    // activation uses full paths.
+    // activation uses full paths. One name never reaches either search:
+    // comctl32.dll, which the manifest's Common-Controls dependency
+    // (app.manifest) redirects to version 6 in Windows' own side-by-side
+    // store, %SystemRoot%\WinSxS. The manifest test in mod tests shows that
+    // for the static import; a later load by name gets that same module.
     unsafe {
         SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32);
     }
@@ -4686,6 +4696,10 @@ fn main() {
         );
         std::process::exit(0);
     }
+    // The first line of a run (only a single_instance_err line, written by
+    // claim_single_instance, can come before it). A second copy has exited
+    // above and never writes it.
+    log_event(&format!("{} {}", Local::now().to_rfc3339(), APP_START));
     if let Err(e) = run() {
         // Fail loudly: tray-window creation, event-loop build errors, and
         // event-loop death all used to be silent exits. (A taskbar that isn't
@@ -9432,9 +9446,10 @@ mod tests {
 
     #[test]
     fn theme_files_on_long_paths_are_read_not_taken_as_keyless() {
-        // MAX_PATH (260) or more: neither this test binary nor the app has a
-        // longPathAware manifest, so GetPrivateProfileStringW couldn't open
-        // the plain path and returned the default — every key read as absent.
+        // MAX_PATH (260) or more: the manifest this test binary shares with
+        // the app (app.manifest) deliberately has no longPathAware, so
+        // GetPrivateProfileStringW couldn't open the plain path and returned
+        // the default — every key read as absent.
         let d = TempDir::new("long-path");
         let deep = d.0.join("a".repeat(120)).join("b".repeat(120));
         fs::create_dir_all(&deep).unwrap();
@@ -10284,5 +10299,244 @@ mod tests {
         // Once its holder is gone the name is free again.
         unsafe { CloseHandle(holder) };
         assert_eq!(claim_instance_mutex(&name("locked")), InstanceClaim::First);
+    }
+
+    /// The folder and file name a loaded module came from, lower-cased.
+    fn module_path(module: *mut c_void) -> String {
+        use windows_sys::Win32::System::LibraryLoader::GetModuleFileNameW;
+        let mut buf = [0u16; 1024];
+        let n = unsafe { GetModuleFileNameW(module, buf.as_mut_ptr(), buf.len() as u32) };
+        String::from_utf16_lossy(&buf[..n as usize]).to_lowercase()
+    }
+
+    // build.rs links the same manifest and version resource into this test
+    // executable as into the app, and .cargo\config.toml gives both the same
+    // linker flags. So this test running at all shows that an exe with the
+    // manifest and /DEPENDENTLOADFLAG:0x800 starts; the rest checks what
+    // Windows made of the manifest.
+    #[test]
+    fn the_manifest_is_embedded_and_windows_honours_it() {
+        use windows_sys::Win32::Foundation::FreeLibrary;
+        use windows_sys::Win32::System::LibraryLoader::{
+            FindResourceW, GetModuleHandleExW, LoadLibraryExW, LoadResource, LockResource,
+            SizeofResource, GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+            GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+        };
+        use windows_sys::Win32::UI::HiDpi::{
+            AreDpiAwarenessContextsEqual, GetThreadDpiAwarenessContext,
+            DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+        };
+        use windows_sys::Win32::UI::Shell::DefSubclassProc;
+
+        if !cfg!(target_env = "msvc") {
+            eprintln!("SKIP: build.rs embeds the resources for MSVC targets only");
+            return;
+        }
+
+        // RT_MANIFEST (24), id 1: the application manifest. A resource type
+        // or id given as a number travels in the pointer (MAKEINTRESOURCE).
+        let number = |n: usize| n as *const u16;
+        let manifest = unsafe {
+            let found = FindResourceW(ptr::null_mut(), number(1), number(24));
+            assert_ne!(found as usize, 0, "the test exe has no manifest resource");
+            let data = LockResource(LoadResource(ptr::null_mut(), found)) as *const u8;
+            assert!(!data.is_null());
+            let size = SizeofResource(ptr::null_mut(), found) as usize;
+            String::from_utf8(std::slice::from_raw_parts(data, size).to_vec()).unwrap()
+        };
+        // The three numbers, as build.rs writes them: a pre-release suffix
+        // in CARGO_PKG_VERSION ("0.7.0-rc.1") isn't part of this version.
+        let identity = format!(
+            "name=\"WinThemeSwitcher\" version=\"{}.{}.{}.0\"",
+            env!("CARGO_PKG_VERSION_MAJOR"),
+            env!("CARGO_PKG_VERSION_MINOR"),
+            env!("CARGO_PKG_VERSION_PATCH"),
+        );
+        for expected in [
+            identity.as_str(),
+            "level=\"asInvoker\" uiAccess=\"false\"",
+            "{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}",
+            ">true/pm</dpiAware>",
+            ">PerMonitorV2</dpiAwareness>",
+            "name=\"Microsoft.Windows.Common-Controls\" version=\"6.0.0.0\"",
+        ] {
+            assert!(manifest.contains(expected), "{expected} not in {manifest}");
+        }
+        // Settings that change how Windows APIs behave stay out (with
+        // longPathAware the long-path test above could no longer show the
+        // bug it covers).
+        let lower = manifest.to_lowercase();
+        assert!(!lower.contains("longpathaware") && !lower.contains("activecodepage"));
+        assert!(!manifest.contains("<!--"), "comments are not embedded");
+
+        // Per-monitor-v2 DPI awareness, without winit's call: no event loop
+        // is built in the tests, so here it can only come from the manifest.
+        let per_monitor_v2 = unsafe {
+            AreDpiAwarenessContextsEqual(
+                GetThreadDpiAwarenessContext(),
+                DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+            )
+        };
+        assert_ne!(per_monitor_v2, 0, "the process isn't per-monitor-v2 aware");
+
+        // comctl32.dll. The app imports it statically (tray-icon and muda
+        // subclass their windows through it); naming one of the functions
+        // they import makes it a static import of this exe too, resolved by
+        // the loader before any code ran, under /DEPENDENTLOADFLAG:0x800
+        // ("System32 only"). The manifest's Common-Controls dependency
+        // redirects the name to version 6 in Windows' side-by-side store
+        // before that search: the module the name stands for in this process
+        // must be that one. (DefSubclassProc is exported by name from version
+        // 5.82 too, so without the manifest this exe would still start, and
+        // fail here rather than in the loader.)
+        let imported = std::hint::black_box(DefSubclassProc as *const c_void);
+        let name = wide("comctl32.dll");
+        let static_import = unsafe { GetModuleHandleW(name.as_ptr()) };
+        assert_ne!(static_import as usize, 0, "comctl32.dll isn't loaded");
+        let path = module_path(static_import);
+        assert!(
+            path.contains("\\winsxs\\")
+                && path.contains("microsoft.windows.common-controls_6595b64144ccf1df_6.0."),
+            "comctl32.dll came from {path}"
+        );
+        // And this exe's own import is bound to that module: the address its
+        // import table holds for DefSubclassProc lies inside it. The lookup
+        // by name alone would also be satisfied by a version 6 that some
+        // other code had brought into the process, next to a version 5.82
+        // the import was bound to — two copies in one process do happen.
+        let mut owner: *mut c_void = ptr::null_mut();
+        let found = unsafe {
+            GetModuleHandleExW(
+                GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS
+                    | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                imported as *const u16,
+                &mut owner,
+            )
+        };
+        assert_ne!(found, 0, "no module holds the imported DefSubclassProc");
+        assert_eq!(
+            owner,
+            static_import,
+            "DefSubclassProc is bound to {}",
+            module_path(owner)
+        );
+        // A load by bare name at run time, with the flag main()'s
+        // SetDefaultDllDirectories makes the default for such loads: the
+        // same module, not a second copy. (This doesn't single out the
+        // redirection — version 6 is loaded already, and the loaded-module
+        // list alone would return it. In the app it is loaded already too:
+        // it is a static import.)
+        let by_name =
+            unsafe { LoadLibraryExW(name.as_ptr(), ptr::null_mut(), LOAD_LIBRARY_SEARCH_SYSTEM32) };
+        assert_eq!(by_name, static_import, "a second comctl32.dll was loaded");
+        unsafe { FreeLibrary(by_name) };
+        // Version 5.82, the comctl32.dll that System32's path names,
+        // shouldn't be in the process as well, and isn't when this test runs
+        // alone. Not an assertion: a Windows component that another test
+        // calls into could load it for itself.
+        let mut system32 = [0u16; 260];
+        let n = unsafe { GetSystemDirectoryW(system32.as_mut_ptr(), system32.len() as u32) };
+        let old = format!(
+            "{}\\comctl32.dll",
+            String::from_utf16_lossy(&system32[..n as usize])
+        );
+        if unsafe { GetModuleHandleW(wide(&old).as_ptr()) } as usize != 0 {
+            eprintln!("NOTE: {old} is loaded too");
+        }
+        eprintln!("comctl32.dll: {path}");
+    }
+
+    // The version resource, read back with Windows' own reader (the one
+    // Explorer's Details tab and Task Manager use), so a wrong length or
+    // alignment in build.rs's hand-written VS_VERSIONINFO shows up here.
+    #[test]
+    fn the_version_resource_says_what_cargo_toml_and_license_say() {
+        use windows_sys::Win32::Storage::FileSystem::{
+            GetFileVersionInfoSizeW, GetFileVersionInfoW, VerQueryValueW, VS_FIXEDFILEINFO,
+        };
+
+        if !cfg!(target_env = "msvc") {
+            eprintln!("SKIP: build.rs embeds the resources for MSVC targets only");
+            return;
+        }
+        let exe = wide(std::env::current_exe().unwrap().to_str().unwrap());
+        let info = unsafe {
+            let size = GetFileVersionInfoSizeW(exe.as_ptr(), ptr::null_mut());
+            assert_ne!(size, 0, "the test exe has no version resource");
+            let mut info = vec![0u8; size as usize];
+            let ok = GetFileVersionInfoW(exe.as_ptr(), 0, size, info.as_mut_ptr() as *mut c_void);
+            assert_ne!(ok, 0);
+            info
+        };
+        // A value's address and its length (bytes for the fixed part and the
+        // translation, UTF-16 units with the NUL for a string).
+        let query = |what: &str| -> (*const u8, usize) {
+            let mut value: *mut c_void = ptr::null_mut();
+            let mut len = 0u32;
+            let ok = unsafe {
+                VerQueryValueW(
+                    info.as_ptr() as *const c_void,
+                    wide(what).as_ptr(),
+                    &mut value,
+                    &mut len,
+                )
+            };
+            assert!(ok != 0 && !value.is_null(), "{what} is missing");
+            (value as *const u8, len as usize)
+        };
+
+        let version = env!("CARGO_PKG_VERSION");
+        let numbers = [
+            env!("CARGO_PKG_VERSION_MAJOR"),
+            env!("CARGO_PKG_VERSION_MINOR"),
+            env!("CARGO_PKG_VERSION_PATCH"),
+        ]
+        .map(|n| n.parse::<u32>().unwrap());
+        let (fixed, len) = query("\\");
+        assert_eq!(len, std::mem::size_of::<VS_FIXEDFILEINFO>());
+        let fixed = unsafe { std::ptr::read_unaligned(fixed as *const VS_FIXEDFILEINFO) };
+        assert_eq!(fixed.dwSignature, 0xFEEF04BD);
+        let (ms, ls) = ((numbers[0] << 16) | numbers[1], numbers[2] << 16);
+        assert_eq!((fixed.dwFileVersionMS, fixed.dwFileVersionLS), (ms, ls));
+        assert_eq!(
+            (fixed.dwProductVersionMS, fixed.dwProductVersionLS),
+            (ms, ls)
+        );
+
+        let (translation, len) = query("\\VarFileInfo\\Translation");
+        assert_eq!(len, 4);
+        let translation = unsafe { std::ptr::read_unaligned(translation as *const [u16; 2]) };
+        assert_eq!(translation, [0x0409, 0x04B0]);
+
+        let text = |key: &str| -> String {
+            let (value, len) = query(&format!("\\StringFileInfo\\040904B0\\{key}"));
+            let units: Vec<u16> = (0..len)
+                .map(|i| unsafe { std::ptr::read_unaligned(value.add(i * 2) as *const u16) })
+                .collect();
+            assert_eq!(units.last(), Some(&0), "{key} isn't NUL-terminated");
+            String::from_utf16(&units[..len - 1]).unwrap()
+        };
+        assert_eq!(text("FileDescription"), "WinThemeSwitcher");
+        assert_eq!(text("ProductName"), "WinThemeSwitcher");
+        assert_eq!(text("FileVersion"), version);
+        assert_eq!(text("ProductVersion"), version);
+        assert_eq!(text("InternalName"), "win-theme-switcher.exe");
+        assert_eq!(text("OriginalFilename"), "win-theme-switcher.exe");
+        // The copyright line is LICENSE's, and the company its holder.
+        let copyright = include_str!("../LICENSE")
+            .lines()
+            .map(str::trim)
+            .find(|l| l.starts_with("Copyright (c) "))
+            .unwrap();
+        assert_eq!(text("LegalCopyright"), copyright);
+        let holder = text("CompanyName");
+        assert!(
+            !holder.is_empty() && copyright.ends_with(&format!(" {holder}")),
+            "CompanyName {holder:?} isn't the holder in {copyright:?}"
+        );
+
+        // The line main() writes to events.log names the same version, and
+        // nothing else.
+        assert_eq!(APP_START, format!("app_start version={version}"));
     }
 }

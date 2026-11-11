@@ -46,6 +46,10 @@ jobs:
 
       # The .cargo/config.toml linker hardening must reach the PE (no
       # VCRUNTIME140 import, DependentLoadFlags 0x800) — fail if it's lost.
+      # The same script checks what build.rs embeds: the application manifest
+      # (app.manifest) and a version resource that carries Cargo.toml's
+      # version. The Test step then runs a test executable with the same
+      # manifest and linker flags, which shows that such an exe starts.
       - name: Verify linker hardening
         run: powershell -NoProfile -ExecutionPolicy Bypass -File scripts/check-hardening.ps1 -Exe target/release/win-theme-switcher.exe
 

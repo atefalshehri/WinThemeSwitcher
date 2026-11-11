@@ -1,5 +1,6 @@
-# Build a release exe, verify its linker hardening, Authenticode-sign it with
-# an RFC 3161 countersignature, and deploy it.
+# Build a release exe, verify its linker hardening, manifest and version
+# resource, Authenticode-sign it with an RFC 3161 countersignature, and deploy
+# it.
 #
 # Why this exists: bare `cargo build --release` produces a fresh-hash
 # unsigned Windows PE. Kaspersky KSN flags first-seen unsigned hashes with
@@ -43,7 +44,9 @@
 #      stopped instance is relaunched if its exe is still validly signed)
 #   7  linker hardening missing: RUSTFLAGS/CARGO_ENCODED_RUSTFLAGS overrides
 #      .cargo\config.toml, or the exe still imports VCRUNTIME140 or lacks
-#      DependentLoadFlags 0x800 (see scripts\check-hardening.ps1)
+#      DependentLoadFlags 0x800; or the exe lacks what build.rs embeds (the
+#      application manifest, the version resource), or its version isn't
+#      Cargo.toml's (see scripts\check-hardening.ps1)
 #   8  deployed, but the relaunched app was not seen running
 #   9  refused to deploy into AppData: this shell has a package identity (an
 #      MSIX app's container), or that couldn't be checked
@@ -153,7 +156,9 @@ if (-not $exe) {
     Quit 2
 }
 
-# Verify the linker hardening landed in the PE itself. Run in-process (a
+# Verify the linker hardening landed in the PE itself, and with it the
+# manifest and the version resource, carrying Cargo.toml's version (the
+# script reads the Cargo.toml next to its own folder). Run in-process (a
 # script's `exit N` sets $LASTEXITCODE) with a seeded failure, so a check
 # that can't run can never read as a pass.
 $global:LASTEXITCODE = 1
