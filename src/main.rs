@@ -20,11 +20,12 @@ use windows::Devices::Geolocation::{GeolocationAccessStatus, Geolocator};
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
 use windows_sys::core::{GUID, HRESULT};
 use windows_sys::Win32::Foundation::{
-    GetLastError, SysFreeString, ERROR_ALREADY_EXISTS, HWND, LPARAM, LRESULT, WPARAM,
+    CloseHandle, GetLastError, SysFreeString, ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS,
+    ERROR_FILE_NOT_FOUND, HWND, LPARAM, LRESULT, WPARAM,
 };
 use windows_sys::Win32::Graphics::Dwm::DwmFlush;
 use windows_sys::Win32::Storage::FileSystem::{
-    GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, FILE_SHARE_READ,
+    GetDriveTypeW, GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, FILE_SHARE_READ,
 };
 use windows_sys::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
 use windows_sys::Win32::System::Environment::ExpandEnvironmentStringsW;
@@ -42,8 +43,10 @@ use windows_sys::Win32::System::RemoteDesktop::{
     WTSRegisterSessionNotification, NOTIFY_FOR_THIS_SESSION,
 };
 use windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW;
-use windows_sys::Win32::System::Threading::CreateMutexW;
-use windows_sys::Win32::System::WindowsProgramming::GetPrivateProfileStringW;
+use windows_sys::Win32::System::Threading::{
+    CreateMutexW, OpenMutexW, SYNCHRONIZATION_SYNCHRONIZE,
+};
+use windows_sys::Win32::System::WindowsProgramming::{GetPrivateProfileStringW, DRIVE_REMOTE};
 use windows_sys::Win32::UI::Shell::{
     AssocQueryStringW, SHLoadIndirectString, ShellExecuteW, ASSOCF_INIT_IGNOREUNKNOWN,
     ASSOCSTR_FRIENDLYAPPNAME,
@@ -1746,6 +1749,11 @@ enum ThemePathIssue {
     /// Drive-relative (`C:x.theme`): would resolve against that drive's
     /// current directory, which the app doesn't control.
     NotAbsolute,
+    /// On a network location (`\\server\share\…` or a network drive). Every
+    /// look at such a file waits for its server, and one that doesn't answer
+    /// held the event-loop thread for 20-40 s per check. Refused from the
+    /// path's text and the drive's type, before anything opens it.
+    NetworkPath,
 }
 
 impl ThemePathIssue {
@@ -1758,6 +1766,7 @@ impl ThemePathIssue {
             ThemePathIssue::ScratchFile => "scratch-file",
             ThemePathIssue::UnexpandedVar => "unexpanded-var",
             ThemePathIssue::NotAbsolute => "not-absolute",
+            ThemePathIssue::NetworkPath => "network-path",
         }
     }
 
@@ -1784,7 +1793,95 @@ impl ThemePathIssue {
                 "a drive letter without a backslash (like C:x.theme) is not supported - \
                  use a full path"
             }
+            ThemePathIssue::NetworkPath => {
+                "it is on a network location (a \\\\server\\share path or a network \
+                 drive), and a server that doesn't answer would freeze the app - copy \
+                 the .theme file to a folder on this PC and use that copy"
+            }
         }
+    }
+}
+
+/// Where an absolute path starts, as far as its text shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PathRoot {
+    /// A share: `\\server\share\…`, `\\?\UNC\server\share\…`, or the same
+    /// through the device namespace, `\\.\UNC\…`.
+    Unc,
+    /// A drive letter (upper-cased): `X:\…`, `\\?\X:\…` or `\\.\X:\…`.
+    Drive(char),
+    /// Anything else: a volume GUID or another device name (`\\?\Volume{…}\`,
+    /// `\\.\pipe\…`, `\\?\GLOBALROOT\…`), a path without a drive. Where a
+    /// device name leads isn't in the text — `GLOBALROOT\Device\Mup\…` is
+    /// the redirector, and so is a name someone defined to point at a share.
+    Other,
+}
+
+/// Pure string work — nothing is opened. For a path in the form Win32 will
+/// open (`on_network` normalizes it first). `/` counts as `\`; in a `\\?\`
+/// path, where Win32 doesn't read it so, that can only turn an odd spelling
+/// into a share, which is the side to err on.
+fn path_root(path: &str) -> PathRoot {
+    fn drive(s: &str) -> Option<char> {
+        let mut chars = s.chars();
+        match (chars.next(), chars.next()) {
+            (Some(letter), Some(':')) if letter.is_ascii_alphabetic() => {
+                Some(letter.to_ascii_uppercase())
+            }
+            _ => None,
+        }
+    }
+    /// `s` without `prefix` (ASCII case-insensitive), if it starts with it.
+    fn after<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
+        let head = s.get(..prefix.len())?;
+        head.eq_ignore_ascii_case(prefix)
+            .then(|| &s[prefix.len()..])
+    }
+    let s = path.replace('/', "\\");
+    let device = s.strip_prefix(r"\\?\").or_else(|| s.strip_prefix(r"\\.\"));
+    if let Some(mut rest) = device {
+        // `Global\` names the same set of device names again, any number
+        // of times: `\\?\Global\UNC\…` is a share, `\\?\Global\C:\…` is C:.
+        while let Some(tail) = after(rest, r"Global\") {
+            rest = tail;
+        }
+        // `\\.\UNC\` is the redirector too (both prefixes lead to `\??\UNC`).
+        if after(rest, r"UNC\").is_some() {
+            return PathRoot::Unc;
+        }
+        return drive(rest).map_or(PathRoot::Other, PathRoot::Drive);
+    }
+    if s.starts_with(r"\\") {
+        return PathRoot::Unc;
+    }
+    drive(&s).map_or(PathRoot::Other, PathRoot::Drive)
+}
+
+/// Whether drive `letter` is a network drive. `GetDriveTypeW` answers for a
+/// drive letter from the process's device map, without asking the server:
+/// measured 2026-11-11 on Windows 11 build 26300 at under a microsecond for a
+/// local drive, a mapped drive and a drive letter linked to a server name
+/// that doesn't resolve. A letter that isn't a drive is not remote.
+fn drive_is_remote(letter: char) -> bool {
+    let root = wide(&format!("{letter}:\\"));
+    unsafe { GetDriveTypeW(root.as_ptr()) == DRIVE_REMOTE }
+}
+
+/// Whether `path` is on a network location: a share by its text, or a drive
+/// letter that `drive_is_remote`. The text is read the way Win32 will open
+/// it: `std::path::absolute` (GetFullPathNameW — string work, no file
+/// system; a `\\?\` path comes back as given, since Win32 opens that form
+/// as written) resolves `.`/`..`, repeated separators and trailing dots
+/// first, so `\\.\C:\..\UNC\server\share\…` is seen as the share it opens.
+/// Not seen: a local path that leads to a share through a junction or a
+/// symlink, through a `subst` drive that `GetDriveTypeW` doesn't report as
+/// remote, or through a device name other than a drive letter.
+fn on_network(path: &Path, drive_is_remote: impl Fn(char) -> bool) -> bool {
+    let as_opened = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+    match path_root(&as_opened.to_string_lossy()) {
+        PathRoot::Unc => true,
+        PathRoot::Drive(letter) => drive_is_remote(letter),
+        PathRoot::Other => false,
     }
 }
 
@@ -1828,17 +1925,32 @@ fn expand_theme_path(raw: &str, base: &Path) -> PathBuf {
     }
 }
 
-/// Whether an (expanded) path may be used as a theme: an existing FILE with
-/// a `.theme` extension that isn't Windows' scratch Custom.theme. Ok is the
-/// path to use: as written, with the file name as stored on disk
-/// (`with_stored_name`).
+/// Whether an (expanded) path may be used as a theme: an existing FILE, not
+/// on a network location, with a `.theme` extension, that isn't Windows'
+/// scratch Custom.theme. Ok is the path to use: as written, with the file
+/// name as stored on disk (`with_stored_name`).
 fn check_theme_path(path: &Path, scratch: &Path) -> Result<PathBuf, ThemePathIssue> {
+    check_theme_path_with(path, scratch, drive_is_remote)
+}
+
+/// `check_theme_path`, with the network-drive question as a parameter so
+/// tests can answer it.
+fn check_theme_path_with(
+    path: &Path,
+    scratch: &Path,
+    drive_is_remote: impl Fn(char) -> bool,
+) -> Result<PathBuf, ThemePathIssue> {
     let prefixed = matches!(
         path.components().next(),
         Some(std::path::Component::Prefix(_))
     );
     if prefixed && !path.has_root() {
         return Err(ThemePathIssue::NotAbsolute);
+    }
+    // Before the first call that opens the path: everything below waits for
+    // the server when the file is on a share.
+    if on_network(path, drive_is_remote) {
+        return Err(ThemePathIssue::NetworkPath);
     }
     if path.is_dir() {
         return Err(ThemePathIssue::Directory);
@@ -3388,28 +3500,125 @@ fn install_panic_hook() {
     }));
 }
 
-/// Claim the per-session single-instance mutex. Returns false when another
-/// instance already holds it. The handle is intentionally leaked — it must
-/// live exactly as long as the process.
-fn claim_single_instance() -> bool {
-    let name = wide("Local\\WinThemeSwitcher.single-instance");
-    unsafe {
-        let handle = CreateMutexW(ptr::null(), 0, name.as_ptr());
-        let last = GetLastError();
-        if (handle as usize) != 0 && last == ERROR_ALREADY_EXISTS {
-            // Second instance; the OS closes the extra handle at process exit.
-            return false;
+/// What creating the single-instance mutex says about another copy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InstanceClaim {
+    /// The mutex is new: this is the only copy.
+    First,
+    /// It existed and was opened: another copy holds it.
+    Duplicate,
+    /// It exists, but this process may not open it — `CreateMutexW` asks for
+    /// full access to an existing mutex, and a copy started with fewer
+    /// rights than the first (at low integrity, say) is refused.
+    DuplicateNoAccess,
+    /// Creating it failed some other way (the code is the last error). No
+    /// reason to refuse to run.
+    Unknown(u32),
+}
+
+impl InstanceClaim {
+    /// For a claim that means another copy is running — show the notice
+    /// and exit — its events.log text; `None` means carry on. The reason is
+    /// added only when the other copy's mutex couldn't be opened, so the
+    /// ordinary line reads as it always has.
+    fn duplicate_log(self) -> Option<&'static str> {
+        match self {
+            InstanceClaim::Duplicate => Some("duplicate_instance action=exit"),
+            InstanceClaim::DuplicateNoAccess => {
+                Some("duplicate_instance action=exit reason=access-denied")
+            }
+            InstanceClaim::First | InstanceClaim::Unknown(_) => None,
         }
-        if (handle as usize) == 0 {
-            // Failing to create the mutex is no reason to refuse to run.
-            log_event(&format!(
-                "{} single_instance_err code={}",
-                Local::now().to_rfc3339(),
-                last,
-            ));
-        }
-        true
     }
+}
+
+/// Read a `CreateMutexW` result: whether a handle came back, and the last
+/// error captured right after the call.
+fn instance_claim(handle_is_null: bool, last_error: u32) -> InstanceClaim {
+    match (handle_is_null, last_error) {
+        (false, ERROR_ALREADY_EXISTS) => InstanceClaim::Duplicate,
+        (false, _) => InstanceClaim::First,
+        (true, ERROR_ACCESS_DENIED) => InstanceClaim::DuplicateNoAccess,
+        (true, code) => InstanceClaim::Unknown(code),
+    }
+}
+
+/// Whether a mutex name is taken, from an `OpenMutexW` attempt: it opened,
+/// or failed for any reason but "no such name" (refused again, or the name
+/// belongs to another kind of object).
+fn mutex_name_taken(open_is_null: bool, last_error: u32) -> bool {
+    !open_is_null || last_error != ERROR_FILE_NOT_FOUND
+}
+
+/// Settle the claim from the two calls it may take, each given as a closure
+/// that returns (no handle came back, the last error captured right after):
+/// `create` is `CreateMutexW`, `probe` is `OpenMutexW` for the least access.
+/// Creating that is refused with access denied says the mutex exists but
+/// may not be opened — or that this process may not create one at all. The
+/// probe tells: only a name that isn't there fails with "not found". Then
+/// either the other copy left between the two calls, and creating works
+/// now, or creating is what is refused; one more round shows which.
+fn settle_instance_claim(
+    mut create: impl FnMut() -> (bool, u32),
+    mut probe: impl FnMut() -> (bool, u32),
+) -> InstanceClaim {
+    for _ in 0..2 {
+        let (handle_is_null, last_error) = create();
+        let claim = instance_claim(handle_is_null, last_error);
+        if claim != InstanceClaim::DuplicateNoAccess {
+            return claim;
+        }
+        let (open_is_null, open_error) = probe();
+        if mutex_name_taken(open_is_null, open_error) {
+            return claim;
+        }
+    }
+    // Refused twice with nothing there to open: a creation failure.
+    InstanceClaim::Unknown(ERROR_ACCESS_DENIED)
+}
+
+/// `OpenMutexW` for `SYNCHRONIZE` only, closed again at once: (no handle
+/// came back, the last error captured right after the call).
+fn probe_mutex(name: &[u16]) -> (bool, u32) {
+    unsafe {
+        let probe = OpenMutexW(SYNCHRONIZATION_SYNCHRONIZE, 0, name.as_ptr());
+        let last = GetLastError();
+        let is_null = (probe as usize) == 0;
+        if !is_null {
+            CloseHandle(probe);
+        }
+        (is_null, last)
+    }
+}
+
+/// Create the named mutex, or learn that another process has it. A handle
+/// to a new or opened mutex is intentionally leaked — it must live exactly
+/// as long as the process (the OS closes it at exit).
+fn claim_instance_mutex(name: &str) -> InstanceClaim {
+    let name = wide(name);
+    settle_instance_claim(
+        || unsafe {
+            let handle = CreateMutexW(ptr::null(), 0, name.as_ptr());
+            let last = GetLastError();
+            ((handle as usize) == 0, last)
+        },
+        || probe_mutex(&name),
+    )
+}
+
+/// Claim the per-session single-instance mutex. `Duplicate` and
+/// `DuplicateNoAccess` mean another copy is running; a failure to create
+/// the mutex is logged here and is no reason to refuse to run.
+fn claim_single_instance() -> InstanceClaim {
+    let claim = claim_instance_mutex("Local\\WinThemeSwitcher.single-instance");
+    if let InstanceClaim::Unknown(code) = claim {
+        log_event(&format!(
+            "{} single_instance_err code={}",
+            Local::now().to_rfc3339(),
+            code,
+        ));
+    }
+    claim
 }
 
 fn main() {
@@ -3422,11 +3631,11 @@ fn main() {
         SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32);
     }
     install_panic_hook();
-    if !claim_single_instance() {
-        log_event(&format!(
-            "{} duplicate_instance action=exit",
-            Local::now().to_rfc3339(),
-        ));
+    if let Some(line) = claim_single_instance().duplicate_log() {
+        // Best effort: a copy too restricted to open the first copy's mutex
+        // (low integrity) can't append to events.log in an ordinary folder
+        // either, and then the notice below is the only sign.
+        log_event(&format!("{} {}", Local::now().to_rfc3339(), line));
         show_message_box(
             "WinThemeSwitcher",
             "WinThemeSwitcher is already running — look for its icon in the \
@@ -6959,5 +7168,556 @@ mod tests {
         assert!(file.ends_with("dark.theme"), "got {file:?}");
         let (_, _, issue) = rejected.expect("rejection reported");
         assert_eq!(issue, ThemePathIssue::ThemePack);
+    }
+
+    // --- themes on network locations (v0.6.0) ---
+
+    #[test]
+    fn path_root_table() {
+        use PathRoot::{Drive, Other, Unc};
+        for (path, want) in [
+            // Shares, in every spelling Win32 takes for one.
+            (r"\\server\share\Night.theme", Unc),
+            (r"\\server.example.com\share\a\b\Night.theme", Unc),
+            (r"\\192.0.2.7\c$\Night.theme", Unc),
+            ("//server/share/Night.theme", Unc),
+            (r"\/server\share\Night.theme", Unc),
+            (r"\\?\UNC\server\share\Night.theme", Unc),
+            (r"\\?\unc\server\share\Night.theme", Unc),
+            (r"\\.\UNC\server\share\Night.theme", Unc),
+            ("//?/UNC/server/share/Night.theme", Unc),
+            // `Global\` behind a device prefix names the same device names
+            // again, once or more, in any letter case.
+            (r"\\?\Global\UNC\server\share\Night.theme", Unc),
+            (r"\\.\Global\UNC\server\share\Night.theme", Unc),
+            (r"\\?\GLOBAL\global\unc\server\share\Night.theme", Unc),
+            // Local-looking UNC paths are shares too: they go through the
+            // redirector all the same.
+            (r"\\localhost\c$\Night.theme", Unc),
+            (r"\\wsl.localhost\Ubuntu\home\Night.theme", Unc),
+            // A drive letter, plain or behind a device prefix; whether it is
+            // a network drive is asked of Windows, not of the text.
+            (r"C:\Themes\Night.theme", Drive('C')),
+            (r"h:\Themes\Night.theme", Drive('H')),
+            ("C:/Themes/Night.theme", Drive('C')),
+            (r"\\?\C:\Themes\Night.theme", Drive('C')),
+            (r"\\?\z:\Night.theme", Drive('Z')),
+            (r"\\.\D:\Night.theme", Drive('D')),
+            (r"C:Night.theme", Drive('C')),
+            (r"\\?\Global\C:\Themes\Night.theme", Drive('C')),
+            (r"\\.\Global\Global\h:\Night.theme", Drive('H')),
+            // Other device names are not taken for shares: a volume GUID is
+            // a local volume, and most of the rest aren't files a theme
+            // could be.
+            (
+                r"\\?\Volume{4c1b02c1-d990-11dc-99ae-806e6f6e6963}\Night.theme",
+                Other,
+            ),
+            (r"\\.\pipe\Night.theme", Other),
+            (r"\\.\PhysicalDrive0", Other),
+            (r"\\?\UNC", Other),
+            (r"\\?\UNCLE\Night.theme", Other),
+            (r"\\?\Global", Other),
+            (r"\\?\Globals\UNC\server\share\Night.theme", Other),
+            // A known gap, pinned here so it isn't mistaken for a decision
+            // that these are local: GLOBALROOT is the root of every device
+            // name, and this one IS the redirector. Where a device name
+            // leads isn't in the text (README, Known limitations).
+            (r"\\?\GLOBALROOT\Device\Mup\server\share\Night.theme", Other),
+            (r"\\?\GLOBALROOT\Device\HarddiskVolume3\Night.theme", Other),
+            // No drive at all (never reaches the policy: a relative path is
+            // joined to the exe's folder first).
+            (r"\Themes\Night.theme", Other),
+            (r"Themes\Night.theme", Other),
+            (r"1:\Night.theme", Other),
+            ("é:\\Night.theme", Other),
+            ("", Other),
+        ] {
+            assert_eq!(path_root(path), want, "{path:?}");
+        }
+    }
+
+    #[test]
+    fn network_drives_are_told_by_drive_type() {
+        use windows_sys::Win32::Storage::FileSystem::{GetLogicalDrives, QueryDosDeviceW};
+        // The drive Windows is on is not a network drive.
+        let system = std::env::var("SystemRoot").unwrap();
+        let system = system.chars().next().unwrap().to_ascii_uppercase();
+        assert!(!drive_is_remote(system), "{system}:");
+        // Neither is a letter that isn't a drive.
+        let present = unsafe { GetLogicalDrives() };
+        let is_drive = |l: &char| present & (1 << (*l as u32 - 'A' as u32)) != 0;
+        match ('A'..='Z').find(|l| !is_drive(l)) {
+            Some(absent) => assert!(!drive_is_remote(absent), "{absent}:"),
+            None => eprintln!("SKIP: every drive letter is in use"),
+        }
+        // A mapped network drive is one — where this PC has any. What a
+        // drive letter stands for is read from Windows' table of device
+        // names (nothing is opened): `net use` links the letter to the
+        // redirector. Elsewhere (CI) nothing here can show a "yes".
+        let target = |letter: char| {
+            let mut buf = [0u16; 1024];
+            let name = wide(&format!("{letter}:"));
+            let n = unsafe { QueryDosDeviceW(name.as_ptr(), buf.as_mut_ptr(), buf.len() as u32) };
+            let text = &buf[..n as usize];
+            let end = text.iter().position(|&c| c == 0).unwrap_or(text.len());
+            String::from_utf16_lossy(&text[..end])
+        };
+        let mapped: Vec<char> = ('A'..='Z')
+            .filter(is_drive)
+            .filter(|l| target(*l).starts_with(r"\Device\LanmanRedirector\"))
+            .collect();
+        if mapped.is_empty() {
+            eprintln!("SKIP: no mapped network drive on this PC");
+        }
+        let scratch = std::env::temp_dir().join("wts-test-no-scratch.theme");
+        for letter in mapped {
+            assert!(drive_is_remote(letter), "{letter}:");
+            assert!(drive_is_remote(letter.to_ascii_lowercase()), "{letter}:");
+            // And the path check asks the real question: a theme on that
+            // drive is refused, not looked for.
+            let theme = PathBuf::from(format!(r"{letter}:\wts-test-no-such-folder\Night.theme"));
+            assert_eq!(
+                check_theme_path(&theme, &scratch),
+                Err(ThemePathIssue::NetworkPath),
+                "{theme:?}"
+            );
+        }
+        // Every letter, lower case included, in far less time than one
+        // unreachable server costs. This can only fail on a PC that has a
+        // mapped drive whose server is slow to answer, if the question
+        // ever starts waiting for it.
+        let started = Instant::now();
+        for letter in ('A'..='Z').chain('a'..='z') {
+            let _ = drive_is_remote(letter);
+        }
+        let took = started.elapsed();
+        assert!(
+            took < Duration::from_secs(1),
+            "52 drive letters took {took:?}"
+        );
+        // The drive question reaches the answer for a path through its root.
+        let asked = std::cell::Cell::new(None);
+        let ask = |l| {
+            asked.set(Some(l));
+            true
+        };
+        assert!(on_network(Path::new(r"\\?\n:\Themes\x.theme"), ask));
+        assert_eq!(asked.get(), Some('N'));
+        assert!(!on_network(Path::new(r"N:\Themes\x.theme"), |_| false));
+        // A share is one whatever the drives are; another device name never.
+        assert!(on_network(Path::new(r"\\server\share\x.theme"), |_| false));
+        assert!(!on_network(Path::new(r"\\.\pipe\x.theme"), |_| true));
+    }
+
+    #[test]
+    fn a_network_path_is_read_the_way_win32_opens_it() {
+        // Win32 resolves `.`, `..`, repeated separators and a trailing dot
+        // in every form but `\\?\` before it opens a path, and behind `\\.\`
+        // a `..` climbs out of the drive letter: each of these opens
+        // `\\.\UNC\server\share\x.theme` (seen with GetFullPathNameW, and
+        // with a lookup of a host name that can't resolve, 2026-11-11).
+        // No drive is a network drive here, so only the text decides.
+        for share in [
+            r"\\.\C:\..\UNC\server\share\x.theme",
+            "//./C:/../UNC/server/share/x.theme",
+            r"\\.\C:\Themes\..\..\UNC\server\share\x.theme",
+            r"\\.\..\UNC\server\share\x.theme",
+            r"\\.\\UNC\server\share\x.theme",
+            r"\\.\.\UNC\server\share\x.theme",
+            r"\\.\UNC.\server\share\x.theme",
+            r"\\.\C:\..\Global\UNC\server\share\x.theme",
+            // `//?/` with forward slashes is not the as-written form.
+            "//?/C:/../UNC/server/share/x.theme",
+        ] {
+            assert!(on_network(Path::new(share), |_| false), "{share:?}");
+        }
+        // The drive asked about is the one the path ends up on.
+        for (path, drive) in [
+            (r"\\.\C:\..\N:\Themes\x.theme", 'N'),
+            (r"C:\Themes\..\x.theme", 'C'),
+            (r"c:/Themes/./x.theme", 'C'),
+            // `\\?\` is opened as written: `..` is a name there, on C:.
+            (r"\\?\C:\..\UNC\server\share\x.theme", 'C'),
+        ] {
+            let asked = std::cell::Cell::new(None);
+            let remote = on_network(Path::new(path), |l| {
+                asked.set(Some(l));
+                false
+            });
+            assert!(!remote, "{path:?}");
+            assert_eq!(asked.get(), Some(drive), "{path:?}");
+        }
+        // Not recognised (README, Known limitations): a device name that
+        // leads to the redirector.
+        assert!(!on_network(
+            Path::new(r"\\?\GLOBALROOT\Device\Mup\server\share\x.theme"),
+            |_| true
+        ));
+        // Through the path check: refused as a share, nothing looked up.
+        let scratch = std::env::temp_dir().join("wts-test-no-scratch.theme");
+        let host = format!("wts-no-such-host-{}-dots.invalid", std::process::id());
+        for share in [
+            format!(r"\\.\C:\..\UNC\{host}\share\Night.theme"),
+            format!(r"\\?\Global\UNC\{host}\share\Night.theme"),
+        ] {
+            assert_eq!(
+                check_theme_path(Path::new(&share), &scratch),
+                Err(ThemePathIssue::NetworkPath),
+                "{share:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn theme_paths_on_a_network_location_are_refused_before_anything_opens_them() {
+        let scratch = std::env::temp_dir().join("wts-test-no-scratch.theme");
+        // A share on a host name that can't resolve (.invalid is reserved),
+        // a fresh name each time so no lookup result is cached. Reading the
+        // text takes microseconds; asking for the host took 120-145 ms per
+        // name on the PC this was written on. The fastest of four is
+        // compared, so one stalled thread can't fail the test. (How long a
+        // failed lookup takes depends on the PC's name resolver; the cases
+        // with a drive that answers "network", further down, pin the order
+        // without a clock.)
+        let mut fastest = Duration::MAX;
+        for i in 0..4 {
+            let host = format!("wts-no-such-host-{}-{i}.invalid", std::process::id());
+            let share = PathBuf::from(format!(r"\\{host}\share\Night.theme"));
+            let started = Instant::now();
+            let verdict = check_theme_path(&share, &scratch);
+            fastest = fastest.min(started.elapsed());
+            assert_eq!(verdict, Err(ThemePathIssue::NetworkPath), "{share:?}");
+        }
+        assert!(
+            fastest < Duration::from_millis(20),
+            "a share was looked up before being refused: {fastest:?}"
+        );
+        // The same through the config: the stock theme is used, and the
+        // rejection carries the reason, the text as configured and its
+        // expansion.
+        let raw = r"\\wts-no-such-host.invalid\share\Night.theme";
+        let cfg = Config {
+            theme_night: Some(raw.to_string()),
+            ..Config::default()
+        };
+        let (file, rejected) = resolve_theme_file_checked(Theme::Dark, &cfg);
+        assert_eq!(file, stock_theme_file(Theme::Dark));
+        let (as_configured, expanded, issue) = rejected.expect("rejection reported");
+        assert_eq!(as_configured, raw);
+        assert_eq!(expanded, PathBuf::from(raw));
+        assert_eq!(issue, ThemePathIssue::NetworkPath);
+        assert_eq!(issue.as_str(), "network-path");
+        // The dialog text says what to do about it.
+        assert!(issue.describe().contains("copy the .theme file"));
+        // The other spellings of a share, and a folder, a pack or an
+        // undefined variable on one: the verdict is the network location,
+        // not what a look at the path would have found.
+        for share in [
+            r"\\?\UNC\wts-no-such-host.invalid\share\Night.theme",
+            r"\\.\UNC\wts-no-such-host.invalid\share\Night.theme",
+            "//wts-no-such-host.invalid/share/Night.theme",
+            r"\\wts-no-such-host.invalid\share",
+            r"\\wts-no-such-host.invalid\share\Night.themepack",
+            r"\\wts-no-such-host.invalid\share\%WTS_NO_SUCH_VAR%\Night.theme",
+        ] {
+            assert_eq!(
+                check_theme_path(Path::new(share), &scratch),
+                Err(ThemePathIssue::NetworkPath),
+                "{share:?}"
+            );
+        }
+        // An exe that itself runs from a share: its relative theme paths
+        // are on the share too.
+        let beside_exe = expand_theme_path(
+            r"themes\Night.theme",
+            Path::new(r"\\wts-no-such-host.invalid\apps\WTS"),
+        );
+        assert_eq!(
+            beside_exe,
+            PathBuf::from(r"\\wts-no-such-host.invalid\apps\WTS\themes\Night.theme")
+        );
+        assert_eq!(
+            check_theme_path(&beside_exe, &scratch),
+            Err(ThemePathIssue::NetworkPath)
+        );
+        // A network drive: the same file is refused when its drive is one,
+        // and used when it isn't. (The drive answer is a parameter; no test
+        // can count on a mapped drive.)
+        let ok = TempTheme::new("network-drive", b"[Theme]\r\nDisplayName=Net\r\n");
+        let PathRoot::Drive(temp_drive) = path_root(&ok.0.to_string_lossy()) else {
+            panic!("temp dir has no drive letter: {:?}", ok.0);
+        };
+        assert_eq!(
+            check_theme_path_with(&ok.0, &scratch, |l| l == temp_drive),
+            Err(ThemePathIssue::NetworkPath)
+        );
+        assert_eq!(
+            check_theme_path_with(&ok.0, &scratch, |_| false),
+            Ok(ok.0.clone())
+        );
+        let verbatim = PathBuf::from(format!(r"\\?\{}", ok.0.display()));
+        assert_eq!(
+            check_theme_path_with(&verbatim, &scratch, |l| l == temp_drive),
+            Err(ThemePathIssue::NetworkPath)
+        );
+        // The order, without a clock: on a drive that answers "network", a
+        // folder that exists and a file that doesn't are both refused as a
+        // network path. A check that looked first would say `directory`
+        // and `missing`.
+        let folder = std::env::temp_dir();
+        let absent = folder.join(format!("wts-test-{}-absent.theme", std::process::id()));
+        assert!(folder.is_dir() && !absent.exists());
+        for path in [&folder, &absent] {
+            assert_eq!(
+                check_theme_path_with(path, &scratch, |_| true),
+                Err(ThemePathIssue::NetworkPath),
+                "{path:?}"
+            );
+        }
+        assert_eq!(
+            check_theme_path_with(&folder, &scratch, |_| false),
+            Err(ThemePathIssue::Directory)
+        );
+        assert_eq!(
+            check_theme_path_with(&absent, &scratch, |_| false),
+            Err(ThemePathIssue::Missing)
+        );
+        // A drive-relative path is still named as that, drive type unasked.
+        assert_eq!(
+            check_theme_path_with(Path::new("N:x.theme"), &scratch, |_| {
+                panic!("the drive was asked about")
+            }),
+            Err(ThemePathIssue::NotAbsolute)
+        );
+    }
+
+    // --- single instance (v0.6.0) ---
+
+    #[test]
+    fn single_instance_claim_table() {
+        use InstanceClaim::{Duplicate, DuplicateNoAccess, First, Unknown};
+        const ERROR_INVALID_HANDLE: u32 = 6;
+        for (handle_is_null, last_error, want, what) in [
+            (false, 0, First, "created"),
+            (
+                false,
+                ERROR_ALREADY_EXISTS,
+                Duplicate,
+                "opened another copy's",
+            ),
+            (
+                true,
+                ERROR_ACCESS_DENIED,
+                DuplicateNoAccess,
+                "another copy's, and it can't be opened",
+            ),
+            (
+                true,
+                ERROR_INVALID_HANDLE,
+                Unknown(ERROR_INVALID_HANDLE),
+                "the name belongs to another kind of object",
+            ),
+            (true, 0, Unknown(0), "no handle and no error"),
+            // Only the handle makes a claim or a duplicate.
+            (
+                true,
+                ERROR_ALREADY_EXISTS,
+                Unknown(ERROR_ALREADY_EXISTS),
+                "exists, but no handle",
+            ),
+            (
+                false,
+                ERROR_ACCESS_DENIED,
+                First,
+                "a stale error beside a handle",
+            ),
+        ] {
+            assert_eq!(instance_claim(handle_is_null, last_error), want, "{what}");
+        }
+        // The second look at a refused mutex: taken unless the name is gone.
+        for (open_is_null, last_error, taken, what) in [
+            (false, 0, true, "opened"),
+            (true, ERROR_ACCESS_DENIED, true, "refused again"),
+            (true, ERROR_INVALID_HANDLE, true, "another kind of object"),
+            (true, ERROR_FILE_NOT_FOUND, false, "no such name"),
+            (
+                false,
+                ERROR_FILE_NOT_FOUND,
+                true,
+                "a stale error beside a handle",
+            ),
+        ] {
+            assert_eq!(mutex_name_taken(open_is_null, last_error), taken, "{what}");
+        }
+        // What main() does with a claim: the exact log text for the two
+        // that end this copy (the ordinary one unchanged since v0.4.0),
+        // nothing for the two that let it run.
+        assert_eq!(First.duplicate_log(), None);
+        assert_eq!(Unknown(ERROR_ACCESS_DENIED).duplicate_log(), None);
+        assert_eq!(
+            Duplicate.duplicate_log(),
+            Some("duplicate_instance action=exit")
+        );
+        assert_eq!(
+            DuplicateNoAccess.duplicate_log(),
+            Some("duplicate_instance action=exit reason=access-denied")
+        );
+    }
+
+    #[test]
+    fn single_instance_claim_sequences() {
+        use InstanceClaim::{Duplicate, DuplicateNoAccess, First, Unknown};
+        /// One call's result: (no handle came back, the last error).
+        type Call = (bool, u32);
+        const DENIED: Call = (true, ERROR_ACCESS_DENIED);
+        const NOT_FOUND: Call = (true, ERROR_FILE_NOT_FOUND);
+        const OPENED: Call = (false, 0);
+        const CREATED: Call = (false, 0);
+        const EXISTS: Call = (false, ERROR_ALREADY_EXISTS);
+        // Each row: what CreateMutexW returns call by call, what the
+        // OpenMutexW probe returns call by call, the claim. Every scripted
+        // result must be used, and no call may go beyond the script.
+        let rows: [(&[Call], &[Call], InstanceClaim, &str); 10] = [
+            (&[CREATED], &[], First, "created: no probe"),
+            (&[EXISTS], &[], Duplicate, "opened: no probe"),
+            (&[(true, 6)], &[], Unknown(6), "another failure: no probe"),
+            (
+                &[DENIED],
+                &[OPENED],
+                DuplicateNoAccess,
+                "refused, and the mutex is there (a copy with fewer rights)",
+            ),
+            (
+                &[DENIED],
+                &[DENIED],
+                DuplicateNoAccess,
+                "refused, and refused again for the least access",
+            ),
+            (
+                &[DENIED, CREATED],
+                &[NOT_FOUND],
+                First,
+                "the other copy left between the two calls: this one holds the mutex now",
+            ),
+            (
+                &[DENIED, EXISTS],
+                &[NOT_FOUND],
+                Duplicate,
+                "it left, and a third copy got there first",
+            ),
+            (
+                &[DENIED, DENIED],
+                &[NOT_FOUND, OPENED],
+                DuplicateNoAccess,
+                "it left, and another copy this one can't open took the name",
+            ),
+            (
+                &[DENIED, DENIED],
+                &[NOT_FOUND, NOT_FOUND],
+                Unknown(ERROR_ACCESS_DENIED),
+                "nothing there, twice: creating is what is refused, and the app runs",
+            ),
+            (
+                &[DENIED, (true, 6)],
+                &[NOT_FOUND],
+                Unknown(6),
+                "the second round fails another way",
+            ),
+        ];
+        for (creates, probes, want, what) in rows {
+            let (created, probed) = (std::cell::Cell::new(0), std::cell::Cell::new(0));
+            let next = |script: &[Call], at: &std::cell::Cell<usize>| {
+                let i = at.get();
+                at.set(i + 1);
+                *script
+                    .get(i)
+                    .unwrap_or_else(|| panic!("{what}: call {} is one too many", i + 1))
+            };
+            let got = settle_instance_claim(|| next(creates, &created), || next(probes, &probed));
+            assert_eq!(got, want, "{what}");
+            assert_eq!(created.get(), creates.len(), "{what}: creates");
+            assert_eq!(probed.get(), probes.len(), "{what}: probes");
+        }
+    }
+
+    #[test]
+    fn a_mutex_this_process_may_not_open_counts_as_another_copy() {
+        // Against Windows itself, on throwaway names (never the app's own).
+        use windows_sys::Win32::Security::{
+            AddAccessAllowedAce, InitializeAcl, InitializeSecurityDescriptor,
+            SetSecurityDescriptorDacl, ACL, ACL_REVISION, SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR,
+            SID, SID_IDENTIFIER_AUTHORITY,
+        };
+        let name = |tag: &str| format!("Local\\WinThemeSwitcherTest-{}-{tag}", std::process::id());
+        // A name nobody made can't be opened, and Windows says so with
+        // "not found" (2) — the one answer that means nothing is there.
+        assert_eq!(probe_mutex(&wide(&name("never-made"))), (true, 2));
+        // The first claim creates the mutex, the second finds it.
+        assert_eq!(claim_instance_mutex(&name("plain")), InstanceClaim::First);
+        assert_eq!(
+            claim_instance_mutex(&name("plain")),
+            InstanceClaim::Duplicate
+        );
+        assert!(!probe_mutex(&wide(&name("plain"))).0);
+        // Make a mutex whose access list is given: no entry at all, or one
+        // that allows Everyone (S-1-1-0) the rights in `everyone`.
+        let create_with = |tag: &str, everyone: Option<u32>| {
+            // Room for the list's header and one entry.
+            let mut acl_buf = [0u32; 16];
+            let acl = acl_buf.as_mut_ptr() as *mut ACL;
+            let mut world = SID {
+                Revision: 1,
+                SubAuthorityCount: 1,
+                IdentifierAuthority: SID_IDENTIFIER_AUTHORITY {
+                    Value: [0, 0, 0, 0, 0, 1],
+                },
+                SubAuthority: [0],
+            };
+            let mut sd: SECURITY_DESCRIPTOR = unsafe { std::mem::zeroed() };
+            let sd_ptr = &mut sd as *mut SECURITY_DESCRIPTOR as *mut c_void;
+            unsafe {
+                let size = std::mem::size_of_val(&acl_buf) as u32;
+                assert_ne!(InitializeAcl(acl, size, ACL_REVISION), 0);
+                if let Some(rights) = everyone {
+                    let sid = &mut world as *mut SID as *mut c_void;
+                    assert_ne!(AddAccessAllowedAce(acl, ACL_REVISION, rights, sid), 0);
+                }
+                assert_ne!(InitializeSecurityDescriptor(sd_ptr, 1), 0);
+                assert_ne!(SetSecurityDescriptorDacl(sd_ptr, 1, acl, 0), 0);
+                let attrs = SECURITY_ATTRIBUTES {
+                    nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+                    lpSecurityDescriptor: sd_ptr,
+                    bInheritHandle: 0,
+                };
+                let holder = CreateMutexW(&attrs, 0, wide(&name(tag)).as_ptr());
+                assert_ne!(holder as usize, 0, "creating the {tag} mutex");
+                holder
+            }
+        };
+        // What a copy started with fewer rights than the first sees: the
+        // full access CreateMutexW asks for is refused (no handle, access
+        // denied), while the mutex can still be opened to wait on.
+        let holder = create_with("wait-only", Some(SYNCHRONIZATION_SYNCHRONIZE));
+        assert_eq!(
+            claim_instance_mutex(&name("wait-only")),
+            InstanceClaim::DuplicateNoAccess
+        );
+        assert!(!probe_mutex(&wide(&name("wait-only"))).0);
+        unsafe { CloseHandle(holder) };
+        // A mutex whose access list lets nobody in: refused both ways, and
+        // still another copy's.
+        let holder = create_with("locked", None);
+        assert_eq!(
+            probe_mutex(&wide(&name("locked"))),
+            (true, ERROR_ACCESS_DENIED)
+        );
+        assert_eq!(
+            claim_instance_mutex(&name("locked")),
+            InstanceClaim::DuplicateNoAccess
+        );
+        // Once its holder is gone the name is free again.
+        unsafe { CloseHandle(holder) };
+        assert_eq!(claim_instance_mutex(&name("locked")), InstanceClaim::First);
     }
 }
