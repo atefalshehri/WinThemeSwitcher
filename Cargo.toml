@@ -18,7 +18,7 @@ tray-icon = "0.25"
 winit = "0.30"
 
 [dependencies.windows-sys]
-version = "0.59"
+version = "0.61"
 features = [
     "Win32_Foundation",
     "Win32_System_Com",
@@ -36,8 +36,11 @@ features = [
     "Win32_UI_Shell",
     "Win32_Graphics_Dwm",
     # RegisterClassW/WNDCLASSW (wake listener window) are cfg-gated on GDI
-    # (WNDCLASSW has an HBRUSH field). Until v0.5.0 this was enabled only
-    # transitively, by tray-icon 0.19 sharing our windows-sys 0.59.
+    # (WNDCLASSW has an HBRUSH field). tray-icon and muda share this
+    # windows-sys (0.61) and enable Gdi and other features on it, so the
+    # build would pass without some entries here. Keep the list complete
+    # on its own: until v0.5.0 Gdi came only from tray-icon 0.19, and the
+    # build broke when tray-icon 0.25 moved to another windows-sys.
     "Win32_Graphics_Gdi",
 ]
 

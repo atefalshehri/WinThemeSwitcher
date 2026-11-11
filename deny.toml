@@ -31,11 +31,12 @@ ignore = []
 allow = ["MIT", "Apache-2.0", "Unicode-3.0"]
 
 [bans]
-# Duplicates are reported, not failed: windows-sys in three versions (winit
-# 0.52, this app 0.59, tray-icon and muda 0.61); windows-targets and
-# windows_x86_64_msvc in two (0.52 via windows-sys 0.52/0.59, 0.53 via this
+# Duplicates are reported, not failed: windows-sys in two versions (winit
+# 0.52; this app, tray-icon and muda 0.61); windows-targets and
+# windows_x86_64_msvc in two (0.52 via windows-sys 0.52, 0.53 via this
 # app's windows 0.59); windows-link in two (0.1 via windows 0.59, 0.2 via
-# windows-sys 0.61 and chrono).
+# windows-sys 0.61 and chrono). Cargo.lock also lists windows-sys 0.59, for
+# rustix, which this target's graph doesn't include.
 multiple-versions = "warn"
 wildcards = "deny"
 

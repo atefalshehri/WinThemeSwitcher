@@ -2346,7 +2346,7 @@ dependencies = [
  "sun-times",
  "tray-icon",
  "windows",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
  "winit",
 ]
 
