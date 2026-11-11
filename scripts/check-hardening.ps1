@@ -225,6 +225,13 @@ if ($manifest -match '(?i)longPathAware|activeCodePage') {
     Write-Error "check-hardening: the manifest in $Exe sets $($Matches[0]) -- it must not (see app.manifest)"
     exit 7
 }
+# The Common-Controls dependency must not name a language: with language="*"
+# Windows looks for the assembly in a folder named for the UI language next
+# to the exe first, and loads a comctl32.dll planted there (app.manifest).
+if ($manifest -match '(?i)<assemblyIdentity\s[^>]*name="Microsoft\.Windows\.Common-Controls"[^>]*\slanguage\s*=') {
+    Write-Error "check-hardening: the Common-Controls dependency in $Exe's manifest has a language attribute -- it must not (see app.manifest)"
+    exit 7
+}
 
 Write-Output "hardening ok: no VCRUNTIME140 import, DependentLoadFlags=0x800, manifest (asInvoker, Common-Controls 6, PerMonitorV2), version $version = Cargo.toml ($Exe)"
 exit 0

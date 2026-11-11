@@ -10367,6 +10367,14 @@ mod tests {
         // bug it covers).
         let lower = manifest.to_lowercase();
         assert!(!lower.contains("longpathaware") && !lower.contains("activecodepage"));
+        // No language on the Common-Controls dependency: with language="*"
+        // Windows looks for the assembly in a folder named for the UI
+        // language next to the exe first (en-US\), and a comctl32.dll
+        // planted there with a manifest was loaded (app.manifest).
+        assert!(
+            !lower.contains("language"),
+            "no language attribute in {manifest}"
+        );
         assert!(!manifest.contains("<!--"), "comments are not embedded");
 
         // Per-monitor-v2 DPI awareness, without winit's call: no event loop

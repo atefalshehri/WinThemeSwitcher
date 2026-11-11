@@ -40,10 +40,16 @@
 
   <!-- Version 6 of the common controls: themed message boxes. For this,
        Windows gives the app version 6 of comctl32.dll, from its
-       side-by-side store (%SystemRoot%\WinSxS), instead of version 5.82. -->
+       side-by-side store (%SystemRoot%\WinSxS), instead of version 5.82.
+       NO language attribute, unlike the snippet usually copied: with
+       language="*" Windows first looks for the assembly in a folder named
+       for the UI language next to the exe (en-US\, en\), and a manifest
+       plus a comctl32.dll planted there was loaded instead of the one in
+       WinSxS (seen on the release exe, 2026-11-11). The test and
+       scripts\check-hardening.ps1 refuse the attribute. -->
   <dependency>
     <dependentAssembly>
-      <assemblyIdentity type="win32" name="Microsoft.Windows.Common-Controls" version="6.0.0.0" processorArchitecture="*" publicKeyToken="6595b64144ccf1df" language="*"/>
+      <assemblyIdentity type="win32" name="Microsoft.Windows.Common-Controls" version="6.0.0.0" processorArchitecture="*" publicKeyToken="6595b64144ccf1df"/>
     </dependentAssembly>
   </dependency>
 </assembly>
