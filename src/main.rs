@@ -510,6 +510,12 @@ struct TickState {
     /// intervention right before a suspend that spans a transition would be
     /// promoted to a day-long override).
     episode_next: Option<DateTime<Utc>>,
+    /// A Toggle applied since the last apply failed (`note_toggle`). The
+    /// modes can't show every Toggle: a second one puts the screen back on
+    /// the baseline, and with two same-mode themes or an unreadable registry
+    /// not even the first is visible. Stands the retry down like an observed
+    /// move, within the same window. Always false outside a failure episode.
+    retry_toggled: bool,
     /// Wall-clock deadline of the pending wait (None = plain Wait, e.g. no
     /// location). See `plan_wake`.
     armed: Option<DateTime<Utc>>,
@@ -526,6 +532,7 @@ impl TickState {
             retry_count: 0,
             retry_baseline: None,
             episode_next: None,
+            retry_toggled: false,
             armed: None,
             mark: None,
         }
@@ -572,17 +579,19 @@ fn decide_tick(
     if kind == TickKind::Refresh {
         return TickAction::Apply;
     }
-    // Pending-retry gate: the screen moved away from the failure snapshot,
-    // so the user intervened mid-episode. Only an OBSERVED move counts — an
-    // unreadable reading (None) on EITHER side proves nothing and must not
-    // cancel. And the stand-down only applies within the failure episode's
-    // own window (now < episode_next): once a transition has passed,
-    // reconciling to the schedule outranks it, exactly like any override
-    // ending at the next natural transition.
+    // Pending-retry gate: the user intervened mid-episode — the screen moved
+    // away from the failure snapshot, or a Toggle applied (which the modes
+    // can't always show: a second Toggle lands back on the snapshot). For
+    // the modes only an OBSERVED move counts — an unreadable reading (None)
+    // on EITHER side proves nothing and must not cancel. And the stand-down
+    // only applies within the failure episode's own window
+    // (now < episode_next): once a transition has passed, reconciling to the
+    // schedule outranks it, exactly like any override ending at the next
+    // natural transition.
+    let screen_moved =
+        state.retry_baseline.is_some() && current.is_some() && current != state.retry_baseline;
     if state.retry_count > 0
-        && state.retry_baseline.is_some()
-        && current.is_some()
-        && current != state.retry_baseline
+        && (screen_moved || state.retry_toggled)
         && state.episode_next.is_some_and(|n| now < n)
     {
         return TickAction::CancelRetry;
@@ -622,12 +631,19 @@ fn decide_tick(
     TickAction::Apply
 }
 
-/// Record a tick that ended in sync with the schedule (any non-Err outcome).
-fn note_reconciled(state: &mut TickState, next: DateTime<Utc>) {
-    state.reconciled_next = Some(next);
+/// End the failure episode, if there is one: no retry pending, a fresh
+/// budget for the next failure.
+fn clear_retry_episode(state: &mut TickState) {
     state.retry_count = 0;
     state.retry_baseline = None;
     state.episode_next = None;
+    state.retry_toggled = false;
+}
+
+/// Record a tick that ended in sync with the schedule (any non-Err outcome).
+fn note_reconciled(state: &mut TickState, next: DateTime<Utc>) {
+    state.reconciled_next = Some(next);
+    clear_retry_episode(state);
 }
 
 /// Record a failed apply. `observed` must be read AFTER the failure (see
@@ -643,10 +659,11 @@ fn note_apply_failed(
 ) -> bool {
     state.retry_count += 1;
     state.retry_baseline = observed;
+    // The baseline is new, so only a Toggle after THIS failure counts (an
+    // earlier one can still be set here when the retry ran past its window).
+    state.retry_toggled = false;
     if state.retry_count > MAX_APPLY_RETRIES {
-        state.retry_count = 0;
-        state.retry_baseline = None;
-        state.episode_next = None;
+        clear_retry_episode(state);
         // Budget spent: the screen is still wrong, so later wakes must keep
         // treating it as a failure to retry, never as an override to
         // preserve — including an episode a failed Refresh started mid-
@@ -656,6 +673,100 @@ fn note_apply_failed(
     } else {
         state.episode_next = Some(next_utc);
         true
+    }
+}
+
+/// Record a Toggle; `applied` is whether its apply_theme returned Ok (which
+/// for tier 2 means "launched", as for a tick's own apply). This is the only
+/// thing Toggle writes in TickState, and all it does is flag a pending
+/// failure episode: the retry gate in `decide_tick` then stands the retry
+/// down, where the modes alone show an odd number of Toggles at best. A
+/// Toggle that failed is not flagged (in the ordinary case — the screen
+/// still on the other slot's theme — it was aiming at the scheduled theme,
+/// which the retry then delivers), and outside an episode nothing is
+/// recorded — a Toggle is then an ordinary override, which the
+/// modes and `reconciled_next` already handle. Pure — unit-tested.
+fn note_toggle(state: &mut TickState, applied: bool) {
+    if applied && state.retry_count > 0 {
+        state.retry_toggled = true;
+    }
+}
+
+/// How a tick's action came out — what `settle_tick` records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TickOutcome {
+    /// The tick ended in step with the schedule: apply_theme succeeded, or
+    /// the tick skipped (already in sync, an override preserved, a retry
+    /// stood down).
+    Reconciled,
+    /// apply_theme failed. `after` is the screen's modes read AFTER the
+    /// failure, never the pre-tick reading (see TickState::retry_baseline).
+    ApplyFailed { after: Option<Modes> },
+}
+
+/// What follows a failed apply — the ` retry=` field of the tick's log line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetryNote {
+    /// Retry number N is scheduled.
+    Attempt(u32),
+    /// The budget is spent: nothing until the next transition, wake or
+    /// Refresh.
+    Exhausted,
+}
+
+/// What a tick arms and logs once its outcome is recorded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Settled {
+    /// Wall-clock deadline of the next tick: the next transition, or sooner
+    /// for a retry.
+    deadline: DateTime<Utc>,
+    /// Set after a failed apply.
+    retry: Option<RetryNote>,
+}
+
+/// Record a tick's outcome in `state` and say when the next tick is due.
+/// Everything a tick records about its outcome goes through here; `tick`
+/// then arms the returned deadline together with the clock mark. `now` is
+/// read after the apply (a retry is timed from the failure, not from the
+/// start of a slow apply); `next` is the schedule's next transition. Pure —
+/// unit-tested.
+fn settle_tick(
+    state: &mut TickState,
+    kind: TickKind,
+    outcome: TickOutcome,
+    now: DateTime<Utc>,
+    next: DateTime<Utc>,
+) -> Settled {
+    match outcome {
+        TickOutcome::Reconciled => {
+            note_reconciled(state, next);
+            Settled {
+                deadline: next,
+                retry: None,
+            }
+        }
+        TickOutcome::ApplyFailed { after } => {
+            if kind == TickKind::Refresh {
+                // Fresh user intent (likely a just-fixed config): a Refresh
+                // never inherits a part-used retry budget.
+                clear_retry_episode(state);
+            }
+            // Bounded retry: tick again soon instead of waiting up to ~12 h
+            // for the next transition. The retry arrives as a normal
+            // Scheduled tick; the pending-retry gate in decide_tick stands
+            // it down if the user changes the theme in the meantime.
+            if note_apply_failed(state, after, next) {
+                Settled {
+                    deadline: retry_deadline(now, next),
+                    retry: Some(RetryNote::Attempt(state.retry_count)),
+                }
+            } else {
+                Settled {
+                    deadline: next,
+                    retry: Some(RetryNote::Exhausted),
+                }
+            }
+        }
     }
 }
 
@@ -675,7 +786,7 @@ const MAX_APPLY_RETRIES: u32 = 3;
 
 /// Deadline for the next tick after a failed apply: retry soon, but never
 /// past the scheduled transition itself. Pure — unit-tested.
-fn retry_deadline(now: DateTime<Local>, next: DateTime<Local>) -> DateTime<Local> {
+fn retry_deadline(now: DateTime<Utc>, next: DateTime<Utc>) -> DateTime<Utc> {
     std::cmp::min(
         next,
         now + chrono::Duration::seconds(APPLY_RETRY_DELAY_SECS),
@@ -1523,8 +1634,10 @@ fn write_theme_registry(modes: Modes) -> Result<(), Box<dyn Error>> {
         // Both results matter: a blocked write (AV/HIPS, ACL, hive error)
         // must surface as Err so tick's bounded retry runs, instead of being
         // logged as applied=registry while nothing changed. A half write
-        // (Apps flipped, System failed) is harmless to the retry gate: tick
-        // takes the failure baseline from a reading made AFTER this returns.
+        // (Apps flipped, System failed) by a tick is harmless to the retry
+        // gate: tick takes the failure baseline from a reading made AFTER
+        // this returns. (A Toggle's half write during a pending retry does
+        // read as a move and stands the retry down.)
         let mut failed: Option<String> = None;
         let mut any_ok = false;
         for (name, name_w, light) in [
@@ -1884,7 +1997,8 @@ fn sync_decidable_logged(day: &Slot, night: &Slot) -> bool {
 
 /// The slot this process last applied successfully (0 = none, 1 = day,
 /// 2 = night) — Toggle's fallback when the screen's modes can't tell the
-/// slots apart. Deliberately NOT in TickState: Toggle must never touch that.
+/// slots apart. Deliberately NOT in TickState: all Toggle writes there is
+/// `note_toggle`'s flag on a pending retry.
 static LAST_APPLIED_SLOT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
 fn note_applied_slot(theme: Theme) {
@@ -3023,7 +3137,6 @@ fn tick(cfg: &Config, elwt: &ActiveEventLoop, kind: TickKind, cause: &str, state
     let decidable = sync_decidable_logged(&day, &night);
     let slot = if want == Theme::Light { &day } else { &night };
     let current = read_modes();
-    let next = next_utc.with_timezone(&Local);
 
     // A clock step since the PRE-tick mark is consumed by THIS tick (the
     // clock-jump tick, or a wake/Refresh that beat it) — log it here so every
@@ -3039,9 +3152,9 @@ fn tick(cfg: &Config, elwt: &ActiveEventLoop, kind: TickKind, cause: &str, state
     }
     let clock_stepped_back = step.is_some_and(|ms| ms < 0);
 
-    // Decide with the PRE-tick state; record the outcome after the apply
-    // result is known (a failed apply must never advance reconciled_next —
-    // see TickState).
+    // Decide with the PRE-tick state; settle_tick records the outcome once
+    // the apply result is known (a failed apply must never advance
+    // reconciled_next — see TickState).
     let action = decide_tick(
         kind,
         current,
@@ -3053,53 +3166,33 @@ fn tick(cfg: &Config, elwt: &ActiveEventLoop, kind: TickKind, cause: &str, state
         state,
     );
 
-    let mut retry_note = String::new();
-    let mut deadline = next;
-    let outcome = match action {
-        TickAction::Apply => {
-            if kind == TickKind::Refresh {
-                // Fresh user intent (likely a just-fixed config): a Refresh
-                // never inherits a burned retry budget.
-                state.retry_count = 0;
-                state.retry_baseline = None;
-                state.episode_next = None;
+    let (outcome, result) = match action {
+        TickAction::Apply => match apply_theme(slot) {
+            Ok(method) => {
+                note_applied_slot(want);
+                (TickOutcome::Reconciled, format!("applied={}", method))
             }
-            match apply_theme(slot) {
-                Ok(method) => {
-                    note_reconciled(state, next_utc);
-                    note_applied_slot(want);
-                    format!("applied={}", method)
-                }
-                Err(e) => {
-                    // Bounded retry: reschedule soon instead of silently
-                    // waiting up to ~12 h for the next transition. The retry
-                    // arrives as a normal ResumeTimeReached tick; the
-                    // pending-retry gate in decide_tick stands it down if
-                    // the user changes the theme in the meantime. The
-                    // baseline is read NOW, after the failure, so a partial
-                    // effect of this apply never reads as the user's move.
-                    if note_apply_failed(state, read_modes(), next_utc) {
-                        retry_note = format!(" retry={}", state.retry_count);
-                        deadline = retry_deadline(Local::now(), next);
-                    } else {
-                        retry_note = " retry=exhausted".to_string();
-                    }
-                    format!("err=\"{}\"", sanitize_log_msg(&e.to_string()))
-                }
-            }
-        }
-        TickAction::SkipInSync => {
-            note_reconciled(state, next_utc);
-            "applied=skip".to_string()
-        }
-        TickAction::SkipOverride => {
-            note_reconciled(state, next_utc);
-            "applied=skip-override".to_string()
-        }
-        TickAction::CancelRetry => {
-            note_reconciled(state, next_utc);
-            "applied=skip-user-intervened".to_string()
-        }
+            // The screen is read NOW, after the failure, so a partial effect
+            // of this apply never reads as the user's move.
+            Err(e) => (
+                TickOutcome::ApplyFailed {
+                    after: read_modes(),
+                },
+                format!("err=\"{}\"", sanitize_log_msg(&e.to_string())),
+            ),
+        },
+        TickAction::SkipInSync => (TickOutcome::Reconciled, "applied=skip".to_string()),
+        TickAction::SkipOverride => (TickOutcome::Reconciled, "applied=skip-override".to_string()),
+        TickAction::CancelRetry => (
+            TickOutcome::Reconciled,
+            "applied=skip-user-intervened".to_string(),
+        ),
+    };
+    let settled = settle_tick(state, kind, outcome, Utc::now(), next_utc);
+    let retry_note = match settled.retry {
+        None => String::new(),
+        Some(RetryNote::Attempt(n)) => format!(" retry={}", n),
+        Some(RetryNote::Exhausted) => " retry=exhausted".to_string(),
     };
 
     // Stamp at write time, not tick start — apply_theme logs detail lines
@@ -3112,17 +3205,12 @@ fn tick(cfg: &Config, elwt: &ActiveEventLoop, kind: TickKind, cause: &str, state
         modes_str(current),
         modes_str(Some(slot.modes)),
         slot_note(slot, decidable),
-        outcome,
+        result,
         retry_note,
-        deadline.to_rfc3339(),
+        settled.deadline.with_timezone(&Local).to_rfc3339(),
     ));
 
-    arm(
-        elwt,
-        state,
-        deadline.with_timezone(&Utc),
-        (now_utc, now_mono),
-    );
+    arm(elwt, state, settled.deadline, (now_utc, now_mono));
 }
 
 unsafe extern "system" fn wake_window_proc(
@@ -3506,16 +3594,17 @@ fn run() -> Result<(), Box<dyn Error>> {
                 open_config_in_editor();
             } else if id == toggle_id {
                 // A deliberate manual override: applies the opposite theme
-                // and intentionally does NOT tick, touch TickState (it
-                // tracks reconciliation with the schedule, not the screen),
-                // or disturb the pending WaitUntil — so the override
-                // survives lock/unlock (see decide_tick) and resets at the
-                // next natural transition, exactly like an override made in
-                // Settings. If a failed-apply retry is pending, one toggle
-                // moves the screen off the retry baseline and the
-                // pending-retry gate stands the retry down; a SECOND toggle
-                // lands back on the baseline, which the gate can't tell from
-                // the original failure, so the retry proceeds (known gap).
+                // and intentionally does NOT tick, change what TickState
+                // knows about the schedule (reconciled_next, the armed
+                // deadline, the clock mark), or disturb the pending
+                // WaitUntil — so the override survives lock/unlock (see
+                // decide_tick) and resets at the next natural transition,
+                // exactly like an override made in Settings. The one thing
+                // it records is note_toggle: if a failed-apply retry is
+                // pending, a Toggle that applied stands it down. The modes
+                // alone show that only for an odd number of toggles — a
+                // second one lands back on the retry baseline, and through
+                // v0.5.1 the retry then reverted it.
                 let day = resolve_slot(Theme::Light, &cfg);
                 let night = resolve_slot(Theme::Dark, &cfg);
                 let decidable = sync_decidable_logged(&day, &night);
@@ -3534,7 +3623,9 @@ fn run() -> Result<(), Box<dyn Error>> {
                     fallback,
                 );
                 let slot = if target == Theme::Light { &day } else { &night };
-                let outcome = match apply_theme(slot) {
+                let result = apply_theme(slot);
+                note_toggle(&mut state, result.is_ok());
+                let outcome = match result {
                     Ok(method) => {
                         note_applied_slot(target);
                         format!("applied={}", method)
@@ -4846,7 +4937,7 @@ mod tests {
 
     #[test]
     fn wake_with_unreadable_current_skips_inside_window() {
-        // current_theme() = None (registry read failed): inside a preserved
+        // read_modes() = None (registry read failed): inside a preserved
         // window the app declines to apply — pinned deliberately.
         let sunset = utc(2026, 7, 4, 15, 46, 5);
         let s = reconciled_at(sunset);
@@ -4994,9 +5085,9 @@ mod tests {
 
     #[test]
     fn retry_deadline_is_soon_but_never_past_next_transition() {
-        let now = utc(2026, 7, 4, 9, 0, 0).with_timezone(&Local);
-        let far_next = utc(2026, 7, 4, 15, 0, 0).with_timezone(&Local);
-        let near_next = utc(2026, 7, 4, 9, 0, 30).with_timezone(&Local);
+        let now = utc(2026, 7, 4, 9, 0, 0);
+        let far_next = utc(2026, 7, 4, 15, 0, 0);
+        let near_next = utc(2026, 7, 4, 9, 0, 30);
         assert_eq!(
             retry_deadline(now, far_next),
             now + chrono::Duration::seconds(APPLY_RETRY_DELAY_SECS)
@@ -5055,10 +5146,11 @@ mod tests {
             utc(2026, 7, 5, 2, 35, 0)
         ));
         // The user picks Dark (via Toggle or Settings), moving the screen off
-        // the failure baseline (Light). Note the gate can only see a MOVE:
-        // re-picking the stuck theme (Light) is indistinguishable from the
-        // failure itself, so that case retries — an inherent limit of
-        // observing current_theme().
+        // the failure baseline (Light). Note the modes can only show a MOVE:
+        // re-picking the stuck theme (Light) in Settings is indistinguishable
+        // from the failure itself, so that case retries — an inherent limit
+        // of observing read_modes(). (A Toggle is recorded separately: see
+        // note_toggle and the tests after reconcile_clears_retry_episode.)
         let retry_at = utc(2026, 7, 4, 16, 47, 5);
         assert_eq!(
             dt(
@@ -5528,6 +5620,500 @@ mod tests {
         assert_eq!(s.retry_count, 0);
         assert_eq!(s.retry_baseline, None);
         assert_eq!(s.reconciled_next, Some(next));
+    }
+
+    // --- Toggle during a pending retry; settle_tick (v0.6.0) ---
+
+    /// One tick as `tick()` runs it, minus the I/O: decide from the pre-tick
+    /// state, then settle the outcome. `apply_fails_leaving` is what a failed
+    /// apply leaves on screen (None = the apply succeeds, if there is one).
+    fn run_tick(
+        s: &mut TickState,
+        kind: TickKind,
+        current: Option<Modes>,
+        target: Modes,
+        now: DateTime<Utc>,
+        next: DateTime<Utc>,
+        apply_fails_leaving: Option<Option<Modes>>,
+    ) -> (TickAction, Settled) {
+        let action = decide_tick(kind, current, target, now, next, false, true, s);
+        let outcome = match (action, apply_fails_leaving) {
+            (TickAction::Apply, Some(after)) => TickOutcome::ApplyFailed { after },
+            _ => TickOutcome::Reconciled,
+        };
+        (action, settle_tick(s, kind, outcome, now, next))
+    }
+
+    #[test]
+    fn a_double_toggle_during_a_retry_stands_the_retry_down() {
+        // Sunset: the apply to dark fails and the screen stays light. Within
+        // the minute before the retry the user toggles twice, ending on
+        // light again — exactly the retry baseline. That is their choice,
+        // and the retry must leave it alone.
+        let sunset = utc(2026, 7, 4, 15, 46, 5);
+        let sunrise = utc(2026, 7, 5, 2, 35, 0);
+        let (light, dark): (Modes, Modes) = (Theme::Light.into(), Theme::Dark.into());
+        let failed = || {
+            let mut s = reconciled_at(sunset);
+            let (action, settled) = run_tick(
+                &mut s,
+                TickKind::Scheduled,
+                Some(light),
+                dark,
+                sunset,
+                sunrise,
+                Some(Some(light)),
+            );
+            assert_eq!(action, TickAction::Apply);
+            assert_eq!(settled.retry, Some(RetryNote::Attempt(1)));
+            assert_eq!(settled.deadline, sunset + mins(1));
+            s
+        };
+        let retry_at = sunset + mins(1);
+
+        // Control: nobody touched anything, so the retry applies.
+        let s = failed();
+        assert_eq!(
+            dt(
+                TickKind::Scheduled,
+                Some(Theme::Light),
+                Theme::Dark,
+                retry_at,
+                &s
+            ),
+            TickAction::Apply
+        );
+
+        // Two toggles: the screen is back on the baseline, the retry still
+        // stands down — as the retry tick, or as an unlock that gets there
+        // first.
+        for kind in [TickKind::Scheduled, TickKind::Wake] {
+            let mut s = failed();
+            note_toggle(&mut s, true);
+            note_toggle(&mut s, true);
+            let (action, settled) =
+                run_tick(&mut s, kind, Some(light), dark, retry_at, sunrise, None);
+            assert_eq!(action, TickAction::CancelRetry, "{kind:?}");
+            // The episode is over and the tick waits for sunrise...
+            assert_eq!(
+                settled,
+                Settled {
+                    deadline: sunrise,
+                    retry: None
+                }
+            );
+            assert_eq!((s.retry_count, s.retry_toggled), (0, false));
+            // ...and until then the toggled theme is an override like any
+            // other: a later unlock preserves it.
+            assert_eq!(s.reconciled_next, Some(sunrise));
+            assert_eq!(
+                dt(
+                    TickKind::Wake,
+                    Some(Theme::Light),
+                    Theme::Dark,
+                    sunset + mins(90),
+                    &s
+                ),
+                TickAction::SkipOverride
+            );
+        }
+
+        // One toggle is seen twice over (the screen moved, and the flag).
+        let mut s = failed();
+        note_toggle(&mut s, true);
+        assert_eq!(
+            dt(
+                TickKind::Scheduled,
+                Some(Theme::Dark),
+                Theme::Dark,
+                retry_at,
+                &s
+            ),
+            TickAction::CancelRetry
+        );
+    }
+
+    #[test]
+    fn a_toggle_stands_a_retry_down_where_the_modes_cant_show_it() {
+        let sunset = utc(2026, 7, 4, 15, 46, 5);
+        let sunrise = utc(2026, 7, 5, 2, 35, 0);
+        let retry_at = sunset + mins(1);
+        let l = md(true, true);
+        // (baseline, screen at the retry, sync decidable): two light-mode
+        // themes, where a toggle changes the wallpaper only; a registry that
+        // couldn't be read after the failure; one that can't be read now;
+        // one that couldn't be read either time.
+        for (baseline, current, decidable) in [
+            (Some(l), Some(l), false),
+            (None, Some(l), true),
+            (Some(l), None, true),
+            (None, None, true),
+        ] {
+            let mut s = reconciled_at(sunset);
+            assert!(note_apply_failed(&mut s, baseline, sunrise));
+            let target = if decidable { md(false, false) } else { l };
+            assert_eq!(
+                dtm(
+                    TickKind::Scheduled,
+                    current,
+                    target,
+                    retry_at,
+                    decidable,
+                    &s
+                ),
+                TickAction::Apply,
+                "without a toggle: {baseline:?} {current:?}"
+            );
+            note_toggle(&mut s, true);
+            assert_eq!(
+                dtm(
+                    TickKind::Scheduled,
+                    current,
+                    target,
+                    retry_at,
+                    decidable,
+                    &s
+                ),
+                TickAction::CancelRetry,
+                "after a toggle: {baseline:?} {current:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_toggle_only_flags_the_failure_it_follows() {
+        let sunset = utc(2026, 7, 4, 15, 46, 5);
+        let sunrise = utc(2026, 7, 5, 2, 35, 0);
+        let (light, dark): (Modes, Modes) = (Theme::Light.into(), Theme::Dark.into());
+        // Everything in TickState but the flag, which a Toggle must leave
+        // alone: what the state knows of the schedule, the retry episode,
+        // the armed deadline and the clock mark.
+        let rest = |s: &TickState| {
+            (
+                s.reconciled_next,
+                s.retry_count,
+                s.retry_baseline,
+                s.episode_next,
+                s.armed,
+                s.mark,
+            )
+        };
+
+        // No retry pending: nothing is recorded at all.
+        let mut s = reconciled_at(sunset);
+        s.armed = Some(sunset);
+        s.mark = Some((sunset - mins(400), Instant::now()));
+        let before = rest(&s);
+        note_toggle(&mut s, true);
+        assert!(!s.retry_toggled);
+        assert_eq!(rest(&s), before);
+        // A toggle BEFORE a failure doesn't stand its retry down (the flag
+        // wasn't set, and the failure would have dropped it anyway).
+        assert!(note_apply_failed(&mut s, Some(light), sunrise));
+        assert_eq!(
+            dtm(
+                TickKind::Scheduled,
+                Some(light),
+                dark,
+                sunset + mins(1),
+                true,
+                &s
+            ),
+            TickAction::Apply
+        );
+
+        // A toggle whose apply failed isn't recorded either, and the retry
+        // still runs...
+        let before = rest(&s);
+        note_toggle(&mut s, false);
+        assert!(!s.retry_toggled);
+        assert_eq!(rest(&s), before);
+        assert_eq!(
+            dtm(
+                TickKind::Scheduled,
+                Some(light),
+                dark,
+                sunset + mins(1),
+                true,
+                &s
+            ),
+            TickAction::Apply
+        );
+        // ...one that applied sets the flag and nothing else, and a failed
+        // one after it doesn't take the flag back.
+        note_toggle(&mut s, true);
+        assert!(s.retry_toggled);
+        assert_eq!(rest(&s), before);
+        note_toggle(&mut s, false);
+        assert!(s.retry_toggled);
+
+        // The flag stands the retry down up to the episode's window, not at
+        // or past it, as for a move the modes show: a retry armed for the
+        // transition itself (a failure in its last minute) reconciles to the
+        // schedule. (An unreadable screen, so only the flag can decide.)
+        for (at, want) in [
+            (
+                sunrise - chrono::Duration::milliseconds(1),
+                TickAction::CancelRetry,
+            ),
+            (sunrise, TickAction::Apply),
+        ] {
+            assert_eq!(
+                decide_tick(
+                    TickKind::Scheduled,
+                    None,
+                    light,
+                    at,
+                    sunrise + mins(790),
+                    false,
+                    true,
+                    &s
+                ),
+                want
+            );
+        }
+
+        // Further past the window: the machine slept through sunrise with
+        // the screen still light, which is what the morning wants. Plain
+        // in-sync, not a stood-down retry.
+        let next_evening = utc(2026, 7, 5, 15, 45, 40);
+        let morning = sunrise + mins(200);
+        let (action, settled) = run_tick(
+            &mut s,
+            TickKind::Wake,
+            Some(light),
+            light,
+            morning,
+            next_evening,
+            None,
+        );
+        assert_eq!(action, TickAction::SkipInSync);
+        assert_eq!(settled.deadline, next_evening);
+        assert_eq!(s.reconciled_next, Some(next_evening));
+        assert_eq!((s.retry_count, s.retry_toggled), (0, false));
+
+        // Same night, but one toggle left the screen dark: the morning wake
+        // applies. If THAT apply fails, the failure opens a new window (the
+        // count carries on: retry 2) with a new baseline and no flag, so its
+        // retry runs...
+        let mut s = reconciled_at(sunset);
+        assert!(note_apply_failed(&mut s, Some(light), sunrise));
+        note_toggle(&mut s, true);
+        let (action, settled) = run_tick(
+            &mut s,
+            TickKind::Wake,
+            Some(dark),
+            light,
+            morning,
+            next_evening,
+            Some(Some(dark)),
+        );
+        assert_eq!(action, TickAction::Apply);
+        assert_eq!(settled.retry, Some(RetryNote::Attempt(2)));
+        assert!(!s.retry_toggled, "a new failure drops the flag");
+        assert_eq!(s.retry_baseline, Some(dark));
+        assert_eq!(s.episode_next, Some(next_evening));
+        let retry = |s: &TickState| {
+            decide_tick(
+                TickKind::Scheduled,
+                Some(dark),
+                light,
+                morning + mins(1),
+                next_evening,
+                false,
+                true,
+                s,
+            )
+        };
+        assert_eq!(retry(&s), TickAction::Apply);
+        // ...unless a toggle follows THIS failure, inside the new window.
+        note_toggle(&mut s, true);
+        note_toggle(&mut s, true);
+        assert_eq!(retry(&s), TickAction::CancelRetry);
+    }
+
+    #[test]
+    fn refresh_applies_over_a_toggled_retry_and_starts_a_fresh_episode() {
+        let sunset = utc(2026, 7, 4, 15, 46, 5);
+        let sunrise = utc(2026, 7, 5, 2, 35, 0);
+        let (light, dark): (Modes, Modes) = (Theme::Light.into(), Theme::Dark.into());
+        let mut s = reconciled_at(sunset);
+        assert!(note_apply_failed(&mut s, Some(light), sunrise));
+        assert!(note_apply_failed(&mut s, Some(light), sunrise));
+        note_toggle(&mut s, true);
+        // Refresh force-applies whatever the gate would say...
+        let now = sunset + mins(2);
+        let (action, settled) = run_tick(
+            &mut s,
+            TickKind::Refresh,
+            Some(light),
+            dark,
+            now,
+            sunrise,
+            Some(Some(light)),
+        );
+        assert_eq!(action, TickAction::Apply);
+        // ...and when it fails too, its episode is new: retry 1 of 3, not 3,
+        // and no toggle on record.
+        assert_eq!(settled.retry, Some(RetryNote::Attempt(1)));
+        assert_eq!(settled.deadline, now + mins(1));
+        assert_eq!((s.retry_count, s.retry_toggled), (1, false));
+        assert_eq!(
+            dtm(
+                TickKind::Scheduled,
+                Some(light),
+                dark,
+                now + mins(1),
+                true,
+                &s
+            ),
+            TickAction::Apply
+        );
+    }
+
+    #[test]
+    fn settle_tick_records_a_reconciled_tick_and_waits_for_the_transition() {
+        let next = utc(2026, 7, 5, 2, 35, 0);
+        let now = utc(2026, 7, 4, 15, 46, 5);
+        for kind in [
+            TickKind::Init,
+            TickKind::Scheduled,
+            TickKind::Wake,
+            TickKind::Refresh,
+        ] {
+            // From a clean state, and from the middle of a failure episode.
+            let mut clean = TickState::new();
+            let mut failing = reconciled_at(now);
+            assert!(note_apply_failed(&mut failing, Some(md(true, true)), next));
+            note_toggle(&mut failing, true);
+            for s in [&mut clean, &mut failing] {
+                let settled = settle_tick(s, kind, TickOutcome::Reconciled, now, next);
+                assert_eq!(
+                    settled,
+                    Settled {
+                        deadline: next,
+                        retry: None
+                    }
+                );
+                assert_eq!(s.reconciled_next, Some(next));
+                assert_eq!(
+                    (
+                        s.retry_count,
+                        s.retry_baseline,
+                        s.episode_next,
+                        s.retry_toggled
+                    ),
+                    (0, None, None, false)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn settle_tick_schedules_bounded_retries_from_the_reading_after_the_failure() {
+        let sunset = utc(2026, 7, 4, 15, 46, 5);
+        let sunrise = utc(2026, 7, 5, 2, 35, 0);
+        let half = md(false, true);
+        let mut s = reconciled_at(sunset);
+        let mut now = sunset;
+        for attempt in 1..=MAX_APPLY_RETRIES {
+            // The apply ran for 3 s before failing: the retry is timed from
+            // the failure.
+            let failed_at = now + chrono::Duration::seconds(3);
+            let settled = settle_tick(
+                &mut s,
+                TickKind::Scheduled,
+                TickOutcome::ApplyFailed { after: Some(half) },
+                failed_at,
+                sunrise,
+            );
+            assert_eq!(settled.retry, Some(RetryNote::Attempt(attempt)));
+            assert_eq!(
+                settled.deadline,
+                failed_at + chrono::Duration::seconds(APPLY_RETRY_DELAY_SECS)
+            );
+            // The baseline is the reading the failure left behind, the
+            // window is this tick's next transition, and a failure never
+            // counts as reconciled.
+            assert_eq!(s.retry_count, attempt);
+            assert_eq!(s.retry_baseline, Some(half));
+            assert_eq!(s.episode_next, Some(sunrise));
+            assert_eq!(s.reconciled_next, Some(sunset));
+            now = settled.deadline;
+        }
+        // One failure more: the budget is spent. Wait for sunrise, with
+        // nothing left that could make a later wake "preserve" the failure.
+        let settled = settle_tick(
+            &mut s,
+            TickKind::Scheduled,
+            TickOutcome::ApplyFailed { after: Some(half) },
+            now,
+            sunrise,
+        );
+        assert_eq!(
+            settled,
+            Settled {
+                deadline: sunrise,
+                retry: Some(RetryNote::Exhausted)
+            }
+        );
+        assert_eq!(s.reconciled_next, None);
+        assert_eq!(
+            (
+                s.retry_count,
+                s.retry_baseline,
+                s.episode_next,
+                s.retry_toggled
+            ),
+            (0, None, None, false)
+        );
+
+        // A failure less than a minute before the transition retries AT the
+        // transition, never after it; an unreadable screen after it replaces
+        // the baseline like any other reading.
+        let mut s = reconciled_at(sunset);
+        assert!(note_apply_failed(&mut s, Some(half), sunrise));
+        let late = sunrise - chrono::Duration::seconds(20);
+        let settled = settle_tick(
+            &mut s,
+            TickKind::Wake,
+            TickOutcome::ApplyFailed { after: None },
+            late,
+            sunrise,
+        );
+        assert_eq!(
+            settled,
+            Settled {
+                deadline: sunrise,
+                retry: Some(RetryNote::Attempt(2))
+            }
+        );
+        assert_eq!(s.retry_baseline, None);
+    }
+
+    #[test]
+    fn settle_tick_gives_a_failed_refresh_a_fresh_budget() {
+        let sunset = utc(2026, 7, 4, 15, 46, 5);
+        let sunrise = utc(2026, 7, 5, 2, 35, 0);
+        let failed = TickOutcome::ApplyFailed {
+            after: Some(md(true, true)),
+        };
+        for kind in [TickKind::Scheduled, TickKind::Wake, TickKind::Refresh] {
+            let mut s = reconciled_at(sunset);
+            for _ in 0..MAX_APPLY_RETRIES {
+                assert!(note_apply_failed(&mut s, Some(md(true, true)), sunrise));
+            }
+            let settled = settle_tick(&mut s, kind, failed, sunset + mins(3), sunrise);
+            if kind == TickKind::Refresh {
+                // The user asked: three more tries, starting now.
+                assert_eq!(settled.retry, Some(RetryNote::Attempt(1)));
+                assert_eq!(settled.deadline, sunset + mins(4));
+                assert_eq!(s.reconciled_next, Some(sunset));
+            } else {
+                assert_eq!(settled.retry, Some(RetryNote::Exhausted), "{kind:?}");
+                assert_eq!(settled.deadline, sunrise);
+            }
+        }
     }
 
     // --- two-value modes (v0.5.0) ---
