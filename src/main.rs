@@ -6,6 +6,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
@@ -27,7 +28,9 @@ use windows_sys::Win32::Graphics::Dwm::DwmFlush;
 use windows_sys::Win32::Storage::FileSystem::{
     GetDriveTypeW, GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, FILE_SHARE_READ,
 };
-use windows_sys::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
+use windows_sys::Win32::System::Com::{
+    CoCreateInstance, CoIncrementMTAUsage, CLSCTX_INPROC_SERVER,
+};
 use windows_sys::Win32::System::Environment::ExpandEnvironmentStringsW;
 use windows_sys::Win32::System::LibraryLoader::{
     GetModuleHandleW, SetDefaultDllDirectories, LOAD_LIBRARY_SEARCH_SYSTEM32,
@@ -1452,41 +1455,237 @@ fn adopt_reloaded_config(
     }
 }
 
+/// Make the calling thread — the main thread — a single-threaded apartment:
+/// IThemeManager2 needs one, and every theme apply runs here. The Windows
+/// Location lookup doesn't: it has a thread of its own (keep_mta_alive).
 fn ensure_com_initialized() {
     unsafe {
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
     }
 }
 
-/// Where Windows Location says the PC is, rounded (round_coordinates). None
-/// when Location is off, denied or fails — or returns a reading the app
-/// can't use (usable_location), which is logged, without the values.
-fn try_get_windows_location() -> Option<(f64, f64)> {
-    let (lat, lon) = query_windows_location()?;
-    match usable_location(lat, lon) {
-        Ok(place) => Some(place),
-        Err(reason) => {
+/// The longest a Windows Location lookup holds up its caller — startup
+/// (before the tray exists) or a Refresh (the event-loop thread). Windows'
+/// own limit for a position is 60 s, and its answer to "may this app use
+/// the location" has none.
+const LOCATION_LOOKUP_CAP: Duration = Duration::from_secs(15);
+
+/// Why run_with_timeout came back without the work's value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NoAnswer {
+    /// The limit passed first. The worker goes on; what it produces later
+    /// is dropped.
+    TimedOut,
+    /// The worker thread couldn't be started, or ended without a value (a
+    /// panic, in a build that unwinds).
+    WorkerLost,
+}
+
+/// Run `work` on a thread of its own and wait for its value, at most
+/// `limit`. On a timeout the caller goes on and the worker is left to
+/// finish (or hang) by itself: its late value is sent into a channel
+/// nobody reads any more and dropped there. So `work` must own everything
+/// it touches, and must not change anything the caller would have to know
+/// about — its only way to report is the value it returns.
+fn run_with_timeout<T, F>(thread_name: &str, limit: Duration, work: F) -> Result<T, NoAnswer>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    // Room for the one value, so the worker's send never waits for a
+    // receiver — also not for one that has given up.
+    let (tx, rx) = mpsc::sync_channel::<T>(1);
+    let spawned = std::thread::Builder::new()
+        .name(thread_name.to_string())
+        .spawn(move || {
+            // Err means the caller timed out and dropped the receiver: the
+            // value comes back inside the error and is dropped right here.
+            let _ = tx.send(work());
+        });
+    if spawned.is_err() {
+        return Err(NoAnswer::WorkerLost);
+    }
+    match rx.recv_timeout(limit) {
+        Ok(value) => Ok(value),
+        Err(mpsc::RecvTimeoutError::Timeout) => Err(NoAnswer::TimedOut),
+        Err(mpsc::RecvTimeoutError::Disconnected) => Err(NoAnswer::WorkerLost),
+    }
+}
+
+/// Why a Windows Location lookup produced no location.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LocationFailure {
+    /// Windows answered "denied": Location is off, or apps (desktop apps)
+    /// aren't allowed to use it.
+    Denied,
+    /// Windows answered "unspecified": not allowed, and no reason given.
+    Unspecified,
+    /// No answer within LOCATION_LOOKUP_CAP.
+    TimedOut,
+    /// A call failed. `stage` says which step, `hresult` is the error code
+    /// (0 for the "worker" stage: the lookup thread couldn't be started or
+    /// ended without an answer). Both are for the log only.
+    Failed { stage: &'static str, hresult: i32 },
+    /// Windows returned a reading, and usable_location refused it for this
+    /// reason.
+    Rejected(&'static str),
+}
+
+impl LocationFailure {
+    /// The `reason=` token of the `location_lookup_failed` log line.
+    fn token(self) -> &'static str {
+        match self {
+            LocationFailure::Denied => "access-denied",
+            LocationFailure::Unspecified => "access-unspecified",
+            LocationFailure::TimedOut => "timeout",
+            LocationFailure::Failed { .. } => "error",
+            LocationFailure::Rejected(_) => "reading-rejected",
+        }
+    }
+}
+
+/// The events.log line for a lookup that produced no location, without
+/// its timestamp. Never a coordinate: a rejected reading is named by its
+/// reason only. Pure — unit-tested.
+fn location_failure_line(failure: LocationFailure, elapsed_ms: u128) -> String {
+    let mut line = format!(
+        "location_lookup_failed reason={} after_ms={}",
+        failure.token(),
+        elapsed_ms,
+    );
+    match failure {
+        LocationFailure::Failed { stage, hresult } => {
+            // {:08X} of an i32 prints its two's complement: 0x80070005.
+            line.push_str(&format!(" stage={stage} hresult=0x{hresult:08X}"));
+        }
+        LocationFailure::Rejected(why) => line.push_str(&format!(" reading={why}")),
+        _ => {}
+    }
+    line
+}
+
+/// Windows' answer to "may this app use the location" as the lookup's
+/// next step: go on, or stop with the reason. Anything that isn't
+/// "allowed" or "denied" counts as unspecified. Pure — unit-tested.
+fn access_answer(status: GeolocationAccessStatus) -> Result<(), LocationFailure> {
+    if status == GeolocationAccessStatus::Allowed {
+        Ok(())
+    } else if status == GeolocationAccessStatus::Denied {
+        Err(LocationFailure::Denied)
+    } else {
+        Err(LocationFailure::Unspecified)
+    }
+}
+
+/// From what the lookup thread brought back (or didn't) to what a caller
+/// may put into a Config: the reading goes through usable_location here,
+/// on the caller's thread, and nothing else comes out as coordinates.
+/// Pure — unit-tested.
+fn settle_location(
+    answer: Result<Result<(f64, f64), LocationFailure>, NoAnswer>,
+) -> Result<(f64, f64), LocationFailure> {
+    match answer {
+        Ok(Ok((lat, lon))) => usable_location(lat, lon).map_err(LocationFailure::Rejected),
+        Ok(Err(failure)) => Err(failure),
+        Err(NoAnswer::TimedOut) => Err(LocationFailure::TimedOut),
+        Err(NoAnswer::WorkerLost) => Err(LocationFailure::Failed {
+            stage: "worker",
+            hresult: 0,
+        }),
+    }
+}
+
+/// Make sure the process has a multithreaded apartment (MTA), and keep it
+/// for the life of the process. A thread that never initialized COM — the
+/// lookup thread — is then in that apartment implicitly, which is what
+/// its WinRT calls need. No per-thread CoInitializeEx: that would have to
+/// be balanced by a CoUninitialize the thread never reaches when it is
+/// abandoned mid-call, and the last one would tear the apartment down
+/// under the activation factories the `windows` crate caches. The main
+/// thread stays the STA it made itself (ensure_com_initialized).
+fn keep_mta_alive() -> Result<(), HRESULT> {
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if DONE.load(Ordering::SeqCst) {
+        return Ok(());
+    }
+    // The cookie would undo it (CoDecrementMTAUsage); never used. Two
+    // threads getting here together take two usages — harmless.
+    let mut cookie = ptr::null_mut();
+    let hr = unsafe { CoIncrementMTAUsage(&mut cookie) };
+    if hr < 0 {
+        return Err(hr);
+    }
+    DONE.store(true, Ordering::SeqCst);
+    Ok(())
+}
+
+/// The Windows Location lookup itself: may the app use the location, and
+/// if so, where is the PC. Blocks until Windows answers — the first
+/// question has no limit of its own (Windows may be showing the user a
+/// prompt), the position gives up after 60 s — so it runs ONLY on the
+/// lookup thread (lookup_windows_location), never on the main thread. It
+/// touches nothing but its own WinRT objects, so a caller that timed out
+/// can leave it running. Returns the raw reading: settle_location decides
+/// whether it's usable.
+fn query_windows_location() -> Result<(f64, f64), LocationFailure> {
+    fn failed_at(stage: &'static str) -> impl Fn(windows::core::Error) -> LocationFailure {
+        move |e| LocationFailure::Failed {
+            stage,
+            hresult: e.code().0,
+        }
+    }
+    keep_mta_alive().map_err(|hresult| LocationFailure::Failed {
+        stage: "apartment",
+        hresult,
+    })?;
+    let access = Geolocator::RequestAccessAsync()
+        .and_then(|op| op.get())
+        .map_err(failed_at("request-access"))?;
+    access_answer(access)?;
+    let geo = Geolocator::new().map_err(failed_at("geolocator"))?;
+    let pos = geo
+        .GetGeopositionAsync()
+        .and_then(|op| op.get())
+        .map_err(failed_at("position"))?;
+    let p = pos
+        .Coordinate()
+        .and_then(|coord| coord.Point())
+        .and_then(|point| point.Position())
+        .map_err(failed_at("reading"))?;
+    Ok((p.Latitude, p.Longitude))
+}
+
+/// One Windows Location lookup, held to `cap`: the location to use —
+/// rounded (round_coordinates) — or why there is none, and how long it
+/// took in milliseconds. The WinRT calls run on a thread of their own; a
+/// result that arrives after the cap is dropped.
+fn lookup_windows_location(cap: Duration) -> (Result<(f64, f64), LocationFailure>, u128) {
+    let started = Instant::now();
+    let answer = run_with_timeout("location", cap, query_windows_location);
+    (settle_location(answer), started.elapsed().as_millis())
+}
+
+/// Where Windows Location says the PC is, or why the app has no location
+/// from it. Waits at most LOCATION_LOOKUP_CAP. A failure is logged — one
+/// `location_lookup_failed` line, after `location_rejected` for a reading
+/// the app can't use — always without coordinates.
+fn try_get_windows_location() -> Result<(f64, f64), LocationFailure> {
+    let (result, elapsed_ms) = lookup_windows_location(LOCATION_LOOKUP_CAP);
+    if let Err(failure) = result {
+        if let LocationFailure::Rejected(reason) = failure {
             log_event(&format!(
                 "{} location_rejected reason={}",
                 Local::now().to_rfc3339(),
                 reason,
             ));
-            None
         }
+        log_event(&format!(
+            "{} {}",
+            Local::now().to_rfc3339(),
+            location_failure_line(failure, elapsed_ms),
+        ));
     }
-}
-
-fn query_windows_location() -> Option<(f64, f64)> {
-    let access = Geolocator::RequestAccessAsync().ok()?.get().ok()?;
-    if access != GeolocationAccessStatus::Allowed {
-        return None;
-    }
-    let geo = Geolocator::new().ok()?;
-    let pos = geo.GetGeopositionAsync().ok()?.get().ok()?;
-    let coord = pos.Coordinate().ok()?;
-    let point = coord.Point().ok()?;
-    let p = point.Position().ok()?;
-    Some((p.Latitude, p.Longitude))
+    result
 }
 
 /// Whether `.json` has a real "open" handler. Without one (common on a fresh
@@ -1528,7 +1727,17 @@ fn system_notepad() -> PathBuf {
     dir.join("notepad.exe")
 }
 
-fn open_config_in_editor() {
+/// Whether a ShellExecuteW result says the launch was accepted: per its
+/// reference, a value greater than 32. 0, an error code up to 32 and a
+/// negative value all mean nothing was started. Pure — unit-tested.
+fn launch_accepted(code: isize) -> bool {
+    code > 32
+}
+
+/// Open config.json for editing: with the `.json` "open" handler if there
+/// is one, or else in Notepad. Returns whether one of the two was
+/// launched (launch_accepted); a failure is logged.
+fn open_config_in_editor() -> bool {
     let path = config_path();
     let path_w = wide(&path.to_string_lossy());
     let verb = wide("open");
@@ -1544,8 +1753,8 @@ fn open_config_in_editor() {
                 SW_SHOWNORMAL,
             );
             code = h as isize;
-            if code > 32 {
-                return;
+            if launch_accepted(code) {
+                return true;
             }
         }
         // No usable .json handler: Notepad (by full path).
@@ -1559,21 +1768,26 @@ fn open_config_in_editor() {
             ptr::null(),
             SW_SHOWNORMAL,
         );
-        if (h2 as isize) <= 32 {
+        if !launch_accepted(h2 as isize) {
             log_event(&format!(
                 "{} open_config_err code={} fallback_code={}",
                 Local::now().to_rfc3339(),
                 code,
                 h2 as isize,
             ));
+            return false;
         }
+        true
     }
 }
 
-fn open_location_settings() {
+/// Ask Windows to open Settings on its Location page. Returns whether the
+/// launch was accepted (launch_accepted) — the most the app can know; a
+/// refusal is logged.
+fn open_location_settings() -> bool {
     let verb = wide("open");
     let uri = wide("ms-settings:privacy-location");
-    unsafe {
+    let code = unsafe {
         ShellExecuteW(
             ptr::null_mut(),
             verb.as_ptr(),
@@ -1581,8 +1795,17 @@ fn open_location_settings() {
             ptr::null(),
             ptr::null(),
             SW_SHOWNORMAL,
-        );
+        )
+    } as isize;
+    let accepted = launch_accepted(code);
+    if !accepted {
+        log_event(&format!(
+            "{} open_settings_err code={}",
+            Local::now().to_rfc3339(),
+            code,
+        ));
     }
+    accepted
 }
 
 fn show_message_box(title: &str, body: &str, flags: u32) -> i32 {
@@ -1591,33 +1814,269 @@ fn show_message_box(title: &str, body: &str, flags: u32) -> i32 {
     unsafe { MessageBoxW(ptr::null_mut(), body_w.as_ptr(), title_w.as_ptr(), flags) }
 }
 
-fn ask_enable_location() -> bool {
-    show_message_box(
-        "WinThemeSwitcher — Location",
-        "Windows Location is off or not allowed for desktop apps.\n\n\
-         Enable it so sunrise and sunset can be computed automatically?\n\n\
-         Yes opens Windows Settings. No lets you enter coordinates manually in config.json.",
-        MB_YESNO | MB_ICONQUESTION,
-    ) == IDYES
+// === What the user is told when Windows Location gave no location ===
+//
+// The texts are built by pure functions from what actually happened, so
+// each sentence can be checked against the situation it is shown in (the
+// tests do): why the lookup failed, whether Settings could be opened,
+// whether the tray icon exists yet — at first run these boxes come up
+// BEFORE the tray icon, so they can't send the user to an icon that isn't
+// there — and whether there is a config.json to type coordinates into (not
+// in a session whose config.json couldn't be created). Plain words only;
+// codes and API names go to events.log.
+
+const LOCATION_BOX_TITLE: &str = "WinThemeSwitcher — Location";
+
+/// Where the Location switches are, in Windows 11's Settings.
+const LOCATION_SETTINGS_PAGE: &str = "Privacy & security > Location";
+
+/// Why the app asks for the location at all.
+const LOCATION_NEEDED: &str =
+    "WinThemeSwitcher needs to know where this PC is to work out when the sun rises and sets.";
+
+/// A Refresh shows nothing about its lookup, found or not (a dialog for
+/// one that fails is v0.8.0's), so a box that sends the user to Refresh
+/// says how to tell — by something the user can see.
+const REFRESH_IS_SILENT: &str =
+    "Refresh does not say whether it found the location: if the theme still does not \
+     change at the next sunrise or sunset, it most likely did not.";
+
+/// What stands in the way of typing coordinates when config.json could not
+/// be created (the app's folder can't be written), and the way out. The
+/// can't-save-settings box (report_config_not_created) has the details.
+const NO_CONFIG_FILE: &str =
+    "config.json could not be created in WinThemeSwitcher's folder. Move WinThemeSwitcher \
+     to a folder you can write to and start it from there";
+
+/// Where the app's icon — and with it the menu that has Refresh — is, or
+/// is about to be. The caller adds what to do with it.
+fn tray_icon_sentence(tray_exists: bool) -> &'static str {
+    if tray_exists {
+        "The WinThemeSwitcher icon is in the notification area at the end of the \
+         taskbar (it may be behind the ^ arrow)."
+    } else {
+        "After you close this message, the WinThemeSwitcher icon appears in the \
+         notification area at the end of the taskbar (it may be behind the ^ arrow)."
+    }
 }
 
-fn show_enable_pending_message() {
-    show_message_box(
-        "WinThemeSwitcher",
-        "Turn on \"Location services\" in the Settings window that just opened. \
-         Then right-click the WinThemeSwitcher tray icon and choose Refresh.",
-        MB_OK | MB_ICONINFORMATION,
-    );
+/// What a lookup that gave no location brings up.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LocationPrompt {
+    /// A Yes/No question, after Windows said the app may not use the
+    /// location: Yes opens the Location page of Settings, No goes on to
+    /// typing coordinates into config.json.
+    OfferSettings(String),
+    /// One message: what happened and what the user can do. For a timeout,
+    /// an error or an unusable reading — nothing says Location is off, so
+    /// nothing offers to turn it on.
+    Inform(String),
 }
 
-fn show_manual_setup_prompt() {
-    show_message_box(
-        "WinThemeSwitcher — Setup",
-        "Please set latitude and longitude in config.json (opening now), \
-         then right-click the tray icon and choose Refresh.",
-        MB_OK | MB_ICONINFORMATION,
-    );
-    open_config_in_editor();
+/// The first box after a failed lookup. "Off or not allowed" is said only
+/// when Windows answered that; every other reason says what happened
+/// instead. `config_on_disk` is false in a session whose config.json could
+/// not be created: nothing then sends the user to type into it or to Open
+/// Config. Pure — unit-tested.
+fn location_prompt(
+    failure: LocationFailure,
+    tray_exists: bool,
+    config_on_disk: bool,
+) -> LocationPrompt {
+    let what = match failure {
+        LocationFailure::Denied | LocationFailure::Unspecified => {
+            let (why, question) = if failure == LocationFailure::Denied {
+                (
+                    "Windows Location is turned off, or apps are not allowed to use it.",
+                    "Open Windows Settings to turn it on?",
+                )
+            } else {
+                (
+                    "Windows did not let WinThemeSwitcher use this PC's location, and did \
+                     not say why. Location may be turned off, or blocked for apps.",
+                    "Open Windows Settings to check?",
+                )
+            };
+            let no = if config_on_disk {
+                "No: type your coordinates into config.json instead."
+            } else {
+                "No: go on without a location for now."
+            };
+            return LocationPrompt::OfferSettings(format!(
+                "{why}\n\n{LOCATION_NEEDED}\n\n{question}\n\n\
+                 Yes: open the Location settings.\n\
+                 {no}",
+            ));
+        }
+        // The answer that comes after the cap is dropped, so answering
+        // Windows' own question isn't enough: Refresh has to ask again.
+        LocationFailure::TimedOut => format!(
+            "Windows did not answer within {} seconds when WinThemeSwitcher asked for \
+             this PC's location. If Windows is showing a question about location \
+             access, answer it, then close this message and choose Refresh (step 1 \
+             below).",
+            LOCATION_LOOKUP_CAP.as_secs(),
+        ),
+        LocationFailure::Failed { .. } => {
+            "WinThemeSwitcher asked Windows for this PC's location, and the lookup failed."
+                .to_string()
+        }
+        LocationFailure::Rejected(_) => {
+            "Windows returned a location for this PC that WinThemeSwitcher cannot use.".to_string()
+        }
+    };
+    // A reading the app refuses isn't cured by a switch in Settings.
+    let check_settings = if matches!(failure, LocationFailure::Rejected(_)) {
+        String::new()
+    } else {
+        format!(
+            "\n\nIf this keeps happening, check that location is turned on in Windows \
+             Settings, under {LOCATION_SETTINGS_PAGE}.",
+        )
+    };
+    // The format is said here too: this path never shows manual_setup_text,
+    // and a west or south value typed without its minus sign is a valid
+    // place elsewhere — no check catches it.
+    let type_them_in = if config_on_disk {
+        "2. Or type your latitude and longitude into config.json, in decimal degrees \
+         (south and west are negative): choose Open Config in the same menu, save the \
+         file, then choose Refresh."
+            .to_string()
+    } else {
+        format!(
+            "2. Or type your latitude and longitude into config.json. Not yet, though: \
+             {NO_CONFIG_FILE} first.",
+        )
+    };
+    LocationPrompt::Inform(format!(
+        "{what}\n\n{LOCATION_NEEDED} Until it has a location, it does not switch \
+         themes by itself.\n\n\
+         What you can do:\n\n\
+         1. Try again later. {icon} Right-click it and choose Refresh. \
+         {REFRESH_IS_SILENT}\n\n\
+         {type_them_in}{check_settings}",
+        icon = tray_icon_sentence(tray_exists),
+    ))
+}
+
+/// The box after the user chose to open the Location settings — true
+/// whether Settings opened or not. It points at the page and says what
+/// must be on there; the switch names are given as a guide, since a PC may
+/// not show all of them ("Location services" is shown to administrators
+/// only) or may word them differently. Pure — unit-tested.
+fn location_settings_followup(settings_opened: bool, tray_exists: bool) -> String {
+    let where_to = if settings_opened {
+        format!(
+            "Windows Settings should now be open on its Location page. If it is not, \
+             open Settings yourself and go to {LOCATION_SETTINGS_PAGE}.",
+        )
+    } else {
+        format!(
+            "Windows Settings could not be opened from here. Open Settings yourself \
+             (Start > Settings) and go to {LOCATION_SETTINGS_PAGE}.",
+        )
+    };
+    format!(
+        "{where_to}\n\n\
+         On that page, turn location on and let apps use it, desktop apps included. \
+         The switches are called \"Location services\", \"Let apps access your \
+         location\" and \"Let desktop apps access your location\", or something close \
+         to that, and a PC may not show all of them. If location is turned off for \
+         the whole PC, only an administrator can turn it on.\n\n\
+         Then let WinThemeSwitcher look again. {icon} Right-click it and choose Refresh. \
+         {REFRESH_IS_SILENT}",
+        icon = tray_icon_sentence(tray_exists),
+    )
+}
+
+/// The box before config.json is opened for typing coordinates. It says
+/// what open_config_in_editor does next — the `.json` program, or else
+/// Notepad — and what happens if neither starts (config_not_opened_text).
+/// Pure — unit-tested.
+fn manual_setup_text(tray_exists: bool) -> String {
+    format!(
+        "To set the location yourself, type your latitude and longitude into \
+         config.json, in decimal degrees (south and west are negative), and save the \
+         file.\n\n\
+         When you close this message, WinThemeSwitcher opens config.json: in the \
+         program set up for .json files, or else in Notepad. If neither can be \
+         started, another message says where the file is.\n\n\
+         {icon} After saving the file, right-click that icon and choose Refresh.",
+        icon = tray_icon_sentence(tray_exists),
+    )
+}
+
+/// The box in place of manual_setup_text when there is no config.json to
+/// type into (it could not be created): nothing is opened, and the text
+/// says what has to happen first. Pure — unit-tested.
+fn no_config_file_text() -> String {
+    format!(
+        "WinThemeSwitcher has no location yet, so it does not switch themes by \
+         itself.\n\n\
+         The location cannot be typed in either: {NO_CONFIG_FILE}.",
+    )
+}
+
+/// The box for a config.json that couldn't be opened for the user: where
+/// the file is. Pure — unit-tested.
+fn config_not_opened_text(path: &Path) -> String {
+    format!(
+        "config.json could not be opened automatically. Open it yourself, for example \
+         with Notepad. The file is here:\n\n{}",
+        path.display(),
+    )
+}
+
+/// The "config.json could not be opened" box is already on screen.
+static CONFIG_NOT_OPENED_BOX_OPEN: AtomicBool = AtomicBool::new(false);
+
+/// First run, and Windows Location gave no location: tell the user what
+/// happened and what to do. Runs before the tray icon exists, so every
+/// box here blocks startup until it is closed — except the last-resort
+/// "couldn't open config.json" one, which must not keep the icon the
+/// previous box promised from appearing. `tray_exists` and
+/// `config_on_disk` are the caller's to say (acquire_location): they
+/// decide what the texts may claim.
+fn explain_missing_location(failure: LocationFailure, tray_exists: bool, config_on_disk: bool) {
+    match location_prompt(failure, tray_exists, config_on_disk) {
+        LocationPrompt::Inform(body) => {
+            show_message_box(LOCATION_BOX_TITLE, &body, MB_OK | MB_ICONWARNING);
+        }
+        LocationPrompt::OfferSettings(body) => {
+            let yes =
+                show_message_box(LOCATION_BOX_TITLE, &body, MB_YESNO | MB_ICONQUESTION) == IDYES;
+            if yes {
+                let opened = open_location_settings();
+                show_message_box(
+                    LOCATION_BOX_TITLE,
+                    &location_settings_followup(opened, tray_exists),
+                    MB_OK | MB_ICONINFORMATION,
+                );
+            } else if !config_on_disk {
+                // No file to type into, and Notepad on a path that doesn't
+                // exist would only ask whether to create it — in a folder
+                // that can't be written.
+                show_message_box(
+                    "WinThemeSwitcher — Setup",
+                    &no_config_file_text(),
+                    MB_OK | MB_ICONWARNING,
+                );
+            } else {
+                show_message_box(
+                    "WinThemeSwitcher — Setup",
+                    &manual_setup_text(tray_exists),
+                    MB_OK | MB_ICONINFORMATION,
+                );
+                if !open_config_in_editor() {
+                    show_warning_async(
+                        &CONFIG_NOT_OPENED_BOX_OPEN,
+                        "WinThemeSwitcher — Setup",
+                        config_not_opened_text(&config_path()),
+                    );
+                }
+            }
+        }
+    }
 }
 
 /// A config-error box is already on screen (repeated Refresh clicks with a
@@ -1711,18 +2170,24 @@ fn report_theme_path_problems(cfg: &Config) {
     );
 }
 
-fn acquire_location(cfg: &mut Config) {
-    if let Some((lat, lon)) = try_get_windows_location() {
-        cfg.latitude = lat;
-        cfg.longitude = lon;
-        persist_config(cfg);
-        return;
-    }
-    if ask_enable_location() {
-        open_location_settings();
-        show_enable_pending_message();
-    } else {
-        show_manual_setup_prompt();
+/// First run (config.json has no location yet): ask Windows Location, and
+/// save what it says; if it gives nothing, tell the user why and what to
+/// do (explain_missing_location). `config_on_disk`: whether there is a
+/// config.json at all (`Loaded::from_file`). Called from run() only, ahead
+/// of the event loop and the tray icon.
+fn acquire_location(cfg: &mut Config, config_on_disk: bool) {
+    match try_get_windows_location() {
+        Ok((lat, lon)) => {
+            cfg.latitude = lat;
+            cfg.longitude = lon;
+            persist_config(cfg);
+        }
+        Err(failure) => {
+            // The boxes come up before the tray icon exists, and must not
+            // send the user to it as if it were there.
+            let tray_exists = false;
+            explain_missing_location(failure, tray_exists, config_on_disk);
+        }
     }
 }
 
@@ -4261,10 +4726,11 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut cfg = match loaded {
         // A first run whose config.json couldn't be created (`from_file`
         // false) carries on like any first run, on the defaults; the user
-        // has been told (load_config_logged).
-        Ok(Loaded { mut cfg, .. }) => {
+        // has been told (load_config_logged), and the location boxes then
+        // don't send them to a file that isn't there.
+        Ok(Loaded { mut cfg, from_file }) => {
             if !cfg.has_location() {
-                acquire_location(&mut cfg);
+                acquire_location(&mut cfg, from_file);
             }
             apply_auto_start(cfg.auto_start);
             cfg
@@ -4272,7 +4738,10 @@ fn run() -> Result<(), Box<dyn Error>> {
         Err(e) => {
             report_config_error(&e);
             let mut cfg = Config::default();
-            if let Some((lat, lon)) = try_get_windows_location() {
+            // In memory only, and without the first-run boxes: the config
+            // error is what the user has to deal with. A failed lookup is
+            // in the log.
+            if let Ok((lat, lon)) = try_get_windows_location() {
                 cfg.latitude = lat;
                 cfg.longitude = lon;
             }
@@ -4380,7 +4849,8 @@ fn run() -> Result<(), Box<dyn Error>> {
             if id == quit_id {
                 elwt.exit();
             } else if id == open_cfg_id {
-                open_config_in_editor();
+                // A failure is in the log (open_config_err).
+                let _ = open_config_in_editor();
             } else if id == toggle_id {
                 // A deliberate manual override: applies the opposite theme
                 // and intentionally does NOT tick, change what TickState
@@ -4436,7 +4906,10 @@ fn run() -> Result<(), Box<dyn Error>> {
                     Some(e) => report_config_error(&e),
                     None => {
                         if !cfg.has_location() {
-                            if let Some((lat, lon)) = try_get_windows_location() {
+                            // Holds the event loop for up to
+                            // LOCATION_LOOKUP_CAP; a failure is logged, and
+                            // the tick below logs skipped=no-location.
+                            if let Ok((lat, lon)) = try_get_windows_location() {
                                 cfg.latitude = lat;
                                 cfg.longitude = lon;
                                 persist_config(&cfg);
@@ -5250,6 +5723,610 @@ mod tests {
                         assert!(moved <= 10, "{lat} {lon} {now}: moved {moved} s");
                     }
                 }
+            }
+        }
+    }
+
+    // --- the Windows Location lookup's cap, outcomes and dialogs (v0.6.0) ---
+
+    #[test]
+    fn work_that_finishes_in_time_hands_its_value_back_from_a_thread_of_its_own() {
+        let caller = std::thread::current().id();
+        let got = run_with_timeout("wts-test-fast", Duration::from_secs(30), move || {
+            let me = std::thread::current();
+            (me.id() != caller, me.name().map(str::to_string), 42)
+        });
+        assert_eq!(got, Ok((true, Some("wts-test-fast".to_string()), 42)));
+        // A limit of zero still isn't a panic or a hang, whichever way the
+        // race goes.
+        let quick = run_with_timeout("wts-test-zero", Duration::ZERO, || 7);
+        assert!(
+            matches!(quick, Ok(7) | Err(NoAnswer::TimedOut)),
+            "{quick:?}"
+        );
+    }
+
+    #[test]
+    fn a_timeout_frees_the_caller_and_the_late_value_is_dropped_without_a_panic() {
+        use std::sync::Arc;
+        /// The worker's late value. Says when it has been dropped, and
+        /// whether that happened while its thread was unwinding from a
+        /// panic — a worker that panicked over the closed channel
+        /// (`tx.send(..).unwrap()`) drops the value too, on its way out.
+        struct Late {
+            dropped: Arc<AtomicBool>,
+            dropped_in_panic: Arc<AtomicBool>,
+        }
+        impl Drop for Late {
+            fn drop(&mut self) {
+                // Before `dropped`, which is what the test waits for.
+                self.dropped_in_panic
+                    .store(std::thread::panicking(), Ordering::SeqCst);
+                self.dropped.store(true, Ordering::SeqCst);
+            }
+        }
+        let dropped = Arc::new(AtomicBool::new(false));
+        let dropped_in_panic = Arc::new(AtomicBool::new(false));
+        let finished = Arc::new(AtomicBool::new(false));
+        // The work waits for the test's go-ahead, so "slow" doesn't depend
+        // on a sleep being long enough.
+        let (go, wait_for_go) = mpsc::channel::<()>();
+        let (flag, panic_flag, done) =
+            (dropped.clone(), dropped_in_panic.clone(), finished.clone());
+        let limit = Duration::from_millis(100);
+        let started = Instant::now();
+        let got = run_with_timeout("wts-test-slow", limit, move || {
+            let _ = wait_for_go.recv();
+            done.store(true, Ordering::SeqCst);
+            Late {
+                dropped: flag,
+                dropped_in_panic: panic_flag,
+            }
+        });
+        let waited = started.elapsed();
+        assert!(matches!(got, Err(NoAnswer::TimedOut)));
+        // The caller waited for the limit and no longer: the work is
+        // still blocked, and nothing has been produced or dropped yet.
+        assert!(waited >= limit, "{waited:?}");
+        assert!(waited < Duration::from_secs(20), "{waited:?}");
+        assert!(!finished.load(Ordering::SeqCst) && !dropped.load(Ordering::SeqCst));
+        // Now the work finishes, late. Its value has nowhere to go and is
+        // dropped by the worker: no leak (the drop happens), and no panic
+        // over the closed channel (the drop happens in a thread that isn't
+        // unwinding — in the release build, which aborts on a panic, a
+        // worker that panicked there would end the app whenever Windows
+        // answered after the cap).
+        go.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !dropped.load(Ordering::SeqCst) {
+            assert!(
+                Instant::now() < deadline,
+                "the late value was never dropped"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(finished.load(Ordering::SeqCst));
+        assert!(
+            !dropped_in_panic.load(Ordering::SeqCst),
+            "the worker panicked over the value nobody waited for"
+        );
+        // And the next call is not disturbed by the one that timed out.
+        assert_eq!(
+            run_with_timeout("wts-test-next", Duration::from_secs(30), || 1),
+            Ok(1)
+        );
+    }
+
+    #[test]
+    fn a_worker_that_ends_without_a_value_is_reported_not_waited_for() {
+        // The test build unwinds (the release build aborts on a panic, and
+        // its panic hook logs it). resume_unwind skips the panic message.
+        let started = Instant::now();
+        let got: Result<u8, NoAnswer> =
+            run_with_timeout("wts-test-lost", Duration::from_secs(30), || {
+                std::panic::resume_unwind(Box::new("no value"))
+            });
+        assert_eq!(got, Err(NoAnswer::WorkerLost));
+        assert!(started.elapsed() < Duration::from_secs(20));
+    }
+
+    /// One of each kind of failed lookup, with a realistic error code.
+    fn location_failures() -> [LocationFailure; 7] {
+        [
+            LocationFailure::Denied,
+            LocationFailure::Unspecified,
+            LocationFailure::TimedOut,
+            LocationFailure::Failed {
+                stage: "position",
+                hresult: 0x8007_0005_u32 as i32,
+            },
+            LocationFailure::Failed {
+                stage: "worker",
+                hresult: 0,
+            },
+            LocationFailure::Rejected("zero"),
+            LocationFailure::Rejected("out-of-range"),
+        ]
+    }
+
+    #[test]
+    fn a_failed_lookup_is_logged_by_reason_and_time_never_by_coordinates() {
+        let lines: Vec<String> = location_failures()
+            .into_iter()
+            .map(|f| location_failure_line(f, 1234))
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                "location_lookup_failed reason=access-denied after_ms=1234",
+                "location_lookup_failed reason=access-unspecified after_ms=1234",
+                "location_lookup_failed reason=timeout after_ms=1234",
+                "location_lookup_failed reason=error after_ms=1234 stage=position hresult=0x80070005",
+                "location_lookup_failed reason=error after_ms=1234 stage=worker hresult=0x00000000",
+                "location_lookup_failed reason=reading-rejected after_ms=1234 reading=zero",
+                "location_lookup_failed reason=reading-rejected after_ms=1234 reading=out-of-range",
+            ]
+        );
+        // Nothing to quote or escape, and the line survives the log's
+        // sanitizer unchanged.
+        for line in &lines {
+            assert_eq!(&sanitize_log_msg(line), line);
+        }
+        // The five reasons are told apart.
+        let mut tokens: Vec<_> = location_failures().iter().map(|f| f.token()).collect();
+        tokens.dedup();
+        assert_eq!(
+            tokens,
+            [
+                "access-denied",
+                "access-unspecified",
+                "timeout",
+                "error",
+                "reading-rejected"
+            ]
+        );
+    }
+
+    #[test]
+    fn only_allowed_lets_the_lookup_go_on() {
+        assert_eq!(access_answer(GeolocationAccessStatus::Allowed), Ok(()));
+        assert_eq!(
+            access_answer(GeolocationAccessStatus::Denied),
+            Err(LocationFailure::Denied)
+        );
+        assert_eq!(
+            access_answer(GeolocationAccessStatus::Unspecified),
+            Err(LocationFailure::Unspecified)
+        );
+        // A value Windows doesn't have today is not taken for "allowed" —
+        // nor for a denial, which would put "off or not allowed" on screen.
+        assert_eq!(
+            access_answer(GeolocationAccessStatus(7)),
+            Err(LocationFailure::Unspecified)
+        );
+    }
+
+    #[test]
+    fn coordinates_leave_a_lookup_only_through_usable_location() {
+        // A reading comes out exactly as usable_location returns it:
+        // rounded, or refused with its reason.
+        for (lat, lon) in [
+            (24.713_552, 46.675_296),
+            (69.649_205, 18.955_324),
+            (-33.868_82, 151.209_3),
+            (0.004, -0.003),
+            (0.0, 0.0),
+            (90.000_4, 0.0),
+            (10.0, 180.004),
+            (f64::NAN, 46.7),
+        ] {
+            assert_eq!(
+                settle_location(Ok(Ok((lat, lon)))),
+                usable_location(lat, lon).map_err(LocationFailure::Rejected),
+                "{lat} {lon}"
+            );
+        }
+        assert_eq!(
+            settle_location(Ok(Ok((24.713_552, 46.675_296)))),
+            Ok((24.71, 46.68))
+        );
+        assert_eq!(
+            settle_location(Ok(Ok((0.0, 0.0)))),
+            Err(LocationFailure::Rejected("zero"))
+        );
+        assert_eq!(
+            settle_location(Ok(Ok((91.0, 0.0)))),
+            Err(LocationFailure::Rejected("out-of-range"))
+        );
+        // What the lookup thread reports is passed on as it is.
+        for failure in location_failures() {
+            assert_eq!(settle_location(Ok(Err(failure))), Err(failure));
+        }
+        // No answer in time, or no answer at all.
+        assert_eq!(
+            settle_location(Err(NoAnswer::TimedOut)),
+            Err(LocationFailure::TimedOut)
+        );
+        assert_eq!(
+            settle_location(Err(NoAnswer::WorkerLost)),
+            Err(LocationFailure::Failed {
+                stage: "worker",
+                hresult: 0
+            })
+        );
+    }
+
+    /// What every location box must keep to, whatever it is about: plain
+    /// words, and no instruction to click an icon that isn't there yet.
+    fn assert_plain_and_true_about_the_tray(text: &str, tray_exists: bool) {
+        for jargon in [
+            "WinRT",
+            "HRESULT",
+            "hresult",
+            "API",
+            "0x",
+            "Geolocator",
+            "stage",
+            "ShellExecute",
+            "ms-settings",
+            "STA",
+        ] {
+            assert!(!text.contains(jargon), "{jargon:?} in: {text}");
+        }
+        // Never the old claims.
+        for old in ["just opened", "opening now", "tray icon"] {
+            assert!(!text.contains(old), "{old:?} in: {text}");
+        }
+        let lower = text.to_lowercase();
+        let Some(click) = lower.find("right-click") else {
+            // A box that doesn't send the user to the icon doesn't need to
+            // say where it is.
+            assert!(!lower.contains("icon"), "{text}");
+            return;
+        };
+        if tray_exists {
+            assert!(text.contains("icon is in the notification area"), "{text}");
+            assert!(!text.contains("icon appears"), "{text}");
+        } else {
+            // Before the tray exists the text first says when and where
+            // the icon turns up, and only then what to click.
+            let appears = text
+                .find("After you close this message, the WinThemeSwitcher icon appears")
+                .unwrap_or_else(|| panic!("no word on when the icon appears: {text}"));
+            assert!(appears < click, "{text}");
+            assert!(!text.contains("icon is in"), "{text}");
+        }
+        assert!(text.contains("^ arrow"), "{text}");
+        assert!(text.contains("Refresh"), "{text}");
+    }
+
+    #[test]
+    fn the_first_location_box_says_what_actually_happened() {
+        // "About 15 s", and the number on screen is the cap's.
+        assert!((10..=20).contains(&LOCATION_LOOKUP_CAP.as_secs()));
+        let within = format!("within {} seconds", LOCATION_LOOKUP_CAP.as_secs());
+        let cases = [(false, true), (true, true), (false, false), (true, false)];
+        for (tray_exists, config_on_disk) in cases {
+            for failure in location_failures() {
+                let prompt = location_prompt(failure, tray_exists, config_on_disk);
+                let (text, offers_settings) = match &prompt {
+                    LocationPrompt::OfferSettings(t) => (t.as_str(), true),
+                    LocationPrompt::Inform(t) => (t.as_str(), false),
+                };
+                assert_plain_and_true_about_the_tray(text, tray_exists);
+                let denial = matches!(
+                    failure,
+                    LocationFailure::Denied | LocationFailure::Unspecified
+                );
+                // Settings is offered only after Windows said no.
+                assert_eq!(offers_settings, denial, "{failure:?}");
+                // "Off or not allowed" as a fact: only for a real denial.
+                assert_eq!(
+                    text.contains("not allowed"),
+                    failure == LocationFailure::Denied,
+                    "{failure:?}: {text}"
+                );
+                assert_eq!(
+                    text.contains("is turned off"),
+                    failure == LocationFailure::Denied,
+                    "{failure:?}: {text}"
+                );
+                // Each other reason says its own thing, and only that.
+                assert_eq!(
+                    text.contains(&within) && text.contains("did not answer"),
+                    failure == LocationFailure::TimedOut,
+                    "{failure:?}: {text}"
+                );
+                assert_eq!(
+                    text.contains("the lookup failed"),
+                    matches!(failure, LocationFailure::Failed { .. }),
+                    "{failure:?}: {text}"
+                );
+                assert_eq!(
+                    text.contains("a location for this PC that WinThemeSwitcher cannot use"),
+                    matches!(failure, LocationFailure::Rejected(_)),
+                    "{failure:?}: {text}"
+                );
+                assert_eq!(
+                    text.contains("did not say why"),
+                    failure == LocationFailure::Unspecified,
+                    "{failure:?}: {text}"
+                );
+                if offers_settings {
+                    // A question with both ways out named; it promises
+                    // nothing about Settings having opened, and leaves the
+                    // icon to the box that follows.
+                    assert!(text.contains("Yes: open the Location settings."));
+                    assert_eq!(
+                        text.contains("No: type your coordinates into config.json"),
+                        config_on_disk,
+                        "{text}"
+                    );
+                    assert_eq!(
+                        text.contains("No: go on without a location for now."),
+                        !config_on_disk,
+                        "{text}"
+                    );
+                    assert!(!text.contains("should now be open"));
+                    assert!(!text.contains("Refresh"));
+                } else {
+                    // What to do next: Refresh later, or config.json.
+                    assert!(text.contains("Try again later."), "{text}");
+                    assert!(text.contains("choose Refresh"), "{text}");
+                    assert!(
+                        text.contains("latitude and longitude into config.json"),
+                        "{text}"
+                    );
+                    // A Refresh shows nothing about its lookup, so the box
+                    // says how the user can tell.
+                    assert!(text.contains(REFRESH_IS_SILENT), "{text}");
+                    // Settings is pointed at, not said to be the cause —
+                    // and not at all for a reading no switch would change.
+                    assert_eq!(
+                        text.contains(LOCATION_SETTINGS_PAGE),
+                        !matches!(failure, LocationFailure::Rejected(_)),
+                        "{failure:?}: {text}"
+                    );
+                    // This is the only box of its path, so it has the
+                    // format the manual-setup box gives.
+                    assert_eq!(
+                        text.contains("in decimal degrees (south and west are negative)"),
+                        config_on_disk,
+                        "{text}"
+                    );
+                    // The timeout box says what to do about Windows' own
+                    // question, in order: the late answer is dropped, so
+                    // answering it is not enough.
+                    assert_eq!(
+                        text.contains(
+                            "answer it, then close this message and choose Refresh (step 1"
+                        ),
+                        failure == LocationFailure::TimedOut,
+                        "{failure:?}: {text}"
+                    );
+                }
+                // Nothing sends the user to a config.json that isn't there:
+                // not to Open Config, not to saving it.
+                assert_eq!(
+                    text.contains("Open Config"),
+                    config_on_disk && !offers_settings
+                );
+                assert_eq!(
+                    text.contains("save the file"),
+                    config_on_disk && !offers_settings
+                );
+                assert_eq!(
+                    text.contains("config.json could not be created"),
+                    !config_on_disk && !offers_settings,
+                    "{text}"
+                );
+                // The details that belong in the log stay there.
+                assert!(!text.contains("position") && !text.contains("out-of-range"));
+                assert!(!text.contains("80070005"));
+            }
+        }
+        // The two kinds of rejected reading, and any two errors, read the
+        // same on screen.
+        for config_on_disk in [true, false] {
+            assert_eq!(
+                location_prompt(LocationFailure::Rejected("zero"), false, config_on_disk),
+                location_prompt(
+                    LocationFailure::Rejected("out-of-range"),
+                    false,
+                    config_on_disk
+                )
+            );
+            assert_eq!(
+                location_prompt(
+                    LocationFailure::Failed {
+                        stage: "position",
+                        hresult: 0x8007_0005_u32 as i32,
+                    },
+                    false,
+                    config_on_disk
+                ),
+                location_prompt(
+                    LocationFailure::Failed {
+                        stage: "worker",
+                        hresult: 0,
+                    },
+                    false,
+                    config_on_disk
+                )
+            );
+        }
+        // "How to tell" is something the user can see, and claims no more
+        // than "most likely".
+        assert!(REFRESH_IS_SILENT.contains("next sunrise or sunset"));
+        assert!(REFRESH_IS_SILENT.contains("most likely"));
+    }
+
+    #[test]
+    fn only_a_shell_result_above_32_counts_as_launched() {
+        // ShellExecuteW: "greater than 32" is success. The error codes it
+        // documents (0, 2 file not found, 5 access denied, 31 no
+        // association, 32 DLL not found) and a negative value are not.
+        for code in [isize::MIN, -1, 0, 2, 5, 31, 32] {
+            assert!(!launch_accepted(code), "{code}");
+        }
+        for code in [33, 42, isize::MAX] {
+            assert!(launch_accepted(code), "{code}");
+        }
+    }
+
+    #[test]
+    fn the_box_after_opening_settings_is_true_whether_settings_opened_or_not() {
+        for tray_exists in [false, true] {
+            for opened in [false, true] {
+                let text = location_settings_followup(opened, tray_exists);
+                assert_plain_and_true_about_the_tray(&text, tray_exists);
+                // That Settings opened is said only when the launch was
+                // accepted — and even then with the way to get there by
+                // hand, which is all the other case has.
+                assert_eq!(text.contains("should now be open"), opened, "{text}");
+                assert_eq!(text.contains("could not be opened"), !opened, "{text}");
+                assert!(text.contains("open Settings yourself") || !opened, "{text}");
+                assert!(text.contains("Open Settings yourself") || opened, "{text}");
+                assert!(text.contains(LOCATION_SETTINGS_PAGE), "{text}");
+                assert_eq!(LOCATION_SETTINGS_PAGE, "Privacy & security > Location");
+                // What must be on, in words that hold if a switch is
+                // missing or renamed; the names are a guide.
+                assert!(text.contains("desktop apps included"), "{text}");
+                assert!(text.contains("or something close to that"), "{text}");
+                assert!(text.contains("may not show all of them"), "{text}");
+                for switch in [
+                    "\"Location services\"",
+                    "\"Let apps access your location\"",
+                    "\"Let desktop apps access your location\"",
+                ] {
+                    assert!(text.contains(switch), "{switch}: {text}");
+                }
+                assert!(text.contains("choose Refresh"), "{text}");
+                assert!(text.ends_with(REFRESH_IS_SILENT), "{text}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_manual_setup_boxes_match_what_opening_config_json_does() {
+        for tray_exists in [false, true] {
+            let text = manual_setup_text(tray_exists);
+            assert_plain_and_true_about_the_tray(&text, tray_exists);
+            assert!(text.contains("latitude and longitude into config.json"));
+            // open_config_in_editor: the .json program, or else Notepad —
+            // after this box is closed, and it may fail.
+            assert!(text.contains("When you close this message"), "{text}");
+            assert!(text.contains("program set up for .json files"), "{text}");
+            assert!(text.contains("or else in Notepad"), "{text}");
+            assert!(
+                text.contains("If neither can be started, another message says where"),
+                "{text}"
+            );
+            assert!(!text.contains("is open") && !text.contains("has opened"));
+            assert!(text.contains("After saving the file"), "{text}");
+        }
+        // The message that follows a failed open names the file.
+        let path = Path::new(r"C:\Some Folder\WinThemeSwitcher\config.json");
+        let text = config_not_opened_text(path);
+        assert!(text.contains("could not be opened"), "{text}");
+        assert!(text.ends_with(r"C:\Some Folder\WinThemeSwitcher\config.json"));
+        assert_plain_and_true_about_the_tray(&text, false);
+        // Without a config.json (it could not be created) the box that
+        // takes the manual one's place promises no editor and no saving:
+        // it says why not, and what to do first.
+        let text = no_config_file_text();
+        assert_plain_and_true_about_the_tray(&text, false);
+        assert!(text.contains("config.json could not be created"), "{text}");
+        assert!(text.contains("to a folder you can write to"), "{text}");
+        for promise in ["opens config.json", "Notepad", "save", "Open Config"] {
+            assert!(!text.contains(promise), "{promise:?} in: {text}");
+        }
+    }
+
+    #[test]
+    fn the_real_windows_location_lookup_ends_within_the_cap_whatever_windows_says() {
+        // Through the same lookup thread, apartment and cap as the app. It
+        // must pass with Location on, off, or absent (GitHub's runners),
+        // so it asserts what holds for every outcome — and prints the
+        // outcome, never a coordinate (--nocapture shows which one a
+        // machine got). On a PC with Location off, Windows may show its
+        // own "allow location?" prompt for the test binary.
+        use windows::Win32::System::Com::CoUninitialize;
+        use windows_sys::Win32::System::Com::{
+            CoGetApartmentType, APTTYPE_CURRENT, APTTYPE_MAINSTA, APTTYPE_STA,
+        };
+        // The caller's side of the app's layout too: the app's main thread
+        // is a single-threaded apartment — the first in the process, which
+        // makes it the one COM sends main-threaded components to — and it
+        // waits for the lookup without pumping messages. So this thread
+        // becomes one, the way run() does it; if anything in Windows'
+        // location code needed that apartment while called from the lookup
+        // thread, the outcome here would be a timeout, as in the app. No
+        // other test initializes COM, so this is normally the process's
+        // first ("main") one; the printed line says which it was.
+        ensure_com_initialized();
+        let (mut apartment, mut qualifier) = (APTTYPE_CURRENT, 0);
+        let hr = unsafe { CoGetApartmentType(&mut apartment, &mut qualifier) };
+        assert!(
+            hr >= 0 && (apartment == APTTYPE_MAINSTA || apartment == APTTYPE_STA),
+            "the test thread is not a single-threaded apartment: hr={hr:#x} type={apartment}"
+        );
+        /// Leaves the apartment when the test is over, pass or fail.
+        struct LeaveApartment;
+        impl Drop for LeaveApartment {
+            fn drop(&mut self) {
+                unsafe { CoUninitialize() };
+            }
+        }
+        let _leave = LeaveApartment;
+        let caller = if apartment == APTTYPE_MAINSTA {
+            "main-sta"
+        } else {
+            "sta"
+        };
+        let cap_ms = LOCATION_LOOKUP_CAP.as_millis();
+        // Twice: the first lookup thread of a process creates the
+        // apartment (keep_mta_alive), a later one — a Refresh after the
+        // startup lookup — finds it there. Not a second time after a slow
+        // first one, to keep the test short where Windows doesn't answer.
+        for nth in 1..=2 {
+            let (result, elapsed_ms) = lookup_windows_location(LOCATION_LOOKUP_CAP);
+            assert!(elapsed_ms <= cap_ms + 3000, "took {elapsed_ms} ms");
+            match result {
+                Ok((lat, lon)) => {
+                    println!(
+                        "windows-location lookup {nth}: caller={caller} ok after_ms={elapsed_ms}"
+                    );
+                    // Messages without the values: a failure here must not
+                    // print where the machine is.
+                    assert!(valid_coordinates(lat, lon), "not a place on Earth");
+                    assert!(!(lat == 0.0 && lon == 0.0), "0/0 came through");
+                    assert!(
+                        round_coordinates(lat, lon) == (lat, lon),
+                        "the reading came through unrounded"
+                    );
+                }
+                Err(failure) => {
+                    println!(
+                        "windows-location lookup {nth}: caller={caller} {}",
+                        location_failure_line(failure, elapsed_ms)
+                    );
+                    // A timeout is reported at the cap, not before it.
+                    if failure == LocationFailure::TimedOut {
+                        assert!(elapsed_ms >= cap_ms, "timeout after {elapsed_ms} ms");
+                    }
+                    // The lookup thread started and reported.
+                    assert_ne!(
+                        failure,
+                        LocationFailure::Failed {
+                            stage: "worker",
+                            hresult: 0
+                        }
+                    );
+                }
+            }
+            if elapsed_ms > 3000 {
+                break;
             }
         }
     }
